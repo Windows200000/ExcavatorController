@@ -194,6 +194,7 @@ void relayCamCmd(const String& path) {
   if (camIP.length() == 0) return;
   HTTPClient http;
   http.begin("http://" + camIP + path);
+  http.setTimeout(200);   // Fix A: don't block longer than one heartbeat window
   http.GET();
   http.end();
 }
@@ -803,22 +804,22 @@ window.addEventListener('blur', stopAllHolds);
 const safetyBadge = document.getElementById('safety-badge');
 let currentMode = 'safe'; // local mirror; real truth comes from cam /status poll
 
-safetyBadge.addEventListener('click', () => {
-  const target = currentMode === 'safe' ? 'mode_arm' : 'mode_safe';
-  camCmd(target);
-  // Don't update badge here — wait for cam poll to confirm
-});
-
-function updateSafetyBadge(mode) {
+const updateSafetyBadge = (mode) => {
   currentMode = mode;
   if (mode === 'armed') {
     safetyBadge.className = 'armed';
-    safetyBadge.textContent = '🔓 ARMED';
+    safetyBadge.innerHTML = '(💢 -_•)╦̵̵̿╤── ARMED';
   } else {
     safetyBadge.className = 'safe';
     safetyBadge.textContent = '🔒 SAFE';
   }
 }
+
+safetyBadge.addEventListener('click', () => {
+  const target = currentMode === 'safe' ? 'mode_arm' : 'mode_safe';
+  camCmd(target);
+  // Don't update badge here — wait for cam poll to confirm
+});
 
 // ── Keyboard shortcuts ──────────────────────────────────────
 const KEY_MAP = {

@@ -78,14 +78,14 @@ const uint32_t REG_RETRY_DELAY_MS = 1000;
 //  AI-Thinker ESP32-CAM, no SD card:
 //  GPIO 13 is free and safe for output.
 // ─────────────────────────────────────────────
-const int PIN_PUMP = 13;
+const int PIN_PUMP = 4; //Temp for LED, change fire action back to LOW when attaching pump
 
 // ─────────────────────────────────────────────
 //  Pump heartbeat timeout
 //  If controller stops sending hold heartbeats,
 //  auto-release the pump after this many ms.
 // ─────────────────────────────────────────────
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;  // Fix B: was 300 — widened for WiFi round-trip headroom
 
 // ─────────────────────────────────────────────
 //  Stream settings
@@ -128,7 +128,7 @@ void pumpOn() {
   }
   if (!pumpActive) {
     pinMode(PIN_PUMP, OUTPUT);
-    digitalWrite(PIN_PUMP, LOW);   // active-low relay — adjust if needed
+    digitalWrite(PIN_PUMP, HIGH);   // active-low relay — adjust if needed
     pumpActive = true;
     Serial.println("[PUMP] ON");
   }
@@ -197,27 +197,48 @@ bool initCamera() {
 // ════════════════════════════════════════════════════════════
 
 // GET /stream  — MJPEG
+// Replace handleStream() with this:
 void handleStream() {
+  // Grab the client before handing off
   WiFiClient client = server.client();
+
+  // Send the initial HTTP header directly
   String header =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
     "Access-Control-Allow-Origin: *\r\n"
+    "Connection: close\r\n"
     "\r\n";
   client.print(header);
 
-  while (client.connected()) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { Serial.println("[CAM] Frame capture failed"); break; }
-    String partHeader =
-      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
-    client.print(partHeader);
-    client.write(fb->buf, fb->len);
-    client.print("\r\n");
-    esp_camera_fb_return(fb);
-    if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
-  }
-  Serial.println("[CAM] Stream client disconnected");
+  // Spin off a FreeRTOS task so handleClient() is no longer blocked
+  WiFiClient* clientPtr = new WiFiClient(client);
+  xTaskCreatePinnedToCore(
+    [](void* arg) {
+      WiFiClient* c = (WiFiClient*)arg;
+      while (c->connected()) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) break;
+        String partHeader =
+          "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+          + String(fb->len) + "\r\n\r\n";
+        c->print(partHeader);
+        c->write(fb->buf, fb->len);
+        c->print("\r\n");
+        esp_camera_fb_return(fb);
+        if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
+      }
+      Serial.println("[CAM] Stream client disconnected");
+      delete c;
+      vTaskDelete(NULL);
+    },
+    "stream_task",
+    8192,        // stack size — needs to be generous for camera ops
+    clientPtr,
+    1,           // priority
+    NULL,
+    1            // pin to core 1 (core 0 runs WiFi)
+  );
 }
 
 // GET /snapshot  — single JPEG at full res
@@ -396,8 +417,8 @@ void loop() {
     pumpOff();
   }
 
-  // Periodic detection + overlay push
-  if (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS) {
+  // Periodic detection + overlay push — skip while pump is firing (Fix D)
+  if (!pumpActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
     lastDetectionMs = millis();
     runDetectionAndPush();
   }
