@@ -2,16 +2,30 @@
  * ============================================================
  *  EXCAVATOR CAM  —  ESP32-CAM sketch
  *  Role   : WiFi client → connects to controller AP
- *           Streams MJPEG  → GET  /stream
- *           Single frame   → GET  /snapshot
- *           Image proc.    → runs on-device, POSTs overlay
- *                            JSON to controller  /overlay
+ *           Streams MJPEG        → GET  /stream
+ *           Single frame         → GET  /snapshot
+ *           Image proc.          → runs on-device, POSTs overlay
+ *                                  JSON to controller  /overlay
+ *           Pump control         → GET  /pump?action=press|hold|release
+ *           Safe / Armed mode    → GET  /mode?set=safe|armed
+ *           Live status          → GET  /status  (includes mode + pump state)
  * ============================================================
  *
  *  CHANGES vs. v1:
  *   - Added registerWithController() — cam now POSTs its IP to
  *     /register after WiFi connect (was missing in v1 setup!)
  *   - Registration retries up to 5 times on failure
+ *
+ *  CHANGES vs. v2:
+ *   - GPIO 13 → pump relay pin (hold-while-pressed)
+ *   - Safe / Armed mode added; boots SAFE by default
+ *   - Pump is blocked while in SAFE mode
+ *   - Entering SAFE mode immediately turns the pump off
+ *   - /pump endpoint supports press / hold / release
+ *   - Pump has 300 ms heartbeat timeout auto-release safety
+ *   - /mode endpoint supports set=safe|armed
+ *   - /status now returns { ip, uptime, heap, mode, pumpActive }
+ *   - Controller UI reads SAFE / ARMED live from this status endpoint
  * ============================================================
  */
 
@@ -24,8 +38,8 @@
 // ─────────────────────────────────────────────
 //  WiFi  (controller is the AP)
 // ─────────────────────────────────────────────
-const char* WIFI_SSID       = "ExcavatorAP";
-const char* WIFI_PASSWORD   = "exc@vator123";
+const char* WIFI_SSID     = "ExcavatorAP";
+const char* WIFI_PASSWORD = "exc@vator123";
 
 // ─────────────────────────────────────────────
 //  Controller address (AP default gateway)
@@ -36,7 +50,7 @@ const uint16_t CONTROLLER_PORT = 80;
 // ─────────────────────────────────────────────
 //  Registration retry settings
 // ─────────────────────────────────────────────
-const int     REG_MAX_RETRIES   = 5;
+const int      REG_MAX_RETRIES    = 5;
 const uint32_t REG_RETRY_DELAY_MS = 1000;
 
 // ─────────────────────────────────────────────
@@ -60,58 +74,101 @@ const uint32_t REG_RETRY_DELAY_MS = 1000;
 #define CAM_PIN_PCLK    22
 
 // ─────────────────────────────────────────────
-//  Stream settings
+//  Pump pin
+//  AI-Thinker ESP32-CAM, no SD card:
+//  GPIO 13 is free and safe for output.
 // ─────────────────────────────────────────────
-// Resolution for the MJPEG stream sent to the browser.
-// Keep low for smooth remote viewing; snapshot uses full res.
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;   // 320×240
-const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640×480
-const uint8_t     JPEG_QUALITY      = 12;   // 0 best … 63 worst; 10-15 sweet spot
-const int         STREAM_DELAY_MS   = 0;    // extra inter-frame delay (ms)
+const int PIN_PUMP = 13;
 
 // ─────────────────────────────────────────────
-//  Image processing
+//  Pump heartbeat timeout
+//  If controller stops sending hold heartbeats,
+//  auto-release the pump after this many ms.
 // ─────────────────────────────────────────────
-// How often to run detection and push overlay to controller (ms).
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;
+
+// ─────────────────────────────────────────────
+//  Stream settings
+// ─────────────────────────────────────────────
+const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;   // 320×240
+const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640×480
+const uint8_t     JPEG_QUALITY      = 12;
+const int         STREAM_DELAY_MS   = 0;
+
+// ─────────────────────────────────────────────
+//  Image processing interval
+// ─────────────────────────────────────────────
 const uint32_t DETECTION_INTERVAL_MS = 500;
 
 // ─────────────────────────────────────────────
-//  Web server on the cam ESP32
+//  Web server
 // ─────────────────────────────────────────────
 WebServer server(80);
 
 // ─────────────────────────────────────────────
-//  Internal state
+//  Runtime state
 // ─────────────────────────────────────────────
 uint32_t lastDetectionMs = 0;
+
+// Safe/Armed mode — boots in SAFE
+enum CamMode { MODE_SAFE, MODE_ARMED };
+CamMode camMode = MODE_SAFE;
+
+// Pump hold state
+bool     pumpActive    = false;
+uint32_t pumpLastSeen  = 0;   // millis() of last hold heartbeat
+
+// ════════════════════════════════════════════════════════════
+//  Pump helpers
+// ════════════════════════════════════════════════════════════
+void pumpOn() {
+  if (camMode == MODE_SAFE) {
+    Serial.println("[PUMP] Blocked — in SAFE mode");
+    return;
+  }
+  if (!pumpActive) {
+    pinMode(PIN_PUMP, OUTPUT);
+    digitalWrite(PIN_PUMP, LOW);   // active-low relay — adjust if needed
+    pumpActive = true;
+    Serial.println("[PUMP] ON");
+  }
+  pumpLastSeen = millis();
+}
+
+void pumpOff() {
+  if (pumpActive) {
+    pinMode(PIN_PUMP, INPUT);   // high-Z
+    pumpActive = false;
+    Serial.println("[PUMP] OFF");
+  }
+}
 
 // ════════════════════════════════════════════════════════════
 //  Camera init
 // ════════════════════════════════════════════════════════════
 bool initCamera() {
   camera_config_t config;
-  config.ledc_channel  = LEDC_CHANNEL_0;
-  config.ledc_timer    = LEDC_TIMER_0;
-  config.pin_d0        = CAM_PIN_D0;
-  config.pin_d1        = CAM_PIN_D1;
-  config.pin_d2        = CAM_PIN_D2;
-  config.pin_d3        = CAM_PIN_D3;
-  config.pin_d4        = CAM_PIN_D4;
-  config.pin_d5        = CAM_PIN_D5;
-  config.pin_d6        = CAM_PIN_D6;
-  config.pin_d7        = CAM_PIN_D7;
-  config.pin_xclk      = CAM_PIN_XCLK;
-  config.pin_pclk      = CAM_PIN_PCLK;
-  config.pin_vsync     = CAM_PIN_VSYNC;
-  config.pin_href      = CAM_PIN_HREF;
-  config.pin_sscb_sda  = CAM_PIN_SIOD;
-  config.pin_sscb_scl  = CAM_PIN_SIOC;
-  config.pin_pwdn      = CAM_PIN_PWDN;
-  config.pin_reset     = CAM_PIN_RESET;
-  config.xclk_freq_hz  = 20000000;
-  config.pixel_format  = PIXFORMAT_JPEG;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = CAM_PIN_D0;
+  config.pin_d1       = CAM_PIN_D1;
+  config.pin_d2       = CAM_PIN_D2;
+  config.pin_d3       = CAM_PIN_D3;
+  config.pin_d4       = CAM_PIN_D4;
+  config.pin_d5       = CAM_PIN_D5;
+  config.pin_d6       = CAM_PIN_D6;
+  config.pin_d7       = CAM_PIN_D7;
+  config.pin_xclk     = CAM_PIN_XCLK;
+  config.pin_pclk     = CAM_PIN_PCLK;
+  config.pin_vsync    = CAM_PIN_VSYNC;
+  config.pin_href     = CAM_PIN_HREF;
+  config.pin_sscb_sda = CAM_PIN_SIOD;
+  config.pin_sscb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn     = CAM_PIN_PWDN;
+  config.pin_reset    = CAM_PIN_RESET;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
 
-  // Use PSRAM if available for larger frame buffers
   if (psramFound()) {
     config.frame_size   = SNAP_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
@@ -123,12 +180,8 @@ bool initCamera() {
   }
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("[CAM] Init failed: 0x%x\n", err);
-    return false;
-  }
+  if (err != ESP_OK) { Serial.printf("[CAM] Init failed: 0x%x\n", err); return false; }
 
-  // Apply stream resolution after init
   sensor_t* s = esp_camera_sensor_get();
   s->set_framesize(s, STREAM_FRAME_SIZE);
   s->set_quality(s, JPEG_QUALITY);
@@ -143,10 +196,9 @@ bool initCamera() {
 //  HTTP handlers
 // ════════════════════════════════════════════════════════════
 
-// -- /stream  (MJPEG)
+// GET /stream  — MJPEG
 void handleStream() {
   WiFiClient client = server.client();
-
   String header =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -156,67 +208,76 @@ void handleStream() {
 
   while (client.connected()) {
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("[CAM] Frame capture failed");
-      break;
-    }
-
+    if (!fb) { Serial.println("[CAM] Frame capture failed"); break; }
     String partHeader =
-      "--frame\r\n"
-      "Content-Type: image/jpeg\r\n"
-      "Content-Length: " + String(fb->len) + "\r\n\r\n";
-
+      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
     client.print(partHeader);
     client.write(fb->buf, fb->len);
     client.print("\r\n");
-
     esp_camera_fb_return(fb);
-
     if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
   }
   Serial.println("[CAM] Stream client disconnected");
 }
 
-// -- /snapshot  (single JPEG, higher res)
+// GET /snapshot  — single JPEG at full res
 void handleSnapshot() {
   sensor_t* s = esp_camera_sensor_get();
   s->set_framesize(s, SNAP_FRAME_SIZE);
-
   camera_fb_t* fb = esp_camera_fb_get();
-  s->set_framesize(s, STREAM_FRAME_SIZE);   // restore stream resolution
-
+  s->set_framesize(s, STREAM_FRAME_SIZE);
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
-
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
   esp_camera_fb_return(fb);
 }
 
-// -- /status  (JSON: IP, uptime, heap)
+// GET /pump?action=press|hold|release
+void handlePump() {
+  String action = server.hasArg("action") ? server.arg("action") : "press";
+  if (action == "press" || action == "hold") {
+    pumpOn();
+  } else if (action == "release") {
+    pumpOff();
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", pumpActive ? "on" : "off");
+}
+
+// GET /mode?set=safe|armed
+void handleMode() {
+  if (!server.hasArg("set")) { server.send(400, "text/plain", "Missing set"); return; }
+  String m = server.arg("set");
+  if (m == "armed") {
+    camMode = MODE_ARMED;
+    Serial.println("[MODE] ARMED");
+  } else if (m == "safe") {
+    camMode = MODE_SAFE;
+    pumpOff();   // safety: immediately cut pump when entering safe mode
+    Serial.println("[MODE] SAFE");
+  } else {
+    server.send(400, "text/plain", "Unknown mode");
+    return;
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", camMode == MODE_ARMED ? "armed" : "safe");
+}
+
+// GET /status  — JSON: ip, uptime, heap, mode, pumpActive
 void handleStatus() {
-  StaticJsonDocument<128> doc;
-  doc["ip"]      = WiFi.localIP().toString();
-  doc["uptime"]  = millis() / 1000;
-  doc["heap"]    = ESP.getFreeHeap();
+  StaticJsonDocument<192> doc;
+  doc["ip"]         = WiFi.localIP().toString();
+  doc["uptime"]     = millis() / 1000;
+  doc["heap"]       = ESP.getFreeHeap();
+  doc["mode"]       = (camMode == MODE_ARMED) ? "armed" : "safe";
+  doc["pumpActive"] = pumpActive;
   String out; serializeJson(doc, out);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", out);
 }
 
 // ════════════════════════════════════════════════════════════
-//  Image processing  (stub — extend here)
-//
-//  This runs on the cam ESP32. Capture a frame, analyse it,
-//  build a list of detections (label, bounding box in
-//  0..1 normalised coords), then POST to the controller.
-//  The browser canvas overlay reads those boxes from /overlay.
-//
-//  To add detection logic:
-//   1. Capture a frame (fb->buf, fb->len, fb->width, fb->height)
-//   2. Run your algorithm (edge detection, blob tracking,
-//      TFLite model inference, ArUco markers, colour thresholding…)
-//   3. Populate the detections vector with Detection structs
-//   4. The rest is handled automatically (JSON + POST)
+//  Image processing stub  (extend here)
 // ════════════════════════════════════════════════════════════
 struct Detection {
   String label;
@@ -230,47 +291,32 @@ void runDetectionAndPush() {
 
   // ── TODO: insert your image processing here ──────────────
   // Example stub (uncomment and adapt):
-  //
   //   Detection d;
-  //   d.label      = "rock";
-  //   d.x          = 0.30f;  // left edge, fraction of frame width
-  //   d.y          = 0.20f;  // top  edge, fraction of frame height
-  //   d.w          = 0.10f;
-  //   d.h          = 0.15f;
-  //   d.confidence = 0.87f;
+  //   d.label = "rock"; d.x=0.30f; d.y=0.20f;
+  //   d.w=0.10f; d.h=0.15f; d.confidence=0.87f;
   //   detections.push_back(d);
   // ─────────────────────────────────────────────────────────
-
-  std::vector<Detection> detections;   // empty until you fill it
-
+  std::vector<Detection> detections;
   esp_camera_fb_return(fb);
 
-  // Build JSON payload
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
     JsonObject o = arr.createNestedObject();
     o["label"]      = d.label;
-    o["x"]          = d.x;
-    o["y"]          = d.y;
-    o["w"]          = d.w;
-    o["h"]          = d.h;
+    o["x"]          = d.x; o["y"] = d.y;
+    o["w"]          = d.w; o["h"] = d.h;
     o["confidence"] = d.confidence;
   }
   doc["ts"] = millis();
-
   String body; serializeJson(doc, body);
 
-  // POST to controller /overlay
   HTTPClient http;
-  String url = "http://" + String(CONTROLLER_IP) + ":" +
-               String(CONTROLLER_PORT) + "/overlay";
+  String url = "http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/overlay";
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
-  if (code < 0) {
-    Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
-  }
+  if (code < 0) Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
   http.end();
 }
 
@@ -281,30 +327,17 @@ void connectWiFi() {
   Serial.printf("[WIFI] Connecting to '%s'", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   uint32_t t = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t > 15000) {
-      Serial.println("\n[WIFI] Timeout — restarting");
-      ESP.restart();
-    }
-    delay(500);
-    Serial.print(".");
+    if (millis() - t > 15000) { Serial.println("\n[WIFI] Timeout — restarting"); ESP.restart(); }
+    delay(500); Serial.print(".");
   }
   Serial.printf("\n[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-// ════════════════════════════════════════════════════════════
-//  Controller registration
-//  POSTs {"ip":"<our IP>"} to the controller so the browser
-//  can discover us and start the camera stream.
-//  Retries up to REG_MAX_RETRIES times before giving up.
-// ════════════════════════════════════════════════════════════
 void registerWithController() {
-  String url  = "http://" + String(CONTROLLER_IP) + ":" +
-                String(CONTROLLER_PORT) + "/register";
+  String url  = "http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/register";
   String body = "{\"ip\":\"" + WiFi.localIP().toString() + "\"}";
-
   for (int attempt = 1; attempt <= REG_MAX_RETRIES; attempt++) {
     Serial.printf("[REG] Registering (attempt %d/%d)…\n", attempt, REG_MAX_RETRIES);
     HTTPClient http;
@@ -312,18 +345,14 @@ void registerWithController() {
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(body);
     http.end();
-
     if (code == 200) {
-      Serial.printf("[REG] Registered successfully at %s\n",
-                    WiFi.localIP().toString().c_str());
+      Serial.printf("[REG] Registered at %s\n", WiFi.localIP().toString().c_str());
       return;
     }
-    Serial.printf("[REG] Failed (HTTP %d) — retrying in %dms\n",
-                  code, REG_RETRY_DELAY_MS);
+    Serial.printf("[REG] Failed (HTTP %d) — retrying in %dms\n", code, REG_RETRY_DELAY_MS);
     delay(REG_RETRY_DELAY_MS);
   }
-  Serial.println("[REG] Registration failed after all retries. "
-                 "Browser will not receive cam IP until reboot or reconnect.");
+  Serial.println("[REG] Registration failed after all retries.");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -333,30 +362,39 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
 
+  // Pump pin — start as input (high-Z / off)
+  pinMode(PIN_PUMP, INPUT);
+
   if (!initCamera()) {
     Serial.println("[BOOT] Camera init failed — halting");
     while (true) delay(1000);
   }
 
   connectWiFi();
-
-  // Register our IP with the controller so the browser can find us
   registerWithController();
 
-  // Register HTTP routes
   server.on("/stream",   HTTP_GET, handleStream);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/pump",     HTTP_GET, handlePump);
+  server.on("/mode",     HTTP_GET, handleMode);
   server.on("/status",   HTTP_GET, handleStatus);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
   Serial.println("[BOOT] HTTP server started");
-  Serial.printf("[BOOT] Stream   : http://%s/stream\n",    WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Snapshot : http://%s/snapshot\n",  WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Stream   : http://%s/stream\n",   WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Snapshot : http://%s/snapshot\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Mode     : SAFE (boots safe, pump blocked)\n");
 }
 
 void loop() {
   server.handleClient();
+
+  // Auto-release pump if hold heartbeat has timed out
+  if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
+    Serial.println("[PUMP] Heartbeat timeout — auto-release");
+    pumpOff();
+  }
 
   // Periodic detection + overlay push
   if (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS) {
