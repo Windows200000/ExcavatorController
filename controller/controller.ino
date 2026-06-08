@@ -1,45 +1,6 @@
 /*
- * ============================================================
- *  EXCAVATOR CONTROLLER  —  NodeMCU ESP32 sketch
- *  Role   : WiFi Access Point
- *           Hosts web console  → GET  /
- *           Cam registration   → POST /register   (cam tells us its IP)
- *           Overlay store      → POST /overlay    (cam pushes detections)
- *           Overlay serve      → GET  /overlay    (browser polls)
- *           Cam IP serve       → GET  /camip      (browser learns cam IP)
- *           Button commands    → GET  /cmd?btn=X  (browser sends presses)
- *           Cam command relay  → GET  /camcmd?cmd=X  (relays to cam)
- * ============================================================
- *
- *  CHANGES vs. v1:
- *   - PIN_LIGHT / PIN_TEST moved off GPIO 34/35 (input-only on ESP32!)
- *   - Added keyboard shortcut support in web UI (WASD / arrows / Q E / L T)
- *
- *  CHANGES vs. v2:
- *   - Multi-button simultaneous hold (replaces single HeldPin)
- *   - Actions may now drive multiple pins at once (W/S/A/D drive mixing)
- *   - Light split into PIN_LIGHT_ON (pulse-on) / PIN_LIGHT_OFF (pulse-off),
- *     hidden behind a single toggle in the web UI
- *   - New /camcmd endpoint: relays pump & mode commands to cam module
- *   - WASD = both tracks forward/back or opposite-spin turn
- *   - Arrow Left / Right = turntable rotation
- *   - Arrow Up / Down = arm up/down
- *   - Space = pump hold (relayed to cam), L = light toggle, T = test hold
- *   - Rebuilt web UI with simplified controls and top-down excavator model
- *   - Model glows live for tracks / turntable / arm / pump / test / light
- *   - Live SAFE / ARMED badge polled live from cam module /status endpoint
- *
- *  CHANGES vs. v3:
- *   - Buttons are in pairs (pull-down + pull-up); one pin per pair is used.
- *     Compatible with 3.3 V pull-up: active HIGH = digital HIGH on the chosen pin.
- *   - Pin definitions now use PinDef {gpio, activeLevel} so the active logic
- *     level is explicit and co-located with the pin number.
- *   - Active levels per function:
- *       Track forward  → HIGH   Track back    → LOW
- *       Turntable left → HIGH   Turntable right → LOW
- *       Light on       → LOW    Light off      → HIGH
- *       Arm down       → HIGH   Arm up         → LOW
- * ============================================================
+ * EXCAVATOR CONTROLLER — NodeMCU ESP32 sketch
+ * See design.md for full architecture and endpoint reference.
  */
 
 #include <WiFi.h>

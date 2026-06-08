@@ -1,32 +1,6 @@
 /*
- * ============================================================
- *  EXCAVATOR CAM  —  ESP32-CAM sketch
- *  Role   : WiFi client → connects to controller AP
- *           Streams MJPEG        → GET  /stream
- *           Single frame         → GET  /snapshot
- *           Image proc.          → runs on-device, POSTs overlay
- *                                  JSON to controller  /overlay
- *           Pump control         → GET  /pump?action=press|hold|release
- *           Safe / Armed mode    → GET  /mode?set=safe|armed
- *           Live status          → GET  /status  (includes mode + pump state)
- * ============================================================
- *
- *  CHANGES vs. v1:
- *   - Added registerWithController() — cam now POSTs its IP to
- *     /register after WiFi connect (was missing in v1 setup!)
- *   - Registration retries up to 5 times on failure
- *
- *  CHANGES vs. v2:
- *   - GPIO 13 → pump relay pin (hold-while-pressed)
- *   - Safe / Armed mode added; boots SAFE by default
- *   - Pump is blocked while in SAFE mode
- *   - Entering SAFE mode immediately turns the pump off
- *   - /pump endpoint supports press / hold / release
- *   - Pump has 300 ms heartbeat timeout auto-release safety
- *   - /mode endpoint supports set=safe|armed
- *   - /status now returns { ip, uptime, heap, mode, pumpActive }
- *   - Controller UI reads SAFE / ARMED live from this status endpoint
- * ============================================================
+ * EXCAVATOR CAM — ESP32-CAM sketch
+ * See design.md for full architecture and endpoint reference.
  */
 
 #include "esp_camera.h"
