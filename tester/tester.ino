@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_timer.h>
+#include <driver/adc.h>
 
 const char* AP_SSID     = "ExcavatorAP";
 const char* AP_PASSWORD = "exc@vator123";
@@ -9,58 +10,47 @@ const IPAddress AP_IP(192, 168, 4, 1);
 const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
 
-const int MONITOR_PIN         = 34;
+const int MONITOR_PIN         = 34;   // ADC1_CHANNEL_6
 const int DAC_PIN             = 25;
 
 // High-speed single-shot sampling with delta compression
-const uint32_t SAMPLE_INTERVAL_US = 20;    // ~50 kSa/s target (single-shot analogRead)
-const uint32_t MAX_JSON_SAMPLES   = 500;   // hard cap per response
-const size_t   BUFFER_SIZE        = 4000;  // 4 s safety net in terms of stored (compressed) samples
+const uint32_t SAMPLE_INTERVAL_US = 20;    // ~50 kSa/s target
+const uint32_t MAX_JSON_SAMPLES   = 500;   // hard cap per HTTP response
+const size_t   BUFFER_SIZE        = 4000;  // stored (compressed) sample ring buffer
+
+// Delta compression: store only when raw changes by >= 16 LSBs (~12.9 mV at 3.3V/12-bit)
+const uint16_t DELTA_THRESH_RAW = 16;
 
 WebServer server(80);
 
-volatile uint16_t sampleRaw[BUFFER_SIZE];
-volatile uint32_t sampleTimeUs[BUFFER_SIZE];
-volatile uint32_t totalSamples = 0;
+// Ring buffer in DRAM (no PSRAM lookup latency)
+static uint16_t DRAM_ATTR sampleRaw[BUFFER_SIZE];
+static uint32_t DRAM_ATTR sampleTimeUs[BUFFER_SIZE];
 
-// Delta compression parameters: store only when raw changes by >= 16 LSBs (~12.9 mV)
-const uint16_t DELTA_THRESH_RAW = 16;
-volatile uint16_t lastStoredRaw = 0;
-volatile bool     hasLastStored = false;
+volatile uint32_t totalSamples = 0;   // count of stored (compressed) samples
+volatile uint32_t writeIdx     = 0;   // rolling write index, avoids % on every ISR
+volatile uint16_t lastStoredRaw = 0;  // pre-initialised in setup() before timer starts
 
 uint8_t dacValue = 0;
 
+// ISR: runs directly in hardware timer interrupt context (ESP_TIMER_ISR).
+// Uses adc1_get_raw() directly (no Arduino mutex overhead) and
+// esp_timer_get_time() (direct register read, cheaper than micros()).
 void IRAM_ATTR onSampleTimer(void*) {
-  // Take one ADC sample in single-shot mode
-  uint16_t raw = (uint16_t)analogRead(MONITOR_PIN);
+  uint16_t raw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
 
-  // First stored sample is always kept
-  if (!hasLastStored) {
-    uint32_t seq = totalSamples + 1;
-    size_t   idx = (seq - 1) % BUFFER_SIZE;
-
-    sampleRaw[idx]    = raw;
-    sampleTimeUs[idx] = (uint32_t)micros();
-    lastStoredRaw     = raw;
-    totalSamples      = seq;
-    hasLastStored     = true;
-    return;
-  }
-
-  // Delta compression in raw domain: only keep changes >= DELTA_THRESH_RAW
+  // Delta compression: skip sample if change is below threshold
   int diff = (int)raw - (int)lastStoredRaw;
-  if (diff >= - (int)DELTA_THRESH_RAW && diff <= (int)DELTA_THRESH_RAW) {
-    // Below threshold -> skip storing, no seq increment
-    return;
-  }
+  if (diff > -(int)DELTA_THRESH_RAW && diff < (int)DELTA_THRESH_RAW) return;
 
-  uint32_t seq = totalSamples + 1;
-  size_t   idx = (seq - 1) % BUFFER_SIZE;
+  // Store sample
+  sampleRaw[writeIdx]    = raw;
+  sampleTimeUs[writeIdx] = (uint32_t)esp_timer_get_time();
+  lastStoredRaw          = raw;
 
-  sampleRaw[idx]    = raw;
-  sampleTimeUs[idx] = (uint32_t)micros();
-  lastStoredRaw     = raw;
-  totalSamples      = seq;
+  // Advance rolling index without division
+  if (++writeIdx >= BUFFER_SIZE) writeIdx = 0;
+  totalSamples++;
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -437,7 +427,6 @@ function drawTrace(w, h) {
   const startIdx = lo;
   const windowUs = timeWindowS * 1_000_000;
 
-  // Gap markers
   for (let i = startIdx; i < storeLen; i++) {
     if (!storeGap[i]) continue;
     const x = ((storeTUs[i] - cutoffUs) / windowUs) * w;
@@ -482,6 +471,15 @@ void handleRoot() {
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
+// Serialise uint32 into buf[], return number of chars written (no null terminator needed).
+static int IRAM_ATTR u32toa(uint32_t v, char* buf) {
+  if (v == 0) { buf[0] = '0'; return 1; }
+  char tmp[10]; int n = 0;
+  while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
+  for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+  return n;
+}
+
 void handleSamples() {
   uint32_t latest = totalSamples;
   uint32_t since  = 0;
@@ -493,25 +491,38 @@ void handleSamples() {
   if (latest >= startSeq && (latest - startSeq + 1) > MAX_JSON_SAMPLES)
     startSeq = latest - MAX_JSON_SAMPLES + 1;
 
-  String json;
-  json.reserve(10000);
-  json += "{\"latest\":";           json += latest;
-  json += ",\"oldest\":";           json += oldest;
-  json += ",\"sampleIntervalUs\":"; json += SAMPLE_INTERVAL_US;
-  json += ",\"samples\":[";
+  // Build JSON into a fixed stack buffer to avoid heap fragmentation.
+  // Max size: header ~60 + 500 samples * ~28 bytes each = ~14060 bytes; 16 KB is safe.
+  static char jsonBuf[16384];
+  int pos = 0;
+
+  // Header
+  pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+                  "{\"latest\":%lu,\"oldest\":%lu,\"sampleIntervalUs\":%lu,\"samples\":[",
+                  (unsigned long)latest, (unsigned long)oldest,
+                  (unsigned long)SAMPLE_INTERVAL_US);
+
   bool first = true;
   if (latest >= startSeq) {
-    for (uint32_t seq = startSeq; seq <= latest; ++seq) {
+    for (uint32_t seq = startSeq; seq <= latest && pos < (int)sizeof(jsonBuf) - 40; ++seq) {
+      // Reconstruct ring-buffer index from seq number
       size_t idx = (seq - 1) % BUFFER_SIZE;
-      if (!first) json += ",";
+      if (!first) jsonBuf[pos++] = ',';
       first = false;
-      json += "["; json += seq;      json += ",";
-      json += sampleTimeUs[idx];     json += ",";
-      json += sampleRaw[idx];        json += "]";
+      jsonBuf[pos++] = '[';
+      pos += u32toa(seq,             jsonBuf + pos);
+      jsonBuf[pos++] = ',';
+      pos += u32toa(sampleTimeUs[idx], jsonBuf + pos);
+      jsonBuf[pos++] = ',';
+      pos += u32toa(sampleRaw[idx],    jsonBuf + pos);
+      jsonBuf[pos++] = ']';
     }
   }
-  json += "]}";
-  server.send(200, "application/json", json);
+  jsonBuf[pos++] = ']';
+  jsonBuf[pos++] = '}';
+  jsonBuf[pos]   = '\0';
+
+  server.send(200, "application/json", jsonBuf);
 }
 
 void handleDac() {
@@ -531,10 +542,18 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-  pinMode(MONITOR_PIN, INPUT);
+  // Configure ADC via IDF directly for fastest single-shot reads in ISR
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // GPIO34 = ADC1_CH6
+
   dacWrite(DAC_PIN, 0);
+
+  // Take one seed sample so the ISR can delta-compare from the first tick
+  lastStoredRaw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
+  sampleRaw[0]    = lastStoredRaw;
+  sampleTimeUs[0] = (uint32_t)esp_timer_get_time();
+  totalSamples    = 1;
+  writeIdx        = 1;
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
@@ -546,11 +565,13 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
+  // Use ESP_TIMER_ISR so the callback runs directly in hardware interrupt context,
+  // bypassing FreeRTOS task scheduling and WiFi preemption.
   esp_timer_handle_t timer;
   esp_timer_create_args_t args = {
     .callback        = onSampleTimer,
     .arg             = nullptr,
-    .dispatch_method = ESP_TIMER_TASK,
+    .dispatch_method = ESP_TIMER_ISR,
     .name            = "scope_sample"
   };
   esp_timer_create(&args, &timer);
@@ -559,8 +580,8 @@ void setup() {
   Serial.println("\nTemporary oscilloscope + DAC firmware");
   Serial.print("AP: ");          Serial.println(AP_SSID);
   Serial.print("Open: http://"); Serial.println(WiFi.softAPIP());
-  Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d\n",
-                MONITOR_PIN, 1000000UL / SAMPLE_INTERVAL_US, DAC_PIN);
+  Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d  |  delta=%u raw\n",
+                MONITOR_PIN, 1000000UL / SAMPLE_INTERVAL_US, DAC_PIN, DELTA_THRESH_RAW);
 }
 
 void loop() {
