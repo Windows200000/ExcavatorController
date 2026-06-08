@@ -28,6 +28,17 @@
  *   - Rebuilt web UI with simplified controls and top-down excavator model
  *   - Model glows live for tracks / turntable / arm / pump / test / light
  *   - Live SAFE / ARMED badge polled live from cam module /status endpoint
+ *
+ *  CHANGES vs. v3:
+ *   - Buttons are in pairs (pull-down + pull-up); one pin per pair is used.
+ *     Compatible with 3.3 V pull-up: active HIGH = digital HIGH on the chosen pin.
+ *   - Pin definitions now use PinDef {gpio, activeLevel} so the active logic
+ *     level is explicit and co-located with the pin number.
+ *   - Active levels per function:
+ *       Track forward  → HIGH   Track back    → LOW
+ *       Turntable left → HIGH   Turntable right → LOW
+ *       Light on       → LOW    Light off      → HIGH
+ *       Arm down       → HIGH   Arm up         → LOW
  * ============================================================
  */
 
@@ -46,24 +57,38 @@ const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET (255, 255, 255, 0);
 
 // ─────────────────────────────────────────────
-//  Output pins
-//  !! GPIO 34,35,36,39 are INPUT-ONLY on the ESP32 !!
+//  PinDef — bundles GPIO number with its active logic level.
+//
+//  activeLevel = HIGH  → driving the pin HIGH activates the function
+//                LOW   → driving the pin LOW  activates the function
+//
+//  pressPin()   writes activeLevel   to the GPIO
+//  releasePin() sets the GPIO to INPUT (Hi-Z), letting the pull-up/pull-down
+//               return the line to its idle state without fighting it.
+//
+//  !! GPIO 34,35,36,39 are INPUT-ONLY on the ESP32 — do NOT use here !!
 //  Safe output GPIOs: 2,4,5,12,13,14,15,16,17,18,19,
 //                     21,22,23,25,26,27,32,33
 // ─────────────────────────────────────────────
-const int PIN_LEFT_FWD    = 13;   // Left  track  forward
-const int PIN_LEFT_BACK   = 12;   // Left  track  back
-const int PIN_RIGHT_FWD   = 14;   // Right track  forward
-const int PIN_RIGHT_BACK  = 27;   // Right track  back
-const int PIN_TURN_LEFT   = 26;   // Turntable rotate left
-const int PIN_TURN_RIGHT  = 25;   // Turntable rotate right
-const int PIN_UP          = 33;   // Arm / bucket up
-const int PIN_DOWN        = 32;   // Arm / bucket down
-const int PIN_LIGHT_ON    = 15;   // Light ON  pulse
-const int PIN_LIGHT_OFF   = 2;    // Light OFF pulse  ← add your actual GPIO here
-const int PIN_TEST        = 4;    // Test (held)
+struct PinDef {
+  int gpio;
+  int activeLevel;  // HIGH (1) or LOW (0)
+};
 
-const int ALL_PINS[] = {
+//                              gpio   activeLevel
+const PinDef PIN_LEFT_FWD    = { 13,  HIGH };  // Left  track  forward
+const PinDef PIN_LEFT_BACK   = { 12,  LOW  };  // Left  track  back
+const PinDef PIN_RIGHT_FWD   = { 14,  HIGH };  // Right track  forward
+const PinDef PIN_RIGHT_BACK  = { 27,  LOW  };  // Right track  back
+const PinDef PIN_TURN_LEFT   = { 26,  HIGH };  // Turntable rotate left
+const PinDef PIN_TURN_RIGHT  = { 25,  LOW  };  // Turntable rotate right
+const PinDef PIN_UP          = { 33,  LOW  };  // Arm / bucket up
+const PinDef PIN_DOWN        = { 32,  HIGH };  // Arm / bucket down
+const PinDef PIN_LIGHT_ON    = { 15,  LOW  };  // Light ON  pulse  (active LOW)
+const PinDef PIN_LIGHT_OFF   = {  2,  HIGH };  // Light OFF pulse  (active HIGH)
+const PinDef PIN_TEST        = {  4,  HIGH };  // Test (held)
+
+const PinDef ALL_PINS[] = {
   PIN_LEFT_FWD, PIN_LEFT_BACK,
   PIN_RIGHT_FWD, PIN_RIGHT_BACK,
   PIN_TURN_LEFT, PIN_TURN_RIGHT,
@@ -80,18 +105,17 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // auto-release if heartbeat stops
 
 // ─────────────────────────────────────────────
 //  Multi-button hold state
-//  Each entry tracks one logical "button" → one or more pins
+//  Each entry tracks one logical "button" → one or more PinDefs
 // ─────────────────────────────────────────────
 struct HeldAction {
   String   name;
-  int      pins[4];      // up to 4 pins per action
+  PinDef   pins[4];    // up to 4 pins per action
   int      pinCount = 0;
   uint32_t lastSeen = 0;
   bool     active   = false;
 };
 
 // We allow up to 6 simultaneous held actions
-// (e.g. W driving both tracks while ArrowLeft runs turntable)
 const int MAX_HELD = 6;
 HeldAction heldActions[MAX_HELD];
 
@@ -111,16 +135,23 @@ bool lightOn = false;
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
 // ════════════════════════════════════════════════════════════
-void pressPin(int pin) { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
-void releasePin(int pin) { pinMode(pin, INPUT); }
+void pressPin(const PinDef& p) {
+  pinMode(p.gpio, OUTPUT);
+  digitalWrite(p.gpio, p.activeLevel);
+}
+
+void releasePin(const PinDef& p) {
+  // Return to Hi-Z; external pull-up/pull-down restores idle state
+  pinMode(p.gpio, INPUT);
+}
 
 void releaseAllPins() {
   for (int i = 0; i < PIN_COUNT; i++) releasePin(ALL_PINS[i]);
   for (int i = 0; i < MAX_HELD; i++) heldActions[i].active = false;
 }
 
-void pulsePin(int pin, uint32_t durationMs) {
-  pressPin(pin); delay(durationMs); releasePin(pin);
+void pulsePin(const PinDef& p, uint32_t durationMs) {
+  pressPin(p); delay(durationMs); releasePin(p);
 }
 
 // ─────────────────────────────────────────────
@@ -133,7 +164,6 @@ HeldAction* findHeld(const String& name) {
   return nullptr;
 }
 HeldAction* allocHeld(const String& name) {
-  // reuse existing slot if already active
   HeldAction* h = findHeld(name);
   if (h) return h;
   for (int i = 0; i < MAX_HELD; i++)
@@ -141,7 +171,7 @@ HeldAction* allocHeld(const String& name) {
   return nullptr; // all slots full
 }
 
-void startAction(const String& name, int* pins, int count) {
+void startAction(const String& name, PinDef* pins, int count) {
   HeldAction* h = allocHeld(name);
   if (!h) return;
   if (!h->active) {
@@ -163,28 +193,24 @@ void stopAction(const String& name) {
 }
 
 // ─────────────────────────────────────────────
-//  Map button name → pin(s)
+//  Map button name → PinDef(s)
 // ─────────────────────────────────────────────
-// Returns count of pins filled; 0 = unknown
-int buttonToPins(const String& btn, int* out) {
+// Returns count of PinDefs filled; 0 = unknown
+int buttonToPins(const String& btn, PinDef* out) {
   if (btn == "left_fwd")   { out[0]=PIN_LEFT_FWD;   return 1; }
   if (btn == "left_back")  { out[0]=PIN_LEFT_BACK;  return 1; }
   if (btn == "right_fwd")  { out[0]=PIN_RIGHT_FWD;  return 1; }
   if (btn == "right_back") { out[0]=PIN_RIGHT_BACK; return 1; }
-  if (btn == "fwd")        { out[0]=PIN_LEFT_FWD; out[1]=PIN_RIGHT_FWD;  return 2; }
+  if (btn == "fwd")        { out[0]=PIN_LEFT_FWD;  out[1]=PIN_RIGHT_FWD;  return 2; }
   if (btn == "back")       { out[0]=PIN_LEFT_BACK; out[1]=PIN_RIGHT_BACK; return 2; }
   if (btn == "spin_left")  { out[0]=PIN_LEFT_BACK; out[1]=PIN_RIGHT_FWD; return 2; }
-  if (btn == "spin_right") { out[0]=PIN_LEFT_FWD; out[1]=PIN_RIGHT_BACK; return 2; }
+  if (btn == "spin_right") { out[0]=PIN_LEFT_FWD;  out[1]=PIN_RIGHT_BACK; return 2; }
   if (btn == "turn_left")  { out[0]=PIN_TURN_LEFT;  return 1; }
   if (btn == "turn_right") { out[0]=PIN_TURN_RIGHT; return 1; }
-  if (btn == "up")         { out[0]=PIN_UP;          return 1; }
-  if (btn == "down")       { out[0]=PIN_DOWN;        return 1; }
-  if (btn == "test")       { out[0]=PIN_TEST;        return 1; }
+  if (btn == "up")         { out[0]=PIN_UP;         return 1; }
+  if (btn == "down")       { out[0]=PIN_DOWN;       return 1; }
+  if (btn == "test")       { out[0]=PIN_TEST;       return 1; }
   return 0;
-}
-
-bool isPulseButton(const String& btn) {
-  return (btn == "light_on" || btn == "light_off");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -194,7 +220,7 @@ void relayCamCmd(const String& path) {
   if (camIP.length() == 0) return;
   HTTPClient http;
   http.begin("http://" + camIP + path);
-  http.setTimeout(200);   // Fix A: don't block longer than one heartbeat window
+  http.setTimeout(200);
   http.GET();
   http.end();
 }
@@ -238,7 +264,7 @@ void handleCmd() {
   String btn    = server.arg("btn");
   String action = server.hasArg("action") ? server.arg("action") : "press";
 
-  // Light toggle — pulse the appropriate pin
+  // Light toggle — pulse the appropriate PinDef
   if (btn == "light") {
     if (action == "press") {
       lightOn = !lightOn;
@@ -249,7 +275,7 @@ void handleCmd() {
     return;
   }
 
-  int pins[4];
+  PinDef pins[4];
   int count = buttonToPins(btn, pins);
   if (count == 0) { server.send(400, "text/plain", "Unknown button"); return; }
 
@@ -266,7 +292,7 @@ void handleCamCmd() {
   if (!server.hasArg("cmd")) { server.send(400, "text/plain", "Missing cmd"); return; }
   String cmd = server.arg("cmd");
 
-  if (cmd == "pump_press")   relayCamCmd("/pump?action=press");
+  if (cmd == "pump_press")        relayCamCmd("/pump?action=press");
   else if (cmd == "pump_release") relayCamCmd("/pump?action=release");
   else if (cmd == "mode_arm")     relayCamCmd("/mode?set=armed");
   else if (cmd == "mode_safe")    relayCamCmd("/mode?set=safe");
