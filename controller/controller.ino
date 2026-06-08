@@ -77,9 +77,9 @@ struct PinDef {
 
 //                              gpio   activeLevel
 const PinDef PIN_LEFT_FWD    = { 13,  HIGH };  // Left  track  forward
-const PinDef PIN_LEFT_BACK   = { 12,  LOW  };  // Left  track  back
+const PinDef PIN_LEFT_BACK   = { 13,  LOW  };  // Left  track  back
 const PinDef PIN_RIGHT_FWD   = { 14,  HIGH };  // Right track  forward
-const PinDef PIN_RIGHT_BACK  = { 27,  LOW  };  // Right track  back
+const PinDef PIN_RIGHT_BACK  = { 14,  LOW  };  // Right track  back
 const PinDef PIN_TURN_LEFT   = { 26,  HIGH };  // Turntable rotate left
 const PinDef PIN_TURN_RIGHT  = { 25,  LOW  };  // Turntable rotate right
 const PinDef PIN_UP          = { 33,  LOW  };  // Arm / bucket up
