@@ -489,3 +489,30 @@ The detection overlay pipeline is designed to support future autonomous operatio
 - The controller can read these detections in `loop()` and autonomously issue `pressPin` / `releasePin` calls without browser involvement
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
 - Suggested detection algorithms: colour thresholding (simple), ArUco marker tracking (positioning), TFLite model inference (object recognition)
+
+---
+
+## Tester – ESP32 ADC/DAC Oscilloscope
+
+A separate `tester/tester.ino` sketch turns the NodeMCU-ESP32 into a high-speed
+single-channel oscilloscope and DAC playground for debugging the excavator’s
+hydraulic and electrical signals.
+
+- WiFi: runs its own AP `ExcavatorAP` on 192.168.4.1, matching the controller.
+- ADC: GPIO34 in single-shot mode at ~50 kSa/s (`SAMPLE_INTERVAL_US = 20`).
+- Delta compression: samples are only stored when the raw ADC code changes by
+  at least 16 LSBs (≈12.9 mV at 3.3 V / 12‑bit). The ESP32 ring buffer holds
+  4,000 stored samples, which is more than 4 seconds of activity at this
+  threshold even at maximum sampling rate.
+- Transport: `/samples` returns JSON of compressed samples as
+  `[seq, time_us, raw]` plus `sampleIntervalUs`.
+- DAC: GPIO25 is driven via `/dac?value=N` and rendered as a horizontal
+  reference line in the browser.
+
+The browser decompresses the delta-encoded stream back into a staircase
+waveform before drawing and CSV export. For every compressed sample after
+the first it injects an extra “hold” point one sampling interval before the
+new sample at the previous voltage level, so each plateau is represented
+by exactly two points: a start and an end. The in-browser buffers retain
+the full decompressed timeline since page load or last Clear and the
+Download CSV button exports this full history.
