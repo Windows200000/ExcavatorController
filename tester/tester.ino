@@ -12,9 +12,10 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 const int MONITOR_PIN         = 34;
 const int DAC_PIN             = 25;
 
-const uint32_t SAMPLE_INTERVAL_US = 1000;  // 1 kSa/s — 100 ms poll = 100 samples/poll
-const uint32_t MAX_JSON_SAMPLES   = 500;   // hard cap per response, well above 100
-const size_t   BUFFER_SIZE        = 4000;  // 4 s safety net, fits easily in DRAM
+// High-speed single-shot sampling with delta compression
+const uint32_t SAMPLE_INTERVAL_US = 20;    // ~50 kSa/s target (single-shot analogRead)
+const uint32_t MAX_JSON_SAMPLES   = 500;   // hard cap per response
+const size_t   BUFFER_SIZE        = 4000;  // 4 s safety net in terms of stored (compressed) samples
 
 WebServer server(80);
 
@@ -22,13 +23,43 @@ volatile uint16_t sampleRaw[BUFFER_SIZE];
 volatile uint32_t sampleTimeUs[BUFFER_SIZE];
 volatile uint32_t totalSamples = 0;
 
+// Delta compression parameters: store only when raw changes by >= 16 LSBs (~12.9 mV)
+const uint16_t DELTA_THRESH_RAW = 16;
+volatile uint16_t lastStoredRaw = 0;
+volatile bool     hasLastStored = false;
+
 uint8_t dacValue = 0;
 
 void IRAM_ATTR onSampleTimer(void*) {
+  // Take one ADC sample in single-shot mode
+  uint16_t raw = (uint16_t)analogRead(MONITOR_PIN);
+
+  // First stored sample is always kept
+  if (!hasLastStored) {
+    uint32_t seq = totalSamples + 1;
+    size_t   idx = (seq - 1) % BUFFER_SIZE;
+
+    sampleRaw[idx]    = raw;
+    sampleTimeUs[idx] = (uint32_t)micros();
+    lastStoredRaw     = raw;
+    totalSamples      = seq;
+    hasLastStored     = true;
+    return;
+  }
+
+  // Delta compression in raw domain: only keep changes >= DELTA_THRESH_RAW
+  int diff = (int)raw - (int)lastStoredRaw;
+  if (diff >= - (int)DELTA_THRESH_RAW && diff <= (int)DELTA_THRESH_RAW) {
+    // Below threshold -> skip storing, no seq increment
+    return;
+  }
+
   uint32_t seq = totalSamples + 1;
   size_t   idx = (seq - 1) % BUFFER_SIZE;
-  sampleRaw[idx]    = (uint16_t)analogRead(MONITOR_PIN);
+
+  sampleRaw[idx]    = raw;
   sampleTimeUs[idx] = (uint32_t)micros();
+  lastStoredRaw     = raw;
   totalSamples      = seq;
 }
 
@@ -250,20 +281,48 @@ async function poll() {
         statusEl.textContent = 'Buffer full!';
         statusEl.className   = 'warn';
       } else {
-        let prevSeq = lastSeq;
         for (const s of data.samples) {
-          if (storeLen >= MAX_STORE) break;
           const seq = s[0];
-          const gap = (prevSeq !== 0 && seq !== prevSeq + 1) ? 1 : 0;
+          const tUs = s[1];
+          const raw = s[2];
+          const v   = rawToVolt(raw);
+
+          // Real packet loss detection: delta compression never creates seq gaps
+          const gap = (lastSeq !== 0 && seq !== lastSeq + 1) ? 1 : 0;
           if (gap) {
-            totalDropped += seq - prevSeq - 1;
+            totalDropped += seq - lastSeq - 1;
             droppedEl.textContent = totalDropped;
           }
-          storeTUs[storeLen]  = s[1];
-          storeV[storeLen]    = rawToVolt(s[2]);
-          storeGap[storeLen]  = gap;
-          storeLen++;
-          prevSeq = seq;
+
+          if (storeLen === 0) {
+            // First point: just store as-is
+            storeTUs[0] = tUs;
+            storeV[0]   = v;
+            storeGap[0] = gap;
+            storeLen    = 1;
+          } else {
+            const prevT = storeTUs[storeLen - 1];
+            const prevV = storeV[storeLen - 1];
+
+            // Synthetic hold point for previous level, just before new sample
+            let tHold = tUs - sampleIntervalUs;
+            if (tHold <= prevT) tHold = prevT; // clamp to avoid time going backwards
+
+            if (storeLen + 2 > MAX_STORE) break;
+
+            // 1) Hold point (no gap)
+            storeTUs[storeLen] = tHold;
+            storeV[storeLen]   = prevV;
+            storeGap[storeLen] = 0;
+            storeLen++;
+
+            // 2) New sample (with gap marker if there was loss)
+            storeTUs[storeLen] = tUs;
+            storeV[storeLen]   = v;
+            storeGap[storeLen] = gap;
+            storeLen++;
+          }
+
           lastSeq = seq;
         }
         storedEl.textContent = storeLen.toLocaleString();
@@ -378,6 +437,7 @@ function drawTrace(w, h) {
   const startIdx = lo;
   const windowUs = timeWindowS * 1_000_000;
 
+  // Gap markers
   for (let i = startIdx; i < storeLen; i++) {
     if (!storeGap[i]) continue;
     const x = ((storeTUs[i] - cutoffUs) / windowUs) * w;
