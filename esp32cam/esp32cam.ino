@@ -85,7 +85,7 @@ const int PIN_PUMP = 4; //Temp for LED, change fire action back to LOW when atta
 //  If controller stops sending hold heartbeats,
 //  auto-release the pump after this many ms.
 // ─────────────────────────────────────────────
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;  // Fix B: was 300 — widened for WiFi round-trip headroom
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;  // Fix B: was 300 — widened to 800 for WiFi round-trip headroom
 
 // ─────────────────────────────────────────────
 //  Stream settings

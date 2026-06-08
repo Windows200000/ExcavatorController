@@ -293,6 +293,7 @@ void handleCamCmd() {
   String cmd = server.arg("cmd");
 
   if (cmd == "pump_press")        relayCamCmd("/pump?action=press");
+  else if (cmd == "pump_hold")    relayCamCmd("/pump?action=hold");
   else if (cmd == "pump_release") relayCamCmd("/pump?action=release");
   else if (cmd == "mode_arm")     relayCamCmd("/mode?set=armed");
   else if (cmd == "mode_safe")    relayCamCmd("/mode?set=safe");
