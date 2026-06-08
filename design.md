@@ -1,4 +1,4 @@
-# Excavator Robot â€” System Design Document
+# Excavator Robot – System Design Document
 
 ---
 
@@ -12,8 +12,8 @@ This document describes the full firmware architecture for a two-module wireless
 
 | Module | Hardware | Role |
 |--------|----------|------|
-| Controller | Berrybase NodeMCU-ESP32 | WiFi AP Â· Web console Â· GPIO button driver Â· Overlay store |
-| Camera | Joy-IT SBC-ESP32-Cam | WiFi client Â· MJPEG streamer Â· Image processing Â· Overlay pusher |
+| Controller | Berrybase NodeMCU-ESP32 | WiFi AP · Web console · GPIO button driver · Overlay store |
+| Camera | Joy-IT SBC-ESP32-Cam | WiFi client · MJPEG streamer · Image processing · Overlay pusher |
 
 ---
 
@@ -23,15 +23,15 @@ This document describes the full firmware architecture for a two-module wireless
 [ Browser ]
     |  HTTP (port 80)
     |
-[ NodeMCU-ESP32 â€“ Controller ]   192.168.4.1
+[ NodeMCU-ESP32 – Controller ]   192.168.4.1
     WiFi AP: ExcavatorAP
     |
     |  WiFi (STA <- AP)
     |
-[ ESP32-CAM â€“ Camera ]           192.168.4.x (DHCP)
+[ ESP32-CAM – Camera ]           192.168.4.x (DHCP)
 ```
 
-All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser â€” all relayed commands go through the controller's `/camcmd` endpoint.
+All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser – all relayed commands go through the controller's `/camcmd` endpoint.
 
 ---
 
@@ -56,7 +56,7 @@ Browser    ->  GET  /overlay (JSON)  ->  Controller  ->  Canvas draw
 Browser (hold/release events)
     ->  GET /cmd?btn=X&action=Y
     ->  Controller: pressPin / releasePin
-    ->  Physical GPIO pulls remote-control button line LOW
+    ->  Physical GPIO drives remote-control button line to activeLevel
 ```
 
 ### Cam Command Relay
@@ -91,7 +91,7 @@ ESP32 board package URL: `https://dl.espressif.com/dl/package_esp32_index.json`
 
 ---
 
-## Controller â€” NodeMCU ESP32
+## Controller – NodeMCU ESP32
 
 The controller runs on the Berrybase NodeMCU-ESP32. It hosts the WiFi Access Point, serves the web console, stores detection overlays pushed by the camera, and drives the physical remote-control buttons of the excavator via GPIO. It also relays pump and mode commands to the camera module via the `/camcmd` endpoint.
 
@@ -107,38 +107,43 @@ const IPAddress AP_SUBNET (255, 255, 255, 0);
 
 ### GPIO Pin Constants
 
-> **Important:** GPIO 34, 35, 36, 39 are **INPUT-ONLY** on the ESP32 â€” they have no output driver and will silently fail. Safe output-capable GPIOs on the NodeMCU-ESP32: 2, 4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
+> **Important:** GPIO 34, 35, 36, 39 are **INPUT-ONLY** on the ESP32 — they have no output driver and will silently fail. Safe output-capable GPIOs on the NodeMCU-ESP32: 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
+
+Pin definitions use a `PinDef` struct that bundles the GPIO number with its active logic level:
 
 ```cpp
-const int PIN_LEFT_FWD    = 13;   // Left track  forward
-const int PIN_LEFT_BACK   = 12;   // Left track  back
-const int PIN_RIGHT_FWD   = 14;   // Right track forward
-const int PIN_RIGHT_BACK  = 27;   // Right track back
-const int PIN_TURN_LEFT   = 26;   // Turn left
-const int PIN_TURN_RIGHT  = 25;   // Turn right
-const int PIN_UP          = 33;   // Arm / bucket up
-const int PIN_DOWN        = 32;   // Arm / bucket down
-const int PIN_LIGHT       = 15;   // Light (momentary pulse)
-const int PIN_TEST        = 4;    // Test button 1
+struct PinDef {
+  int gpio;
+  int activeLevel;  // HIGH (1) = driving HIGH activates the function
+                    // LOW  (0) = driving LOW  activates the function
+};
 ```
 
-`PIN_LIGHT` is split into two pins:
+`pressPin()` writes `activeLevel` to the GPIO. `releasePin()` sets the GPIO to INPUT (Hi-Z), letting the external pull-up/pull-down restore the idle state without fighting the driver.
+
+| Constant | GPIO | Active Level | Function |
+|----------|------|-------------|----------|
+| `PIN_LEFT_FWD` | 13 | HIGH | Left track forward |
+| `PIN_LEFT_BACK` | 12 | LOW | Left track back |
+| `PIN_RIGHT_FWD` | 14 | HIGH | Right track forward |
+| `PIN_RIGHT_BACK` | 27 | LOW | Right track back |
+| `PIN_TURN_LEFT` | 26 | HIGH | Turntable rotate left |
+| `PIN_TURN_RIGHT` | 25 | LOW | Turntable rotate right |
+| `PIN_UP` | 33 | LOW | Arm / bucket up |
+| `PIN_DOWN` | 32 | HIGH | Arm / bucket down |
+| `PIN_LIGHT_ON` | 15 | LOW | Light ON pulse (active LOW) |
+| `PIN_LIGHT_OFF` | 2 | HIGH | Light OFF pulse (active HIGH) |
+| `PIN_TEST` | 4 | HIGH | Test (held) |
+
+All output pins are tracked in an array for safe initialisation and `releaseAllPins()`:
 
 ```cpp
-// PIN_LIGHT_ON  â€“ pulse to turn light on
-// PIN_LIGHT_OFF â€“ pulse to turn light off
-// (hidden behind a single toggle in the web UI)
-```
-
-All output pins are tracked in an array for safe initialisation and `releaseAll()`:
-
-```cpp
-const int ALL_PINS[] = {
+const PinDef ALL_PINS[] = {
   PIN_LEFT_FWD, PIN_LEFT_BACK,
   PIN_RIGHT_FWD, PIN_RIGHT_BACK,
   PIN_TURN_LEFT, PIN_TURN_RIGHT,
   PIN_UP, PIN_DOWN,
-  PIN_LIGHT, PIN_TEST
+  PIN_LIGHT_ON, PIN_LIGHT_OFF, PIN_TEST
 };
 const int PIN_COUNT = sizeof(ALL_PINS) / sizeof(ALL_PINS[0]);
 ```
@@ -146,7 +151,7 @@ const int PIN_COUNT = sizeof(ALL_PINS) / sizeof(ALL_PINS[0]);
 ### Timing Constants
 
 ```cpp
-const uint32_t PULSE_DURATION_MS = 150;   // Duration of light / test momentary pulse
+const uint32_t PULSE_DURATION_MS = 150;   // Duration of light on/off pulse
 const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat stops
 ```
 
@@ -158,41 +163,66 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat
 | `left_back` | Hold | Active while held |
 | `right_fwd` | Hold | Active while held |
 | `right_back` | Hold | Active while held |
-| `turn_left` | Hold | Active while held |
-| `turn_right` | Hold | Active while held |
+| `fwd` | Hold | Both tracks forward simultaneously |
+| `back` | Hold | Both tracks back simultaneously |
+| `spin_left` | Hold | Left track back + Right track forward (counter-clockwise spin) |
+| `spin_right` | Hold | Left track forward + Right track back (clockwise spin) |
+| `turn_left` | Hold | Turntable rotate left |
+| `turn_right` | Hold | Turntable rotate right |
 | `up` | Hold | Active while held |
 | `down` | Hold | Active while held |
 | `light` | Pulse | Toggle backed by `PIN_LIGHT_ON` / `PIN_LIGHT_OFF` pulses |
 | `test` | Hold | Active while held |
 
-Multi-button simultaneous hold is supported, allowing multi-pin actions. WASD simultaneously drives both tracks (forward/back) or opposite-spin turn.
+Up to `MAX_HELD = 6` simultaneous held actions are supported, allowing multi-pin composite actions. WASD simultaneously drives both tracks (forward/back) or opposite-spin turn.
+
+#### Composite Button Actions
+
+Some button names drive multiple pins simultaneously:
+
+| Button | Pins Driven | Effect |
+|--------|-------------|--------|
+| `fwd` | `PIN_LEFT_FWD` + `PIN_RIGHT_FWD` | Both tracks forward |
+| `back` | `PIN_LEFT_BACK` + `PIN_RIGHT_BACK` | Both tracks back |
+| `spin_left` | `PIN_LEFT_BACK` + `PIN_RIGHT_FWD` | Counter-clockwise spin |
+| `spin_right` | `PIN_LEFT_FWD` + `PIN_RIGHT_BACK` | Clockwise spin |
+
+### Multi-Button Hold State
+
+The controller supports up to `MAX_HELD = 6` simultaneous held actions. Each slot is a `HeldAction` struct tracking the action name, up to 4 `PinDef`s, and a `lastSeen` timestamp:
+
+```cpp
+struct HeldAction {
+  String   name;
+  PinDef   pins[4];    // up to 4 pins per action
+  int      pinCount = 0;
+  uint32_t lastSeen = 0;
+  bool     active   = false;
+};
+HeldAction heldActions[MAX_HELD];
+```
 
 ### Pin-Control Pattern
 
-The button emulation works by pulling the remote-control line LOW (simulating a button press) and releasing it by returning the GPIO to high-impedance input mode:
+The button emulation works by driving the GPIO to its `activeLevel` (simulating a button press) and releasing it by returning the GPIO to high-impedance input mode, letting the external pull-up/pull-down restore the idle state:
 
 ```cpp
-// Press the button (pull the line down)
-pinMode(pin, OUTPUT);
-digitalWrite(pin, LOW);
-// some delay
+void pressPin(const PinDef& p) {
+  pinMode(p.gpio, OUTPUT);
+  digitalWrite(p.gpio, p.activeLevel);
+}
 
-// Release the button
-pinMode(pin, INPUT);        // back to high-Z
-```
+void releasePin(const PinDef& p) {
+  pinMode(p.gpio, INPUT);   // back to Hi-Z
+}
 
-Helper functions wrap this pattern:
-
-```cpp
-void pressPin(int pin)   { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
-void releasePin(int pin) { pinMode(pin, INPUT); }   // back to high-Z
-void releaseAll()        { /* iterates ALL_PINS, calls releasePin */ }
-void pulsePin(int pin, uint32_t durationMs) { pressPin(pin); delay(durationMs); releasePin(pin); }
+void releaseAllPins() { /* iterates ALL_PINS, calls releasePin; clears all heldActions */ }
+void pulsePin(const PinDef& p, uint32_t durationMs) { pressPin(p); delay(durationMs); releasePin(p); }
 ```
 
 ### Heartbeat Watchdog
 
-The browser sends a heartbeat `action=hold` every `HOLD_HEARTBEAT_INTERVAL_MS` while a key or button is held. If no heartbeat arrives within `HOLD_TIMEOUT_MS` (300 ms), the controller auto-releases the pin. This is a safety feature preventing the excavator from running away if the browser tab closes or network drops.
+The browser sends a heartbeat `action=hold` every 150 ms while a key or button is held. If no heartbeat arrives within `HOLD_TIMEOUT_MS` (300 ms), the controller auto-releases all pins for that action and clears the slot. This is a safety feature preventing the excavator from running away if the browser tab closes or network drops.
 
 ### HTTP Endpoints
 
@@ -205,13 +235,13 @@ The browser sends a heartbeat `action=hold` every `HOLD_HEARTBEAT_INTERVAL_MS` w
 | `GET` | `/overlay` | Browser polls detection overlay JSON |
 | `GET` | `/cmd?btn=X&action=Y` | Browser sends button press / hold / release |
 | `GET` | `/camcmd?cmd=X` | Controller relays pump and mode commands to cam |
-| `GET` | `/status` | Returns `{camIP, uptime, heap, heldPin}` |
+| `GET` | `/status` | Returns `{camIP, uptime, heap, light}` |
 
 #### `/cmd` Action Values
 
-- `press` â€” start holding the pin LOW; begins heartbeat window
-- `hold` â€” heartbeat renewal; resets the `HOLD_TIMEOUT_MS` watchdog
-- `release` â€” release the pin immediately
+- `press` – start holding the pin to activeLevel; begins heartbeat window
+- `hold` – heartbeat renewal; resets the `HOLD_TIMEOUT_MS` watchdog
+- `release` – release the pin immediately (back to Hi-Z)
 
 ### Web Console
 
@@ -219,7 +249,7 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
 - An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam's address
 - A `<canvas>` overlay rendered on top of the feed for detection bounding boxes
-- Five control groups: **Left Track**, **Right Track**, **Turn**, **Arm / Bucket**, **Lights & Aux**
+- Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
 - Simplified controls with a top-down excavator model SVG
 - Model glows live for tracks / turntable / arm / pump / test / light activation states
@@ -229,14 +259,14 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
 | Key | Action |
 |-----|--------|
-| `W` | Left track forward |
-| `S` | Left track back |
-| `â†‘` Arrow Up | Right track forward |
-| `â†“` Arrow Down | Right track back |
-| `â†` Arrow Left | Turn left |
-| `â†’` Arrow Right | Turn right |
-| `Q` | Arm / bucket up |
-| `E` | Arm / bucket down |
+| `W` | Both tracks forward |
+| `S` | Both tracks back |
+| `A` | Spin left (counter-clockwise) |
+| `D` | Spin right (clockwise) |
+| `←` Arrow Left | Turntable rotate left |
+| `→` Arrow Right | Turntable rotate right |
+| `↑` Arrow Up | Arm / bucket up |
+| `↓` Arrow Down | Arm / bucket down |
 | `L` | Light toggle (pulse) |
 | `T` | Test hold |
 | `Space` | Pump hold (relayed to cam via `/camcmd`) |
@@ -253,22 +283,23 @@ The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedIm
 
 ```
 setup():
-  releaseAll()          <- ensure all pins start high-Z
+  releaseAllPins()      <- ensure all pins start high-Z
   WiFi.softAP(...)
   register HTTP routes
   server.begin()
 
 loop():
   server.handleClient()
-  // Heartbeat watchdog
-  if (heldPin.active && (millis() - heldPin.lastSeen) > HOLD_TIMEOUT_MS) {
-    auto-release pin
-  }
+  // Heartbeat watchdog — iterate all heldActions slots
+  for each heldActions[i] where active:
+    if (millis() - lastSeen) > HOLD_TIMEOUT_MS:
+      auto-release all pins for that action
+      heldActions[i].active = false
 ```
 
 ---
 
-## Camera Module â€” Joy-IT SBC-ESP32-Cam
+## Camera Module – Joy-IT SBC-ESP32-Cam
 
 The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller's WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
 
@@ -339,7 +370,7 @@ The following pins are internally connected to the SD card slot on the SBC-ESP32
 To put the device into flash mode: connect **IO0 to GND** before power-on. Remove the connection after upload. A USB-to-TTL converter (3.3 V) is required (no built-in USB). Serial baud rate: **115200**.
 
 | Camera Module Pin | USB-TTL Converter |
-|-------------------|--------------------|
+|-------------------|-------------------|
 | 5V | 5V |
 | GND | GND |
 | U0T (IO1) | RX |
