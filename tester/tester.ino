@@ -36,6 +36,10 @@ volatile uint32_t totalSamples  = 0;  // count of stored (compressed) samples
 volatile uint32_t writeIdx      = 0;  // rolling write index — avoids % in hot path
 volatile uint16_t lastStoredRaw = 0;  // seeded in setup() before timer starts
 
+// Debug counters — updated only in ISR, read only in loop()
+volatile uint32_t DRAM_ATTR dbgIsrFired  = 0;  // total ISR invocations
+volatile uint32_t DRAM_ATTR dbgIsrStored = 0;  // ISR invocations that stored a sample
+
 uint8_t dacValue = 0;
 
 // Hardware timer ISR — called directly by the hardware timer peripheral.
@@ -43,6 +47,8 @@ uint8_t dacValue = 0;
 // IRAM_ATTR ensures the function is resident in IRAM so it runs even
 // when the flash cache is busy serving WiFi / WebServer code.
 void IRAM_ATTR onSampleTimer() {
+  dbgIsrFired++;
+
   uint16_t raw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
   uint32_t now = (uint32_t)esp_timer_get_time();
 
@@ -64,6 +70,7 @@ void IRAM_ATTR onSampleTimer() {
   // Advance rolling index without division
   if (++writeIdx >= BUFFER_SIZE) writeIdx = 0;
   totalSamples++;
+  dbgIsrStored++;
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -499,6 +506,12 @@ void handleSamples() {
   if (latest >= startSeq && (latest - startSeq + 1) > MAX_JSON_SAMPLES)
     startSeq = latest - MAX_JSON_SAMPLES + 1;
 
+  uint32_t sendCount = (latest >= startSeq) ? (latest - startSeq + 1) : 0;
+  Serial.printf("[SAMPLES] since=%lu latest=%lu oldest=%lu startSeq=%lu sending=%lu\n",
+                (unsigned long)since, (unsigned long)latest,
+                (unsigned long)oldest, (unsigned long)startSeq,
+                (unsigned long)sendCount);
+
   // Fixed stack buffer avoids heap fragmentation during JSON build.
   // Max: header ~60 + 500 samples * ~28 bytes = ~14 060 bytes; 16 KB is safe.
   static char jsonBuf[16384];
@@ -544,6 +557,12 @@ void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
 
+// ── Loop debug: print ISR stats every 2 s ──────────────────────────────────
+static uint32_t lastDbgMs       = 0;
+static uint32_t lastDbgFired    = 0;
+static uint32_t lastDbgStored   = 0;
+static uint32_t lastDbgSamples  = 0;
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -560,6 +579,11 @@ void setup() {
   lastStoredRaw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
   totalSamples  = 0;
   writeIdx      = 0;
+  dbgIsrFired   = 0;
+  dbgIsrStored  = 0;
+
+  Serial.printf("[BOOT] lastStoredRaw seed = %u  (%.3f V)\n",
+                (unsigned)lastStoredRaw, lastStoredRaw * 3.3f / 4095.0f);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
@@ -581,14 +605,37 @@ void setup() {
   timerAttachInterrupt(hwTimer, &onSampleTimer);
   timerStart(hwTimer);
 
+  lastDbgMs = millis();
   Serial.println("\nTemporary oscilloscope + DAC firmware");
   Serial.print("AP: ");          Serial.println(AP_SSID);
   Serial.print("Open: http://"); Serial.println(WiFi.softAPIP());
   Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d  |  delta=%u raw  |  max_gap=%lu us\n",
                 MONITOR_PIN, (unsigned long)SAMPLE_FREQ_HZ, DAC_PIN, DELTA_THRESH_RAW,
                 (unsigned long)MAX_GAP_US);
+  Serial.println("[DBG] ISR debug prints every 2 s: fired/stored/totalSamples/lastRaw");
 }
 
 void loop() {
   server.handleClient();
+
+  uint32_t now = millis();
+  if (now - lastDbgMs >= 2000) {
+    lastDbgMs = now;
+
+    // Snapshot volatile counters once
+    uint32_t fired   = dbgIsrFired;
+    uint32_t stored  = dbgIsrStored;
+    uint32_t total   = totalSamples;
+    uint16_t lastRaw = lastStoredRaw;
+
+    Serial.printf("[DBG] ISR fired=%lu (+%lu)  stored=%lu (+%lu)  totalSamples=%lu  lastRaw=%u (%.3fV)\n",
+                  (unsigned long)fired,   (unsigned long)(fired  - lastDbgFired),
+                  (unsigned long)stored,  (unsigned long)(stored - lastDbgStored),
+                  (unsigned long)total,
+                  (unsigned)lastRaw, lastRaw * 3.3f / 4095.0f);
+
+    lastDbgFired   = fired;
+    lastDbgStored  = stored;
+    lastDbgSamples = total;
+  }
 }
