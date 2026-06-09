@@ -14,7 +14,9 @@ const int MONITOR_PIN         = 34;   // ADC1_CHANNEL_6
 const int DAC_PIN             = 25;
 
 // High-speed single-shot sampling with delta compression
-const uint32_t SAMPLE_INTERVAL_US = 20;    // ~50 kSa/s target
+// timerBegin() takes frequency in Hz; 1000000/20 = 50000 Hz = 50 kSa/s target
+const uint32_t SAMPLE_INTERVAL_US = 20;
+const uint32_t SAMPLE_FREQ_HZ     = 1000000UL / SAMPLE_INTERVAL_US;  // 50000
 const uint32_t MAX_JSON_SAMPLES   = 500;   // hard cap per HTTP response
 const size_t   BUFFER_SIZE        = 4000;  // stored (compressed) sample ring buffer
 
@@ -23,29 +25,30 @@ const uint16_t DELTA_THRESH_RAW = 16;
 
 WebServer server(80);
 
-// Ring buffer in DRAM (no PSRAM lookup latency)
+// Ring buffer placed in DRAM (no flash-cache miss latency from ISR)
 static uint16_t DRAM_ATTR sampleRaw[BUFFER_SIZE];
 static uint32_t DRAM_ATTR sampleTimeUs[BUFFER_SIZE];
 
-volatile uint32_t totalSamples = 0;   // count of stored (compressed) samples
-volatile uint32_t writeIdx     = 0;   // rolling write index, avoids % on every ISR
-volatile uint16_t lastStoredRaw = 0;  // pre-initialised in setup() before timer starts
+volatile uint32_t totalSamples  = 0;  // count of stored (compressed) samples
+volatile uint32_t writeIdx      = 0;  // rolling write index — avoids % in hot path
+volatile uint16_t lastStoredRaw = 0;  // seeded in setup() before timer starts
 
 uint8_t dacValue = 0;
 
-// ISR: runs directly in hardware timer interrupt context (ESP_TIMER_ISR).
-// Uses adc1_get_raw() directly (no Arduino mutex overhead) and
-// esp_timer_get_time() (direct register read, cheaper than micros()).
-void IRAM_ATTR onSampleTimer(void*) {
+// Hardware timer ISR — called directly by the hardware timer peripheral.
+// Arduino-ESP32 v3 hardware timer callbacks take no arguments.
+// IRAM_ATTR ensures the function is resident in IRAM so it runs even
+// when the flash cache is busy serving WiFi / WebServer code.
+void IRAM_ATTR onSampleTimer() {
   uint16_t raw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
 
-  // Delta compression: skip sample if change is below threshold
+  // Delta compression: skip if change is below threshold
   int diff = (int)raw - (int)lastStoredRaw;
   if (diff > -(int)DELTA_THRESH_RAW && diff < (int)DELTA_THRESH_RAW) return;
 
   // Store sample
   sampleRaw[writeIdx]    = raw;
-  sampleTimeUs[writeIdx] = (uint32_t)esp_timer_get_time();
+  sampleTimeUs[writeIdx] = (uint32_t)esp_timer_get_time();  // µs, direct register read
   lastStoredRaw          = raw;
 
   // Advance rolling index without division
@@ -277,7 +280,6 @@ async function poll() {
           const raw = s[2];
           const v   = rawToVolt(raw);
 
-          // Real packet loss detection: delta compression never creates seq gaps
           const gap = (lastSeq !== 0 && seq !== lastSeq + 1) ? 1 : 0;
           if (gap) {
             totalDropped += seq - lastSeq - 1;
@@ -285,7 +287,6 @@ async function poll() {
           }
 
           if (storeLen === 0) {
-            // First point: just store as-is
             storeTUs[0] = tUs;
             storeV[0]   = v;
             storeGap[0] = gap;
@@ -294,19 +295,16 @@ async function poll() {
             const prevT = storeTUs[storeLen - 1];
             const prevV = storeV[storeLen - 1];
 
-            // Synthetic hold point for previous level, just before new sample
             let tHold = tUs - sampleIntervalUs;
-            if (tHold <= prevT) tHold = prevT; // clamp to avoid time going backwards
+            if (tHold <= prevT) tHold = prevT;
 
             if (storeLen + 2 > MAX_STORE) break;
 
-            // 1) Hold point (no gap)
             storeTUs[storeLen] = tHold;
             storeV[storeLen]   = prevV;
             storeGap[storeLen] = 0;
             storeLen++;
 
-            // 2) New sample (with gap marker if there was loss)
             storeTUs[storeLen] = tUs;
             storeV[storeLen]   = v;
             storeGap[storeLen] = gap;
@@ -321,7 +319,7 @@ async function poll() {
     }
 
     const rate = 1000000 / sampleIntervalUs;
-    rateEl.textContent   = rate >= 1000
+    rateEl.textContent = rate >= 1000
       ? `${(rate/1000).toFixed(1)} kSa/s`
       : `${rate.toFixed(0)} Sa/s`;
     if (storeLen < MAX_STORE) {
@@ -471,8 +469,8 @@ void handleRoot() {
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
-// Serialise uint32 into buf[], return number of chars written (no null terminator needed).
-static int IRAM_ATTR u32toa(uint32_t v, char* buf) {
+// Serialise uint32 into buf[], returns number of chars written (no null terminator).
+static int u32toa(uint32_t v, char* buf) {
   if (v == 0) { buf[0] = '0'; return 1; }
   char tmp[10]; int n = 0;
   while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
@@ -491,12 +489,11 @@ void handleSamples() {
   if (latest >= startSeq && (latest - startSeq + 1) > MAX_JSON_SAMPLES)
     startSeq = latest - MAX_JSON_SAMPLES + 1;
 
-  // Build JSON into a fixed stack buffer to avoid heap fragmentation.
-  // Max size: header ~60 + 500 samples * ~28 bytes each = ~14060 bytes; 16 KB is safe.
+  // Fixed stack buffer avoids heap fragmentation during JSON build.
+  // Max: header ~60 + 500 samples * ~28 bytes = ~14 060 bytes; 16 KB is safe.
   static char jsonBuf[16384];
   int pos = 0;
 
-  // Header
   pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
                   "{\"latest\":%lu,\"oldest\":%lu,\"sampleIntervalUs\":%lu,\"samples\":[",
                   (unsigned long)latest, (unsigned long)oldest,
@@ -505,12 +502,11 @@ void handleSamples() {
   bool first = true;
   if (latest >= startSeq) {
     for (uint32_t seq = startSeq; seq <= latest && pos < (int)sizeof(jsonBuf) - 40; ++seq) {
-      // Reconstruct ring-buffer index from seq number
       size_t idx = (seq - 1) % BUFFER_SIZE;
       if (!first) jsonBuf[pos++] = ',';
       first = false;
       jsonBuf[pos++] = '[';
-      pos += u32toa(seq,             jsonBuf + pos);
+      pos += u32toa(seq,               jsonBuf + pos);
       jsonBuf[pos++] = ',';
       pos += u32toa(sampleTimeUs[idx], jsonBuf + pos);
       jsonBuf[pos++] = ',';
@@ -542,14 +538,15 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Configure ADC via IDF directly for fastest single-shot reads in ISR
+  // Configure ADC1 via IDF for fastest direct single-shot reads
   adc1_config_width(ADC_WIDTH_BIT_12);
   adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // GPIO34 = ADC1_CH6
 
   dacWrite(DAC_PIN, 0);
 
-  // Take one seed sample so the ISR can delta-compare from the first tick
-  lastStoredRaw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
+  // Seed the delta baseline before the timer starts so the first ISR tick
+  // has a valid lastStoredRaw to compare against.
+  lastStoredRaw   = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
   sampleRaw[0]    = lastStoredRaw;
   sampleTimeUs[0] = (uint32_t)esp_timer_get_time();
   totalSamples    = 1;
@@ -565,23 +562,21 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
-  // Use ESP_TIMER_ISR so the callback runs directly in hardware interrupt context,
-  // bypassing FreeRTOS task scheduling and WiFi preemption.
-  esp_timer_handle_t timer;
-  esp_timer_create_args_t args = {
-    .callback        = onSampleTimer,
-    .arg             = nullptr,
-    .dispatch_method = ESP_TIMER_ISR,
-    .name            = "scope_sample"
-  };
-  esp_timer_create(&args, &timer);
-  esp_timer_start_periodic(timer, SAMPLE_INTERVAL_US);
+  // Arduino-ESP32 v3 hardware timer API:
+  //   timerBegin(freq_hz) — configures a hardware timer peripheral at the
+  //   given frequency. Returns a hw_timer_t* handle.
+  //   timerAttachInterrupt attaches the IRAM_ATTR ISR; timerStart arms it.
+  // This fires a true hardware interrupt, bypassing FreeRTOS scheduling
+  // and WiFi task preemption, without requiring ESP_TIMER_ISR.
+  hw_timer_t* hwTimer = timerBegin(SAMPLE_FREQ_HZ);
+  timerAttachInterrupt(hwTimer, &onSampleTimer);
+  timerStart(hwTimer);
 
   Serial.println("\nTemporary oscilloscope + DAC firmware");
   Serial.print("AP: ");          Serial.println(AP_SSID);
   Serial.print("Open: http://"); Serial.println(WiFi.softAPIP());
   Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d  |  delta=%u raw\n",
-                MONITOR_PIN, 1000000UL / SAMPLE_INTERVAL_US, DAC_PIN, DELTA_THRESH_RAW);
+                MONITOR_PIN, (unsigned long)SAMPLE_FREQ_HZ, DAC_PIN, DELTA_THRESH_RAW);
 }
 
 void loop() {
