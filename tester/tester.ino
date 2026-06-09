@@ -23,6 +23,9 @@ const size_t   BUFFER_SIZE        = 4000;  // stored (compressed) sample ring bu
 // Delta compression: store only when raw changes by >= 16 LSBs (~12.9 mV at 3.3V/12-bit)
 const uint16_t DELTA_THRESH_RAW = 16;
 
+// Force a sample at least every 100 ms so a flat/quiet signal still streams
+const uint32_t MAX_GAP_US = 100000;
+
 WebServer server(80);
 
 // Ring buffer placed in DRAM (no flash-cache miss latency from ISR)
@@ -41,14 +44,21 @@ uint8_t dacValue = 0;
 // when the flash cache is busy serving WiFi / WebServer code.
 void IRAM_ATTR onSampleTimer() {
   uint16_t raw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
+  uint32_t now = (uint32_t)esp_timer_get_time();
 
   // Delta compression: skip if change is below threshold
   int diff = (int)raw - (int)lastStoredRaw;
-  if (diff > -(int)DELTA_THRESH_RAW && diff < (int)DELTA_THRESH_RAW) return;
+  bool changed = diff >= (int)DELTA_THRESH_RAW || diff <= -(int)DELTA_THRESH_RAW;
+
+  // Force a store if no sample has been written yet, or if too much time has passed
+  uint32_t lastT = (writeIdx == 0) ? sampleTimeUs[BUFFER_SIZE - 1] : sampleTimeUs[writeIdx - 1];
+  bool timeout = (totalSamples == 0) || ((now - lastT) > MAX_GAP_US);
+
+  if (!changed && !timeout) return;
 
   // Store sample
   sampleRaw[writeIdx]    = raw;
-  sampleTimeUs[writeIdx] = (uint32_t)esp_timer_get_time();  // µs, direct register read
+  sampleTimeUs[writeIdx] = now;
   lastStoredRaw          = raw;
 
   // Advance rolling index without division
@@ -544,13 +554,12 @@ void setup() {
 
   dacWrite(DAC_PIN, 0);
 
-  // Seed the delta baseline before the timer starts so the first ISR tick
-  // has a valid lastStoredRaw to compare against.
-  lastStoredRaw   = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
-  sampleRaw[0]    = lastStoredRaw;
-  sampleTimeUs[0] = (uint32_t)esp_timer_get_time();
-  totalSamples    = 1;
-  writeIdx        = 1;
+  // Prime the delta baseline so the first ISR tick has a valid lastStoredRaw
+  // to compare against. Do NOT seed a fake stored sample — totalSamples and
+  // writeIdx stay at 0 so the browser's since-cursor starts correctly.
+  lastStoredRaw = (uint16_t)adc1_get_raw(ADC1_CHANNEL_6);
+  totalSamples  = 0;
+  writeIdx      = 0;
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
@@ -575,8 +584,9 @@ void setup() {
   Serial.println("\nTemporary oscilloscope + DAC firmware");
   Serial.print("AP: ");          Serial.println(AP_SSID);
   Serial.print("Open: http://"); Serial.println(WiFi.softAPIP());
-  Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d  |  delta=%u raw\n",
-                MONITOR_PIN, (unsigned long)SAMPLE_FREQ_HZ, DAC_PIN, DELTA_THRESH_RAW);
+  Serial.printf("ADC GPIO%d @ %lu Sa/s  |  DAC GPIO%d  |  delta=%u raw  |  max_gap=%lu us\n",
+                MONITOR_PIN, (unsigned long)SAMPLE_FREQ_HZ, DAC_PIN, DELTA_THRESH_RAW,
+                (unsigned long)MAX_GAP_US);
 }
 
 void loop() {
