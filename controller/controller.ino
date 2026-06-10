@@ -3,10 +3,10 @@
  * See design.md for full architecture and endpoint reference.
  */
 
-#include <WiFi.h>
-#include <WebServer.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
+#include &lt;WiFi.h&gt;
+#include &lt;WebServer.h&gt;
+#include &lt;HTTPClient.h&gt;
+#include &lt;ArduinoJson.h&gt;
 
 // ─────────────────────────────────────────────
 //  WiFi AP credentials
@@ -18,45 +18,66 @@ const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET (255, 255, 255, 0);
 
 // ─────────────────────────────────────────────
-//  PinDef — bundles GPIO number with its active logic level.
+//  Unified PinDef — supports SIMPLE pins and MOSFET-driven track pins.
 //
-//  activeLevel = HIGH  → driving the pin HIGH activates the function
-//                LOW   → driving the pin LOW  activates the function
+//  PIN_SIMPLE:
+//    One GPIO, one logical action, one activeLevel (HIGH or LOW).
+//    setPinActive()  → OUTPUT + activeLevel
+//    setPinIdle()    → INPUT (Hi-Z)
 //
-//  pressPin()   writes activeLevel   to the GPIO
-//  releasePin() sets the GPIO to INPUT (Hi-Z), letting the pull-up/pull-down
-//               return the line to its idle state without fighting it.
+//  PIN_MOSFET (N-channel MOSFET, one per track):
+//    One GPIO gate drives three states:
+//      OUTPUT HIGH  → track off   (no button pressed)
+//      INPUT (Hi-Z) → track fwd   (P↔S via internal analog path)
+//      OUTPUT LOW   → track back  (P↔G hard ground)
+//
+//    Wiring (per track):
+//      Gate   → ESP32 GPIO (series resistor ~1 kΩ from remote S node)
+//      Drain  → remote P node
+//      Source → remote G (GND), tied to ESP32 GND
+//
+//    actionHiZ  = action name for INPUT state  (forward)
+//    actionLow  = action name for LOW state    (back)
+//    actionHigh = action name for HIGH state   (usually nullptr = idle)
 //
 //  !! GPIO 34,35,36,39 are INPUT-ONLY on the ESP32 — do NOT use here !!
 //  Safe output GPIOs: 2,4,5,12,13,14,15,16,17,18,19,
 //                     21,22,23,25,26,27,32,33
 // ─────────────────────────────────────────────
+enum PinMode_t { PIN_SIMPLE, PIN_MOSFET };
+
 struct PinDef {
-  int gpio;
-  int activeLevel;  // HIGH (1) or LOW (0)
+  int         gpio;
+  PinMode_t   mode;
+  // SIMPLE fields
+  const char* action;       // e.g. "up", "down", "turn_left"
+  int         activeLevel;  // HIGH or LOW
+  // MOSFET fields
+  const char* actionHigh;   // OUTPUT HIGH state (track off); nullptr = no binding
+  const char* actionHiZ;    // INPUT (Hi-Z)  state (track fwd)
+  const char* actionLow;    // OUTPUT LOW    state (track back)
 };
 
-//                              gpio   activeLevel
-const PinDef PIN_LEFT_FWD    = { 13,  HIGH };  // Left  track  forward
-const PinDef PIN_LEFT_BACK   = { 13,  LOW  };  // Left  track  back
-const PinDef PIN_RIGHT_FWD   = { 14,  HIGH };  // Right track  forward
-const PinDef PIN_RIGHT_BACK  = { 14,  LOW  };  // Right track  back
-const PinDef PIN_TURN_LEFT   = { 26,  HIGH };  // Turntable rotate left
-const PinDef PIN_TURN_RIGHT  = { 25,  LOW  };  // Turntable rotate right
-const PinDef PIN_UP          = { 33,  LOW  };  // Arm / bucket up
-const PinDef PIN_DOWN        = { 32,  HIGH };  // Arm / bucket down
-const PinDef PIN_LIGHT_ON    = { 15,  LOW  };  // Light ON  pulse  (active LOW)
-const PinDef PIN_LIGHT_OFF   = {  2,  HIGH };  // Light OFF pulse  (active HIGH)
-const PinDef PIN_TEST        = {  4,  HIGH };  // Test (held)
-
-const PinDef ALL_PINS[] = {
-  PIN_LEFT_FWD, PIN_LEFT_BACK,
-  PIN_RIGHT_FWD, PIN_RIGHT_BACK,
-  PIN_TURN_LEFT, PIN_TURN_RIGHT,
-  PIN_UP, PIN_DOWN,
-  PIN_LIGHT_ON, PIN_LIGHT_OFF, PIN_TEST
+// ─────────────────────────────────────────────
+//  Pin table — one entry per physical GPIO used.
+//
+//  GPIO13: Left  track MOSFET gate
+//  GPIO14: Right track MOSFET gate
+//  All others: simple button-press pins
+// ─────────────────────────────────────────────
+const PinDef PIN_TABLE[] = {
+  // gpio  mode         action        level  actionHigh  actionHiZ      actionLow
+  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",   "left_back"  },
+  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",  "right_back" },
+  { 26, PIN_SIMPLE,  "turn_left",   HIGH,  nullptr,    nullptr,       nullptr      },
+  { 25, PIN_SIMPLE,  "turn_right",  LOW,   nullptr,    nullptr,       nullptr      },
+  { 33, PIN_SIMPLE,  "up",          LOW,   nullptr,    nullptr,       nullptr      },
+  { 32, PIN_SIMPLE,  "down",        HIGH,  nullptr,    nullptr,       nullptr      },
+  { 15, PIN_SIMPLE,  "light_on",    LOW,   nullptr,    nullptr,       nullptr      },
+  {  2, PIN_SIMPLE,  "light_off",   HIGH,  nullptr,    nullptr,       nullptr      },
+  {  4, PIN_SIMPLE,  "test",        HIGH,  nullptr,    nullptr,       nullptr      },
 };
-const int PIN_COUNT = sizeof(ALL_PINS) / sizeof(ALL_PINS[0]);
+const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
 // ─────────────────────────────────────────────
 //  Timing
@@ -66,17 +87,20 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // auto-release if heartbeat stops
 
 // ─────────────────────────────────────────────
 //  Multi-button hold state
-//  Each entry tracks one logical "button" → one or more PinDefs
 // ─────────────────────────────────────────────
+struct HeldPin {
+  const PinDef* pin;
+  bool          useHiZ;  // MOSFET only: true=INPUT(fwd), false=LOW(back)
+};
+
 struct HeldAction {
   String   name;
-  PinDef   pins[4];    // up to 4 pins per action
+  HeldPin  pins[4];
   int      pinCount = 0;
   uint32_t lastSeen = 0;
   bool     active   = false;
 };
 
-// We allow up to 6 simultaneous held actions
 const int MAX_HELD = 6;
 HeldAction heldActions[MAX_HELD];
 
@@ -89,34 +113,51 @@ String camIP = "";
 String overlayJson = "{\"detections\":[]}";
 
 // ─────────────────────────────────────────────
-//  Light toggle state (website-side logical toggle)
+//  Light toggle state
 // ─────────────────────────────────────────────
 bool lightOn = false;
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
 // ════════════════════════════════════════════════════════════
-void pressPin(const PinDef& p) {
-  pinMode(p.gpio, OUTPUT);
-  digitalWrite(p.gpio, p.activeLevel);
+static void setPinIdle(const PinDef& p) {
+  if (p.mode == PIN_SIMPLE) {
+    pinMode(p.gpio, INPUT);
+  } else {
+    // MOSFET idle = OUTPUT HIGH (track off)
+    pinMode(p.gpio, OUTPUT);
+    digitalWrite(p.gpio, HIGH);
+  }
 }
 
-void releasePin(const PinDef& p) {
-  // Return to Hi-Z; external pull-up/pull-down restores idle state
-  pinMode(p.gpio, INPUT);
+static void setPinActive(const PinDef& p, bool hiZForMosfet) {
+  if (p.mode == PIN_SIMPLE) {
+    pinMode(p.gpio, OUTPUT);
+    digitalWrite(p.gpio, p.activeLevel);
+  } else {
+    if (hiZForMosfet) {
+      pinMode(p.gpio, INPUT);   // forward
+    } else {
+      pinMode(p.gpio, OUTPUT);
+      digitalWrite(p.gpio, LOW); // back
+    }
+  }
 }
 
 void releaseAllPins() {
-  for (int i = 0; i < PIN_COUNT; i++) releasePin(ALL_PINS[i]);
+  for (int i = 0; i < PIN_COUNT; i++) setPinIdle(PIN_TABLE[i]);
   for (int i = 0; i < MAX_HELD; i++) heldActions[i].active = false;
 }
 
-void pulsePin(const PinDef& p, uint32_t durationMs) {
-  pressPin(p); delay(durationMs); releasePin(p);
+static void pulseSimplePin(const PinDef& p, uint32_t durationMs) {
+  if (p.mode != PIN_SIMPLE) return;
+  setPinActive(p, false);
+  delay(durationMs);
+  setPinIdle(p);
 }
 
 // ─────────────────────────────────────────────
-//  Find or allocate a held-action slot by name
+//  Held-action slot management
 // ─────────────────────────────────────────────
 HeldAction* findHeld(const String& name) {
   for (int i = 0; i < MAX_HELD; i++)
@@ -124,21 +165,83 @@ HeldAction* findHeld(const String& name) {
       return &heldActions[i];
   return nullptr;
 }
+
 HeldAction* allocHeld(const String& name) {
   HeldAction* h = findHeld(name);
   if (h) return h;
   for (int i = 0; i < MAX_HELD; i++)
     if (!heldActions[i].active) return &heldActions[i];
-  return nullptr; // all slots full
+  return nullptr;
 }
 
-void startAction(const String& name, PinDef* pins, int count) {
+// ─────────────────────────────────────────────
+//  Map button name → HeldPin list
+//  Returns count; 0 = unknown button.
+//  Composite actions (fwd/back/spin_*) fan out recursively.
+// ─────────────────────────────────────────────
+int buttonToHeldPins(const String& btn, HeldPin* out) {
+  // Composites
+  if (btn == "fwd") {
+    HeldPin tmp[4];
+    int c1 = buttonToHeldPins("left_fwd",  tmp);
+    int c2 = buttonToHeldPins("right_fwd", tmp + c1);
+    for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
+    return c1 + c2;
+  }
+  if (btn == "back") {
+    HeldPin tmp[4];
+    int c1 = buttonToHeldPins("left_back",  tmp);
+    int c2 = buttonToHeldPins("right_back", tmp + c1);
+    for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
+    return c1 + c2;
+  }
+  if (btn == "spin_left") {
+    HeldPin tmp[4];
+    int c1 = buttonToHeldPins("left_back", tmp);
+    int c2 = buttonToHeldPins("right_fwd", tmp + c1);
+    for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
+    return c1 + c2;
+  }
+  if (btn == "spin_right") {
+    HeldPin tmp[4];
+    int c1 = buttonToHeldPins("left_fwd",  tmp);
+    int c2 = buttonToHeldPins("right_back", tmp + c1);
+    for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
+    return c1 + c2;
+  }
+
+  // Primitives — walk PIN_TABLE
+  for (int i = 0; i < PIN_COUNT; i++) {
+    const PinDef& p = PIN_TABLE[i];
+    if (p.mode == PIN_SIMPLE) {
+      if (p.action && btn == p.action) {
+        out[0] = { &p, false };
+        return 1;
+      }
+    } else { // PIN_MOSFET
+      if (p.actionHiZ && btn == p.actionHiZ) {
+        out[0] = { &p, true };
+        return 1;
+      }
+      if (p.actionLow && btn == p.actionLow) {
+        out[0] = { &p, false };
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+void startAction(const String& name, HeldPin* pins, int count) {
   HeldAction* h = allocHeld(name);
   if (!h) return;
   if (!h->active) {
     h->name     = name;
     h->pinCount = count;
-    for (int i = 0; i < count; i++) { h->pins[i] = pins[i]; pressPin(pins[i]); }
+    for (int i = 0; i < count; i++) {
+      h->pins[i] = pins[i];
+      setPinActive(*pins[i].pin, pins[i].useHiZ);
+    }
     h->active = true;
     Serial.printf("[CMD] Hold  '%s'  (%d pins)\n", name.c_str(), count);
   }
@@ -148,30 +251,9 @@ void startAction(const String& name, PinDef* pins, int count) {
 void stopAction(const String& name) {
   HeldAction* h = findHeld(name);
   if (!h) return;
-  for (int i = 0; i < h->pinCount; i++) releasePin(h->pins[i]);
+  for (int i = 0; i < h->pinCount; i++) setPinIdle(*h->pins[i].pin);
   h->active = false;
   Serial.printf("[CMD] Release '%s'\n", name.c_str());
-}
-
-// ─────────────────────────────────────────────
-//  Map button name → PinDef(s)
-// ─────────────────────────────────────────────
-// Returns count of PinDefs filled; 0 = unknown
-int buttonToPins(const String& btn, PinDef* out) {
-  if (btn == "left_fwd")   { out[0]=PIN_LEFT_FWD;   return 1; }
-  if (btn == "left_back")  { out[0]=PIN_LEFT_BACK;  return 1; }
-  if (btn == "right_fwd")  { out[0]=PIN_RIGHT_FWD;  return 1; }
-  if (btn == "right_back") { out[0]=PIN_RIGHT_BACK; return 1; }
-  if (btn == "fwd")        { out[0]=PIN_LEFT_FWD;  out[1]=PIN_RIGHT_FWD;  return 2; }
-  if (btn == "back")       { out[0]=PIN_LEFT_BACK; out[1]=PIN_RIGHT_BACK; return 2; }
-  if (btn == "spin_left")  { out[0]=PIN_LEFT_BACK; out[1]=PIN_RIGHT_FWD; return 2; }
-  if (btn == "spin_right") { out[0]=PIN_LEFT_FWD;  out[1]=PIN_RIGHT_BACK; return 2; }
-  if (btn == "turn_left")  { out[0]=PIN_TURN_LEFT;  return 1; }
-  if (btn == "turn_right") { out[0]=PIN_TURN_RIGHT; return 1; }
-  if (btn == "up")         { out[0]=PIN_UP;         return 1; }
-  if (btn == "down")       { out[0]=PIN_DOWN;       return 1; }
-  if (btn == "test")       { out[0]=PIN_TEST;       return 1; }
-  return 0;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -197,9 +279,9 @@ void handleRoot() {
 
 void handleRegister() {
   if (!server.hasArg("plain")) { server.send(400, "text/plain", "No body"); return; }
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument&lt;128&gt; doc;
   if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "text/plain", "Bad JSON"); return; }
-  camIP = doc["ip"].as<String>();
+  camIP = doc["ip"].as&lt;String&gt;();
   Serial.printf("[REG] Cam registered at %s\n", camIP.c_str());
   server.send(200, "text/plain", "OK");
 }
@@ -225,19 +307,25 @@ void handleCmd() {
   String btn    = server.arg("btn");
   String action = server.hasArg("action") ? server.arg("action") : "press";
 
-  // Light toggle — pulse the appropriate PinDef
   if (btn == "light") {
     if (action == "press") {
       lightOn = !lightOn;
-      pulsePin(lightOn ? PIN_LIGHT_ON : PIN_LIGHT_OFF, PULSE_DURATION_MS);
+      const char* desired = lightOn ? "light_on" : "light_off";
+      for (int i = 0; i &lt; PIN_COUNT; i++) {
+        const PinDef& p = PIN_TABLE[i];
+        if (p.mode == PIN_SIMPLE && p.action && String(p.action) == desired) {
+          pulseSimplePin(p, PULSE_DURATION_MS);
+          break;
+        }
+      }
       Serial.printf("[CMD] Light %s\n", lightOn ? "ON" : "OFF");
     }
     server.send(200, "text/plain", lightOn ? "on" : "off");
     return;
   }
 
-  PinDef pins[4];
-  int count = buttonToPins(btn, pins);
+  HeldPin pins[4];
+  int count = buttonToHeldPins(btn, pins);
   if (count == 0) { server.send(400, "text/plain", "Unknown button"); return; }
 
   if (action == "press" || action == "hold") {
@@ -248,12 +336,12 @@ void handleCmd() {
   server.send(200, "text/plain", "OK");
 }
 
-// /camcmd?cmd=pump_press|pump_release|mode_arm|mode_safe
+// /camcmd?cmd=pump_press|pump_hold|pump_release|mode_arm|mode_safe
 void handleCamCmd() {
   if (!server.hasArg("cmd")) { server.send(400, "text/plain", "Missing cmd"); return; }
   String cmd = server.arg("cmd");
 
-  if (cmd == "pump_press")        relayCamCmd("/pump?action=press");
+  if      (cmd == "pump_press")   relayCamCmd("/pump?action=press");
   else if (cmd == "pump_hold")    relayCamCmd("/pump?action=hold");
   else if (cmd == "pump_release") relayCamCmd("/pump?action=release");
   else if (cmd == "mode_arm")     relayCamCmd("/mode?set=armed");
@@ -264,7 +352,7 @@ void handleCamCmd() {
 }
 
 void handleStatus() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument&lt;256&gt; doc;
   doc["camIP"]  = camIP;
   doc["uptime"] = millis() / 1000;
   doc["heap"]   = ESP.getFreeHeap();
@@ -273,9 +361,6 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-// ════════════════════════════════════════════════════════════
-//  Web console HTML  (stored in flash — defined below setup())
-// ════════════════════════════════════════════════════════════
 extern const char INDEX_HTML[] PROGMEM;
 
 // ════════════════════════════════════════════════════════════
@@ -308,13 +393,12 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Auto-release any held action whose heartbeat has timed out
   uint32_t now = millis();
-  for (int i = 0; i < MAX_HELD; i++) {
-    if (heldActions[i].active && (now - heldActions[i].lastSeen) > HOLD_TIMEOUT_MS) {
+  for (int i = 0; i &lt; MAX_HELD; i++) {
+    if (heldActions[i].active && (now - heldActions[i].lastSeen) &gt; HOLD_TIMEOUT_MS) {
       Serial.printf("[SAFE] Timeout-release '%s'\n", heldActions[i].name.c_str());
-      for (int j = 0; j < heldActions[i].pinCount; j++)
-        releasePin(heldActions[i].pins[j]);
+      for (int j = 0; j &lt; heldActions[i].pinCount; j++)
+        setPinIdle(*heldActions[i].pins[j].pin);
       heldActions[i].active = false;
     }
   }
