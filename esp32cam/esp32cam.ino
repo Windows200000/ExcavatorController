@@ -59,7 +59,7 @@ const int PIN_PUMP = 4; //Temp for LED, change fire action back to LOW when atta
 //  If controller stops sending hold heartbeats,
 //  auto-release the pump after this many ms.
 // ─────────────────────────────────────────────
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;  // Fix B: was 300 — widened to 800 for WiFi round-trip headroom
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 // ─────────────────────────────────────────────
 //  Stream settings
@@ -301,77 +301,60 @@ struct Detection {
 //  Image processing — Red dot detection + overlay push
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
-  // Switch to RGB565 only if stream is not active
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_pixformat(s, PIXFORMAT_RGB565);
-  s->set_framesize(s, FRAMESIZE_QVGA);  // always QVGA for detection — VGA RGB565 is too large
-  delay(150);  // let sensor settle after format switch
-
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb || fb->format != PIXFORMAT_RGB565) {
+  if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     if (fb) esp_camera_fb_return(fb);
-    s->set_pixformat(s, PIXFORMAT_JPEG);
-    s->set_framesize(s, STREAM_FRAME_SIZE);
-    delay(150);
     return;
   }
 
-  std::vector<Detection> detections;
-
   const int W = fb->width;
   const int H = fb->height;
-  const uint16_t* pixels = (const uint16_t*)fb->buf;
+  size_t   rgbLen = (size_t)W * H * 3;
+  uint8_t* rgb    = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) rgb   = (uint8_t*)malloc(rgbLen);
 
-  const uint8_t R_MIN = 15, R_MAX = 31;
-  const uint8_t G_MAX = 12;
-  const uint8_t B_MAX = 12;
-  const int MIN_BLOB  = 30;
+  bool decoded = false;
+  if (rgb) decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
 
-  int bx1 = W, by1 = H, bx2 = 0, by2 = 0;
-  int blobCount = 0;
+  esp_camera_fb_return(fb);  // return immediately — don't hold it during processing
 
-  for (int y = 0; y < H; y++) {
-    for (int x = 0; x < W; x++) {
-      uint16_t px = pixels[y * W + x];
-      px = (px >> 8) | (px << 8);
-      uint8_t r = (px >> 11) & 0x1F;
-      uint8_t g = (px >>  5) & 0x3F;
-      uint8_t b =  px        & 0x1F;
+  std::vector<Detection> detections;
 
-      if (r >= R_MIN && r <= R_MAX && g <= G_MAX && b <= B_MAX) {
-        if (x < bx1) bx1 = x;
-        if (x > bx2) bx2 = x;
-        if (y < by1) by1 = y;
-        if (y > by2) by2 = y;
-        blobCount++;
+  if (decoded) {
+    int bx1 = W, by1 = H, bx2 = 0, by2 = 0, blobCount = 0;
+
+    for (int y = 0; y < H; y++) {
+      for (int x = 0; x < W; x++) {
+        uint8_t r = rgb[(y * W + x) * 3 + 0];
+        uint8_t g = rgb[(y * W + x) * 3 + 1];
+        uint8_t b = rgb[(y * W + x) * 3 + 2];
+        if (r > 160 && g < 80 && b < 80) {
+          if (x < bx1) bx1 = x;
+          if (x > bx2) bx2 = x;
+          if (y < by1) by1 = y;
+          if (y > by2) by2 = y;
+          blobCount++;
+        }
       }
+    }
+
+    if (blobCount >= 30) {
+      Detection d;
+      d.label  = "red_dot";
+      float cx = (float)(bx1 + bx2) / 2.0f;
+      float cy = (float)(by1 + by2) / 2.0f;
+      float hw = (float)(bx2 - bx1) / 2.0f * 0.8f;
+      float hh = (float)(by2 - by1) / 2.0f * 0.8f;
+      d.x = (cx - hw) / W;  d.y = (cy - hh) / H;
+      d.w = (hw * 2.0f) / W;  d.h = (hh * 2.0f) / H;
+      d.confidence = min(1.0f, (float)blobCount / 500.0f);
+      detections.push_back(d);
+      Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
+                    d.x, d.y, d.w, d.h, d.confidence);
     }
   }
 
-  esp_camera_fb_return(fb);
-
-  // Switch back to JPEG for streaming BEFORE doing any network calls
-  s->set_pixformat(s, PIXFORMAT_JPEG);
-  s->set_framesize(s, STREAM_FRAME_SIZE);
-  delay(150);
-
-  // Only report if a real blob was found
-  if (blobCount >= MIN_BLOB) {
-    Detection d;
-    d.label = "red_dot";
-    float cx = (float)(bx1 + bx2) / 2.0f;
-    float cy = (float)(by1 + by2) / 2.0f;
-    float hw = (float)(bx2 - bx1) / 2.0f * 0.8f;
-    float hh = (float)(by2 - by1) / 2.0f * 0.8f;
-    d.x = (cx - hw) / W;
-    d.y = (cy - hh) / H;
-    d.w = (hw * 2.0f) / W;
-    d.h = (hh * 2.0f) / H;
-    d.confidence = min(1.0f, (float)blobCount / 500.0f);
-    detections.push_back(d);
-    Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
-                  d.x, d.y, d.w, d.h, d.confidence);
-  }
+  if (rgb) free(rgb);
 
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
