@@ -301,36 +301,38 @@ struct Detection {
 //  Image processing — Red dot detection + overlay push
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
+  // Switch to RGB565 only if stream is not active
   sensor_t* s = esp_camera_sensor_get();
   s->set_pixformat(s, PIXFORMAT_RGB565);
-  delay(100); // let sensor settle
+  s->set_framesize(s, FRAMESIZE_QVGA);  // always QVGA for detection — VGA RGB565 is too large
+  delay(150);  // let sensor settle after format switch
 
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) return;
+  if (!fb || fb->format != PIXFORMAT_RGB565) {
+    if (fb) esp_camera_fb_return(fb);
+    s->set_pixformat(s, PIXFORMAT_JPEG);
+    s->set_framesize(s, STREAM_FRAME_SIZE);
+    delay(150);
+    return;
+  }
 
   std::vector<Detection> detections;
 
-  // ── Red dot detection via RGB565 colour thresholding ──────
-  // RGB565: each pixel = 2 bytes, big-endian
-  // R[4:0] = bits[15:11], G[5:0] = bits[10:5], B[4:0] = bits[4:0]
   const int W = fb->width;
   const int H = fb->height;
   const uint16_t* pixels = (const uint16_t*)fb->buf;
 
-  // Thresholds tuned for a bright red dot
-  const uint8_t R_MIN = 15, R_MAX = 31;  // 5-bit red   (>=15 = saturated red)
-  const uint8_t G_MAX = 12;              // 6-bit green  (low green)
-  const uint8_t B_MAX = 12;              // 5-bit blue   (low blue)
-  const int MIN_BLOB  = 30;              // min pixels to count as a dot
+  const uint8_t R_MIN = 15, R_MAX = 31;
+  const uint8_t G_MAX = 12;
+  const uint8_t B_MAX = 12;
+  const int MIN_BLOB  = 30;
 
-  // Simple bounding-box blob finder
   int bx1 = W, by1 = H, bx2 = 0, by2 = 0;
   int blobCount = 0;
 
   for (int y = 0; y < H; y++) {
     for (int x = 0; x < W; x++) {
       uint16_t px = pixels[y * W + x];
-      // RGB565 byte-swap (ESP32 stores little-endian)
       px = (px >> 8) | (px << 8);
       uint8_t r = (px >> 11) & 0x1F;
       uint8_t g = (px >>  5) & 0x3F;
@@ -346,32 +348,31 @@ void runDetectionAndPush() {
     }
   }
 
+  esp_camera_fb_return(fb);
+
+  // Switch back to JPEG for streaming BEFORE doing any network calls
+  s->set_pixformat(s, PIXFORMAT_JPEG);
+  s->set_framesize(s, STREAM_FRAME_SIZE);
+  delay(150);
+
+  // Only report if a real blob was found
   if (blobCount >= MIN_BLOB) {
     Detection d;
-    d.label      = "red_dot";
+    d.label = "red_dot";
     float cx = (float)(bx1 + bx2) / 2.0f;
     float cy = (float)(by1 + by2) / 2.0f;
-    float hw = (float)(bx2 - bx1) / 2.0f;
-    float hh = (float)(by2 - by1) / 2.0f;
-    // Shrink box by 20% to cut edge noise
-    hw *= 0.8f;
-    hh *= 0.8f;
+    float hw = (float)(bx2 - bx1) / 2.0f * 0.8f;
+    float hh = (float)(by2 - by1) / 2.0f * 0.8f;
     d.x = (cx - hw) / W;
     d.y = (cy - hh) / H;
     d.w = (hw * 2.0f) / W;
     d.h = (hh * 2.0f) / H;
-    d.confidence = min(1.0f, (float)blobCount / 500.0f);  // scale to 0..1
+    d.confidence = min(1.0f, (float)blobCount / 500.0f);
     detections.push_back(d);
     Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                   d.x, d.y, d.w, d.h, d.confidence);
   }
-  // ── end detection ─────────────────────────────────────────
 
-  esp_camera_fb_return(fb);
-
-  s->set_pixformat(s, PIXFORMAT_JPEG);
-
-  // Serialize + POST to /overlay
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
