@@ -55,8 +55,8 @@ Browser    ->  GET  /overlay (JSON)  ->  Controller  ->  Canvas draw
 ```
 Browser (hold/release events)
     ->  GET /cmd?btn=X&action=Y
-    ->  Controller: pressPin / releasePin
-    ->  Physical GPIO drives remote-control button line to activeLevel
+    ->  Controller: setPinActive / setPinIdle
+    ->  Physical GPIO drives remote-control button line
 ```
 
 ### Cam Command Relay
@@ -105,48 +105,64 @@ const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET (255, 255, 255, 0);
 ```
 
-### GPIO Pin Constants
+### GPIO Pin Architecture
 
 > **Important:** GPIO 34, 35, 36, 39 are **INPUT-ONLY** on the ESP32 — they have no output driver and will silently fail. Safe output-capable GPIOs on the NodeMCU-ESP32: 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
 
-Pin definitions use a `PinDef` struct that bundles the GPIO number with its active logic level:
+Pin definitions use a unified `PinDef` struct with a `PinMode_t` enum that selects between simple push-button emulation and MOSFET-driven track control:
 
 ```cpp
+enum PinMode_t { PIN_SIMPLE, PIN_MOSFET };
+
 struct PinDef {
-  int gpio;
-  int activeLevel;  // HIGH (1) = driving HIGH activates the function
-                    // LOW  (0) = driving LOW  activates the function
+  int         gpio;
+  PinMode_t   mode;
+  // PIN_SIMPLE fields
+  const char* action;       // logical button name, e.g. "up", "turn_left"
+  int         activeLevel;  // HIGH or LOW
+  // PIN_MOSFET fields
+  const char* actionHigh;   // OUTPUT HIGH state (track off); nullptr = no binding
+  const char* actionHiZ;    // INPUT (Hi-Z) state  → track forward
+  const char* actionLow;    // OUTPUT LOW  state  → track back
 };
 ```
 
-`pressPin()` writes `activeLevel` to the GPIO. `releasePin()` sets the GPIO to INPUT (Hi-Z), letting the external pull-up/pull-down restore the idle state without fighting the driver.
+#### PIN_SIMPLE
 
-| Constant | GPIO | Active Level | Function |
-|----------|------|-------------|----------|
-| `PIN_LEFT_FWD` | 13 | HIGH | Left track forward |
-| `PIN_LEFT_BACK` | 12 | LOW | Left track back |
-| `PIN_RIGHT_FWD` | 14 | HIGH | Right track forward |
-| `PIN_RIGHT_BACK` | 27 | LOW | Right track back |
-| `PIN_TURN_LEFT` | 26 | HIGH | Turntable rotate left |
-| `PIN_TURN_RIGHT` | 25 | LOW | Turntable rotate right |
-| `PIN_UP` | 33 | LOW | Arm / bucket up |
-| `PIN_DOWN` | 32 | HIGH | Arm / bucket down |
-| `PIN_LIGHT_ON` | 15 | LOW | Light ON pulse (active LOW) |
-| `PIN_LIGHT_OFF` | 2 | HIGH | Light OFF pulse (active HIGH) |
-| `PIN_TEST` | 4 | HIGH | Test (held) |
+Used for all buttons except the track MOSFET gates. `setPinActive()` drives OUTPUT + `activeLevel`; `setPinIdle()` returns the pin to INPUT (Hi-Z), letting the external pull-up/pull-down restore the idle state.
 
-All output pins are tracked in an array for safe initialisation and `releaseAllPins()`:
+#### PIN_MOSFET (N-channel MOSFET per track)
 
-```cpp
-const PinDef ALL_PINS[] = {
-  PIN_LEFT_FWD, PIN_LEFT_BACK,
-  PIN_RIGHT_FWD, PIN_RIGHT_BACK,
-  PIN_TURN_LEFT, PIN_TURN_RIGHT,
-  PIN_UP, PIN_DOWN,
-  PIN_LIGHT_ON, PIN_LIGHT_OFF, PIN_TEST
-};
-const int PIN_COUNT = sizeof(ALL_PINS) / sizeof(ALL_PINS[0]);
-```
+The excavator tracks are driven through a single N-channel MOSFET per track. One ESP32 GPIO controls three logical states:
+
+| ESP32 GPIO state | MOSFET effect | Track action |
+|-----------------|---------------|--------------|
+| OUTPUT HIGH | Gate fully on → Drain–Source closed to GND | Track **off** (no button) |
+| INPUT (Hi-Z) | Gate at intermediate voltage via internal paths | Track **forward** |
+| OUTPUT LOW | Gate off → Drain–Source open | Track **back** |
+
+**Wiring (per track):**
+- Gate → ESP32 GPIO (series resistor ~1 kΩ from remote S node)
+- Drain → excavator remote P node
+- Source → excavator remote G (GND), tied to ESP32 GND
+
+`setPinIdle()` on a MOSFET pin drives OUTPUT HIGH (track off). `setPinActive()` uses the `useHiZ` flag: `true` → INPUT (forward), `false` → OUTPUT LOW (back).
+
+### Pin Table
+
+All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactly one entry per GPIO:
+
+| GPIO | Mode | Action(s) | Notes |
+|------|------|-----------|-------|
+| 13 | MOSFET | HiZ=`left_fwd`, LOW=`left_back` | Left track gate |
+| 14 | MOSFET | HiZ=`right_fwd`, LOW=`right_back` | Right track gate |
+| 26 | SIMPLE | `turn_left` (HIGH) | Turntable left |
+| 25 | SIMPLE | `turn_right` (LOW) | Turntable right |
+| 33 | SIMPLE | `up` (LOW) | Arm / bucket up |
+| 32 | SIMPLE | `down` (HIGH) | Arm / bucket down |
+| 15 | SIMPLE | `light_on` (LOW) | Light ON pulse |
+| 2 | SIMPLE | `light_off` (HIGH) | Light OFF pulse |
+| 4 | SIMPLE | `test` (HIGH) | Test hold |
 
 ### Timing Constants
 
@@ -159,42 +175,47 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat
 
 | Button | Type | Behaviour |
 |--------|------|-----------|
-| `left_fwd` | Hold | Active while held; released on pointer-up / key-up |
-| `left_back` | Hold | Active while held |
-| `right_fwd` | Hold | Active while held |
-| `right_back` | Hold | Active while held |
+| `left_fwd` | Hold | Left track forward (GPIO13 Hi-Z) |
+| `left_back` | Hold | Left track back (GPIO13 LOW) |
+| `right_fwd` | Hold | Right track forward (GPIO14 Hi-Z) |
+| `right_back` | Hold | Right track back (GPIO14 LOW) |
 | `fwd` | Hold | Both tracks forward simultaneously |
 | `back` | Hold | Both tracks back simultaneously |
-| `spin_left` | Hold | Left track back + Right track forward (counter-clockwise spin) |
-| `spin_right` | Hold | Left track forward + Right track back (clockwise spin) |
+| `spin_left` | Hold | Left back + Right forward (counter-clockwise) |
+| `spin_right` | Hold | Left forward + Right back (clockwise) |
 | `turn_left` | Hold | Turntable rotate left |
 | `turn_right` | Hold | Turntable rotate right |
-| `up` | Hold | Active while held |
-| `down` | Hold | Active while held |
-| `light` | Pulse | Toggle backed by `PIN_LIGHT_ON` / `PIN_LIGHT_OFF` pulses |
+| `up` | Hold | Arm / bucket up |
+| `down` | Hold | Arm / bucket down |
+| `light` | Pulse | Toggle: pulses `light_on` or `light_off` pin |
 | `test` | Hold | Active while held |
 
-Up to `MAX_HELD = 6` simultaneous held actions are supported, allowing multi-pin composite actions. WASD simultaneously drives both tracks (forward/back) or opposite-spin turn.
+Up to `MAX_HELD = 6` simultaneous held actions are supported.
 
 #### Composite Button Actions
 
-Some button names drive multiple pins simultaneously:
+Composite buttons fan out to multiple `HeldPin` entries via recursive calls to `buttonToHeldPins()`:
 
-| Button | Pins Driven | Effect |
-|--------|-------------|--------|
-| `fwd` | `PIN_LEFT_FWD` + `PIN_RIGHT_FWD` | Both tracks forward |
-| `back` | `PIN_LEFT_BACK` + `PIN_RIGHT_BACK` | Both tracks back |
-| `spin_left` | `PIN_LEFT_BACK` + `PIN_RIGHT_FWD` | Counter-clockwise spin |
-| `spin_right` | `PIN_LEFT_FWD` + `PIN_RIGHT_BACK` | Clockwise spin |
+| Button | HeldPins driven | Effect |
+|--------|-----------------|--------|
+| `fwd` | `left_fwd` + `right_fwd` | Both tracks forward |
+| `back` | `left_back` + `right_back` | Both tracks back |
+| `spin_left` | `left_back` + `right_fwd` | Counter-clockwise spin |
+| `spin_right` | `left_fwd` + `right_back` | Clockwise spin |
 
 ### Multi-Button Hold State
 
-The controller supports up to `MAX_HELD = 6` simultaneous held actions. Each slot is a `HeldAction` struct tracking the action name, up to 4 `PinDef`s, and a `lastSeen` timestamp:
+The controller supports up to `MAX_HELD = 6` simultaneous held actions. Each slot is a `HeldAction` struct. `HeldPin` stores a pointer into `PIN_TABLE` plus a `useHiZ` flag (relevant for MOSFET pins):
 
 ```cpp
+struct HeldPin {
+  const PinDef* pin;
+  bool          useHiZ;  // MOSFET: true=INPUT(fwd), false=LOW(back)
+};
+
 struct HeldAction {
   String   name;
-  PinDef   pins[4];    // up to 4 pins per action
+  HeldPin  pins[4];
   int      pinCount = 0;
   uint32_t lastSeen = 0;
   bool     active   = false;
@@ -204,25 +225,25 @@ HeldAction heldActions[MAX_HELD];
 
 ### Pin-Control Pattern
 
-The button emulation works by driving the GPIO to its `activeLevel` (simulating a button press) and releasing it by returning the GPIO to high-impedance input mode, letting the external pull-up/pull-down restore the idle state:
-
 ```cpp
-void pressPin(const PinDef& p) {
-  pinMode(p.gpio, OUTPUT);
-  digitalWrite(p.gpio, p.activeLevel);
-}
+// Put a pin in its idle / safe state
+void setPinIdle(const PinDef& p);
+  // SIMPLE  → pinMode(INPUT)
+  // MOSFET  → pinMode(OUTPUT); digitalWrite(HIGH)  [track off]
 
-void releasePin(const PinDef& p) {
-  pinMode(p.gpio, INPUT);   // back to Hi-Z
-}
+// Activate a pin
+void setPinActive(const PinDef& p, bool hiZForMosfet);
+  // SIMPLE         → pinMode(OUTPUT); digitalWrite(activeLevel)
+  // MOSFET + hiZ   → pinMode(INPUT)                [track forward]
+  // MOSFET + !hiZ  → pinMode(OUTPUT); digitalWrite(LOW) [track back]
 
-void releaseAllPins() { /* iterates ALL_PINS, calls releasePin; clears all heldActions */ }
-void pulsePin(const PinDef& p, uint32_t durationMs) { pressPin(p); delay(durationMs); releasePin(p); }
+void releaseAllPins();  // iterates PIN_TABLE, calls setPinIdle; clears all heldActions
+void pulseSimplePin(const PinDef& p, uint32_t durationMs);  // SIMPLE pins only
 ```
 
 ### Heartbeat Watchdog
 
-The browser sends a heartbeat `action=hold` every 150 ms while a key or button is held. If no heartbeat arrives within `HOLD_TIMEOUT_MS` (300 ms), the controller auto-releases all pins for that action and clears the slot. This is a safety feature preventing the excavator from running away if the browser tab closes or network drops.
+The browser sends a heartbeat `action=hold` every 150 ms while a key or button is held. If no heartbeat arrives within `HOLD_TIMEOUT_MS` (300 ms), the controller auto-releases all pins for that action and clears the slot. This prevents the excavator from running away if the browser tab closes or network drops.
 
 ### HTTP Endpoints
 
@@ -239,9 +260,9 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 
 #### `/cmd` Action Values
 
-- `press` – start holding the pin to activeLevel; begins heartbeat window
+- `press` – start holding the pin; begins heartbeat window
 - `hold` – heartbeat renewal; resets the `HOLD_TIMEOUT_MS` watchdog
-- `release` – release the pin immediately (back to Hi-Z)
+- `release` – release the pin immediately (back to idle state)
 
 ### Web Console
 
@@ -251,8 +272,7 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 - A `<canvas>` overlay rendered on top of the feed for detection bounding boxes
 - Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
-- Simplified controls with a top-down excavator model SVG
-- Model glows live for tracks / turntable / arm / pump / test / light activation states
+- A top-down excavator model SVG that glows live for tracks / turntable / arm / pump / test / light
 - Live **SAFE / ARMED** badge polled from cam `/status` endpoint
 
 #### Keyboard Shortcuts
@@ -283,7 +303,8 @@ The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedIm
 
 ```
 setup():
-  releaseAllPins()      <- ensure all pins start high-Z
+  releaseAllPins()      <- ensure all pins start in idle state
+                           (SIMPLE → Hi-Z, MOSFET → OUTPUT HIGH / track off)
   WiFi.softAP(...)
   register HTTP routes
   server.begin()
@@ -293,7 +314,7 @@ loop():
   // Heartbeat watchdog — iterate all heldActions slots
   for each heldActions[i] where active:
     if (millis() - lastSeen) > HOLD_TIMEOUT_MS:
-      auto-release all pins for that action
+      auto-release all pins for that action via setPinIdle()
       heldActions[i].active = false
 ```
 
@@ -514,7 +535,7 @@ loop():
 The detection overlay pipeline is designed to support future autonomous operation:
 
 - Detections from on-device image processing are already available on the controller via `/overlay`
-- The controller can read these detections in `loop()` and autonomously issue `pressPin` / `releasePin` calls without browser involvement
+- The controller can read these detections in `loop()` and autonomously issue `setPinActive` / `setPinIdle` calls without browser involvement
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
 - Suggested detection algorithms: colour thresholding (simple, implemented), ArUco marker tracking (positioning), TFLite model inference (object recognition)
 
