@@ -18,58 +18,76 @@ const IPAddress AP_GATEWAY(192, 168, 4, 1);
 const IPAddress AP_SUBNET (255, 255, 255, 0);
 
 // ─────────────────────────────────────────────
-//  Unified PinDef — supports SIMPLE pins and MOSFET-driven track pins.
+//  Unified PinDef — every GPIO is described by an idle state and up to
+//  three action bindings (one per driven state).  No separate modes exist;
+//  the idle field fully determines what setPinIdle() does, and each
+//  actionXxx field is either a button name string or nullptr (unbound).
 //
-//  PIN_SIMPLE:
-//    One GPIO, one logical action, one activeLevel (HIGH or LOW).
-//    setPinActive()  → OUTPUT + activeLevel
-//    setPinIdle()    → INPUT (Hi-Z)
+//  PinState_t values:
+//    HIGH  →  pinMode(OUTPUT); digitalWrite(HIGH)
+//    LOW   →  pinMode(OUTPUT); digitalWrite(LOW)
+//    HiZ   →  pinMode(INPUT)   ← floating / high-impedance
 //
-//  PIN_MOSFET (N-channel MOSFET, one per track):
-//    One GPIO gate drives three states:
-//      OUTPUT HIGH  → track off   (no button pressed)
-//      INPUT (Hi-Z) → track fwd   (P↔S via internal analog path)
-//      OUTPUT LOW   → track back  (P↔G hard ground)
+//  Typical wiring patterns:
+//    MOSFET gate (track / turntable / arm / light):
+//      idle = HIGH  (track off — MOSFET fully on, drain clamped to GND)
+//      actionHiZ drives the "forward / on" button via the internal analog path
+//      actionLow drives the "back / pulse" button by pulling gate low
 //
-//    Wiring (per track):
-//      Gate   → ESP32 GPIO (series resistor ~1 kΩ from remote S node)
-//      Drain  → remote P node
-//      Source → remote G (GND), tied to ESP32 GND
+//    Simple button (active-LOW):
+//      idle = HiZ   (pin floating, external pull-up holds line idle)
+//      actionLow drives the button line to GND
 //
-//    actionHiZ  = action name for INPUT state  (forward)
-//    actionLow  = action name for LOW state    (back)
-//    actionHigh = action name for HIGH state   (usually nullptr = idle)
+//  !! GPIO 34, 35, 36, 39 are INPUT-ONLY on the ESP32 — do NOT use here !!
 //
-//  !! GPIO 34,35,36,39 are INPUT-ONLY on the ESP32 — do NOT use here !!
-//  Safe output GPIOs: 2,4,5,12,13,14,15,16,17,18,19,
-//                     21,22,23,25,26,27,32,33
+//  Available output-capable GPIOs on the NodeMCU-ESP32 and their modes:
+//    GPIO  2  — output only (on-board LED, boot-sensitive)     HIGH / LOW / HiZ
+//    GPIO  4  — output / input                                 HIGH / LOW / HiZ  ← test pin
+//    GPIO  5  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 12  — output / input (boot-sensitive, use carefully) HIGH / LOW / HiZ
+//    GPIO 13  — output / input                                 HIGH / LOW / HiZ  ← left track
+//    GPIO 14  — output / input                                 HIGH / LOW / HiZ  ← right track
+//    GPIO 15  — output / input (boot-sensitive)                HIGH / LOW / HiZ  ← light
+//    GPIO 16  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 17  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 18  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 19  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 21  — output / input (I2C SDA by default)            HIGH / LOW / HiZ
+//    GPIO 22  — output / input (I2C SCL by default)            HIGH / LOW / HiZ
+//    GPIO 23  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 25  — output / input / DAC                           HIGH / LOW / HiZ
+//    GPIO 26  — output / input / DAC                           HIGH / LOW / HiZ  ← turntable
+//    GPIO 27  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 32  — output / input                                 HIGH / LOW / HiZ
+//    GPIO 33  — output / input                                 HIGH / LOW / HiZ  ← arm
 // ─────────────────────────────────────────────
-enum PinMode_t { PIN_SIMPLE, PIN_MOSFET };
+enum PinState_t { HIGH_STATE, LOW_STATE, HIZ_STATE };
+// Friendly aliases so the pin table reads HIGH / LOW / HiZ naturally
+#define HIGH HIGH_STATE
+#define LOW  LOW_STATE
+#define HiZ  HIZ_STATE
 
 struct PinDef {
   int         gpio;
-  PinMode_t   mode;
-  // SIMPLE fields
-  const char* action;       // e.g. "arm_fwd", "arm_back", "turn_left"
-  int         activeLevel;  // HIGH or LOW
-  // MOSFET fields
-  const char* actionHigh;   // OUTPUT HIGH state (track off); nullptr = no binding
-  const char* actionHiZ;    // INPUT (Hi-Z)  state (track fwd)
-  const char* actionLow;    // OUTPUT LOW    state (track back)
+  PinState_t  idle;        // state applied by setPinIdle()
+  const char* actionHigh;  // button name that drives this pin HIGH   (nullptr = unbound)
+  const char* actionHiZ;   // button name that drives this pin to HiZ (nullptr = unbound)
+  const char* actionLow;   // button name that drives this pin LOW    (nullptr = unbound)
 };
 
 // ─────────────────────────────────────────────
 //  Pin table — one entry per physical GPIO used.
+//
+//  Weirdo mode:    Nothing        Green            Cyan
+//  gpio  idle      actionHigh     actionHiZ        actionLow
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
-  // Weirdo mode:                          Nothing     Green          Cyan
-  // gpio  mode      action         level  actionHigh  actionHiZ      actionLow
-  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",    "left_back"    },
-  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",   "right_back"   },
-  { 26, PIN_MOSFET,  nullptr,       0,     nullptr,    "turn_left",   "turn_right"   },
-  { 33, PIN_MOSFET,  nullptr,       0,     nullptr,    "arm_fwd",     "arm_back"     },
-  { 15, PIN_MOSFET,  nullptr,       0,     nullptr,    "light_on",    "light_off"    },
-  {  4, PIN_SIMPLE,  "test",        LOW,   nullptr,    nullptr,       nullptr        },
+  { 13 , HIGH , nullptr      , "left_fwd"     , "left_back"   },
+  { 14 , HIGH , nullptr      , "right_fwd"    , "right_back"  },
+  { 26 , HIGH , nullptr      , "turn_left"    , "turn_right"  },
+  { 33 , HIGH , nullptr      , "arm_fwd"      , "arm_back"    },
+  { 15 , HIGH , nullptr      , "light_on"     , "light_off"   },
+  {  4 , HiZ  , nullptr      , nullptr        , "test"        },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
@@ -84,7 +102,7 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // auto-release if heartbeat stops
 // ─────────────────────────────────────────────
 struct HeldPin {
   const PinDef* pin;
-  bool          useHiZ;  // MOSFET only: true=INPUT(fwd), false=LOW(back)
+  PinState_t    targetState;  // which state to drive this pin to when active
 };
 
 struct HeldAction {
@@ -114,38 +132,29 @@ bool lightOn = false;
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
 // ════════════════════════════════════════════════════════════
-static void setPinIdle(const PinDef& p) {
-  if (p.mode == PIN_SIMPLE) {
-    pinMode(p.gpio, INPUT);
-  } else {
-    // MOSFET idle = OUTPUT HIGH (track off)
-    pinMode(p.gpio, OUTPUT);
-    digitalWrite(p.gpio, HIGH);
+static void applyPinState(int gpio, PinState_t state) {
+  switch (state) {
+    case HIGH_STATE: pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH); break;
+    case LOW_STATE:  pinMode(gpio, OUTPUT); digitalWrite(gpio, LOW);  break;
+    case HIZ_STATE:  pinMode(gpio, INPUT);                            break;
   }
 }
 
-static void setPinActive(const PinDef& p, bool hiZForMosfet) {
-  if (p.mode == PIN_SIMPLE) {
-    pinMode(p.gpio, OUTPUT);
-    digitalWrite(p.gpio, p.activeLevel);
-  } else {
-    if (hiZForMosfet) {
-      pinMode(p.gpio, INPUT);   // forward
-    } else {
-      pinMode(p.gpio, OUTPUT);
-      digitalWrite(p.gpio, LOW); // back
-    }
-  }
+static void setPinIdle(const PinDef& p) {
+  applyPinState(p.gpio, p.idle);
+}
+
+static void setPinActive(const PinDef& p, PinState_t targetState) {
+  applyPinState(p.gpio, targetState);
 }
 
 void releaseAllPins() {
   for (int i = 0; i < PIN_COUNT; i++) setPinIdle(PIN_TABLE[i]);
-  for (int i = 0; i < MAX_HELD; i++) heldActions[i].active = false;
+  for (int i = 0; i < MAX_HELD;  i++) heldActions[i].active = false;
 }
 
-static void pulseSimplePin(const PinDef& p, uint32_t durationMs) {
-  if (p.mode != PIN_SIMPLE) return;
-  setPinActive(p, false);
+static void pulsePin(const PinDef& p, PinState_t activeState, uint32_t durationMs) {
+  setPinActive(p, activeState);
   delay(durationMs);
   setPinIdle(p);
 }
@@ -204,24 +213,12 @@ int buttonToHeldPins(const String& btn, HeldPin* out) {
     return c1 + c2;
   }
 
-  // Primitives — walk PIN_TABLE
+  // Primitives — walk PIN_TABLE, check all three action slots
   for (int i = 0; i < PIN_COUNT; i++) {
     const PinDef& p = PIN_TABLE[i];
-    if (p.mode == PIN_SIMPLE) {
-      if (p.action && btn == p.action) {
-        out[0] = { &p, false };
-        return 1;
-      }
-    } else { // PIN_MOSFET
-      if (p.actionHiZ && btn == p.actionHiZ) {
-        out[0] = { &p, true };
-        return 1;
-      }
-      if (p.actionLow && btn == p.actionLow) {
-        out[0] = { &p, false };
-        return 1;
-      }
-    }
+    if (p.actionHigh && btn == p.actionHigh) { out[0] = { &p, HIGH_STATE }; return 1; }
+    if (p.actionHiZ  && btn == p.actionHiZ)  { out[0] = { &p, HIZ_STATE  }; return 1; }
+    if (p.actionLow  && btn == p.actionLow)  { out[0] = { &p, LOW_STATE  }; return 1; }
   }
   return 0;
 }
@@ -234,7 +231,7 @@ void startAction(const String& name, HeldPin* pins, int count) {
     h->pinCount = count;
     for (int i = 0; i < count; i++) {
       h->pins[i] = pins[i];
-      setPinActive(*pins[i].pin, pins[i].useHiZ);
+      setPinActive(*pins[i].pin, pins[i].targetState);
     }
     h->active = true;
     Serial.printf("[CMD] Hold  '%s'  (%d pins)\n", name.c_str(), count);
@@ -307,8 +304,13 @@ void handleCmd() {
       const char* desired = lightOn ? "light_on" : "light_off";
       for (int i = 0; i < PIN_COUNT; i++) {
         const PinDef& p = PIN_TABLE[i];
-        if (p.mode == PIN_SIMPLE && p.action && String(p.action) == desired) {
-          pulseSimplePin(p, PULSE_DURATION_MS);
+        if ((p.actionHiZ  && String(p.actionHiZ)  == desired) ||
+            (p.actionLow  && String(p.actionLow)   == desired) ||
+            (p.actionHigh && String(p.actionHigh)  == desired)) {
+          PinState_t s = (p.actionHiZ  && String(p.actionHiZ)  == desired) ? HIZ_STATE
+                       : (p.actionLow  && String(p.actionLow)   == desired) ? LOW_STATE
+                       : HIGH_STATE;
+          pulsePin(p, s, PULSE_DURATION_MS);
           break;
         }
       }
