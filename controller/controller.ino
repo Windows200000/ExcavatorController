@@ -3,10 +3,10 @@
  * See design.md for full architecture and endpoint reference.
  */
 
-#include &lt;WiFi.h&gt;
-#include &lt;WebServer.h&gt;
-#include &lt;HTTPClient.h&gt;
-#include &lt;ArduinoJson.h&gt;
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ─────────────────────────────────────────────
 //  WiFi AP credentials
@@ -279,9 +279,9 @@ void handleRoot() {
 
 void handleRegister() {
   if (!server.hasArg("plain")) { server.send(400, "text/plain", "No body"); return; }
-  StaticJsonDocument&lt;128&gt; doc;
+  StaticJsonDocument<128> doc;
   if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "text/plain", "Bad JSON"); return; }
-  camIP = doc["ip"].as&lt;String&gt;();
+  camIP = doc["ip"].as<String>();
   Serial.printf("[REG] Cam registered at %s\n", camIP.c_str());
   server.send(200, "text/plain", "OK");
 }
@@ -311,7 +311,7 @@ void handleCmd() {
     if (action == "press") {
       lightOn = !lightOn;
       const char* desired = lightOn ? "light_on" : "light_off";
-      for (int i = 0; i &lt; PIN_COUNT; i++) {
+      for (int i = 0; i < PIN_COUNT; i++) {
         const PinDef& p = PIN_TABLE[i];
         if (p.mode == PIN_SIMPLE && p.action && String(p.action) == desired) {
           pulseSimplePin(p, PULSE_DURATION_MS);
@@ -352,7 +352,7 @@ void handleCamCmd() {
 }
 
 void handleStatus() {
-  StaticJsonDocument&lt;256&gt; doc;
+  StaticJsonDocument<256> doc;
   doc["camIP"]  = camIP;
   doc["uptime"] = millis() / 1000;
   doc["heap"]   = ESP.getFreeHeap();
@@ -394,10 +394,10 @@ void loop() {
   server.handleClient();
 
   uint32_t now = millis();
-  for (int i = 0; i &lt; MAX_HELD; i++) {
-    if (heldActions[i].active && (now - heldActions[i].lastSeen) &gt; HOLD_TIMEOUT_MS) {
+  for (int i = 0; i < MAX_HELD; i++) {
+    if (heldActions[i].active && (now - heldActions[i].lastSeen) > HOLD_TIMEOUT_MS) {
       Serial.printf("[SAFE] Timeout-release '%s'\n", heldActions[i].name.c_str());
-      for (int j = 0; j &lt; heldActions[i].pinCount; j++)
+      for (int j = 0; j < heldActions[i].pinCount; j++)
         setPinIdle(*heldActions[i].pins[j].pin);
       heldActions[i].active = false;
     }
