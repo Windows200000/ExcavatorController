@@ -523,6 +523,16 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   .track-fill.active{fill:#e05c00;}
   .arrow-indicator{opacity:0;transition:opacity .15s;}
   .arrow-indicator.active{opacity:1;}
+
+  /* ── Debug overlay panel ── */
+  #dbg{
+    position:fixed;bottom:8px;left:8px;z-index:9999;
+    background:rgba(0,0,0,.88);border:1px solid #00ff00;border-radius:4px;
+    padding:6px 8px;font-family:'Share Tech Mono',monospace;font-size:.6rem;
+    color:#00ff00;max-width:480px;pointer-events:none;line-height:1.6;
+  }
+  #dbg b{color:#fff;}
+  #dbg-json{color:#ff0;font-size:.55rem;max-height:80px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin-top:4px;}
 </style>
 </head>
 <body>
@@ -956,10 +966,44 @@ function pollCamStatus() {
 }
 setInterval(pollCamStatus, MODE_POLL);
 
+// ── Debug overlay panel ──────────────────────────────────────
+const dbg = document.createElement('div');
+dbg.id = 'dbg';
+dbg.innerHTML = '<b>DBG</b> canvas: <span id="dbg-canvas">?</span> &nbsp; img: <span id="dbg-img">?</span><br>' +
+  'detections: <span id="dbg-count">0</span> &nbsp; first: <span id="dbg-first">-</span><br>' +
+  '<div id="dbg-json">no data yet</div>';
+document.body.appendChild(dbg);
+
+function updateDbg(detections, rawText) {
+  document.getElementById('dbg-canvas').textContent =
+    canvas.width + 'x' + canvas.height;
+  document.getElementById('dbg-img').textContent =
+    (feedImg.naturalWidth || '?') + 'x' + (feedImg.naturalHeight || '?');
+  document.getElementById('dbg-count').textContent = detections ? detections.length : 0;
+  if (detections && detections.length) {
+    const d = detections[0];
+    document.getElementById('dbg-first').textContent =
+      'x=' + d.x.toFixed(3) + ' y=' + d.y.toFixed(3) +
+      ' w=' + d.w.toFixed(3) + ' h=' + d.h.toFixed(3) +
+      ' conf=' + (d.confidence * 100).toFixed(0) + '%';
+  } else {
+    document.getElementById('dbg-first').textContent = '-';
+  }
+  document.getElementById('dbg-json').textContent = rawText || '';
+}
+
 // ── Canvas overlay — detection bounding boxes ────────────────
 // red_dot detections are drawn with a red box; other labels use amber.
-function drawOverlay(detections) {
+function drawOverlay(detections, rawText) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Debug: green dashed border around entire canvas drawing area
+  ctx.save();
+  ctx.strokeStyle = '#00ff00';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeRect(1, 1, canvas.width - 2, canvas.height - 2);
+  ctx.restore();
+  updateDbg(detections, rawText);
   if (!detections || !detections.length) return;
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
@@ -981,7 +1025,11 @@ function drawOverlay(detections) {
 }
 
 function pollOverlay() {
-  fetch('/overlay').then(r => r.json()).then(d => drawOverlay(d.detections)).catch(() => {});
+  fetch('/overlay').then(r => r.text()).then(text => {
+    let parsed = { detections: [] };
+    try { parsed = JSON.parse(text); } catch(e) {}
+    drawOverlay(parsed.detections, text);
+  }).catch(() => {});
 }
 setInterval(pollOverlay, OVERLAY_POLL);
 
