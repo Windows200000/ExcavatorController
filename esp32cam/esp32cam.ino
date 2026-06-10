@@ -71,6 +71,10 @@ const int         STREAM_DELAY_MS   = 0;
 
 // ─────────────────────────────────────────────
 //  Image processing interval
+//  Detection runs on its own timer independently of the MJPEG stream.
+//  Stream and detection each call esp_camera_fb_get() independently;
+//  with fb_count=2 (PSRAM path) the driver hands out separate buffer
+//  slots so concurrent access is safe.
 // ─────────────────────────────────────────────
 const uint32_t DETECTION_INTERVAL_MS = 500;
 
@@ -83,7 +87,6 @@ WebServer server(80);
 //  Runtime state
 // ─────────────────────────────────────────────
 uint32_t lastDetectionMs = 0;
-volatile bool streamActive = false;
 
 // Safe/Armed mode — boots in SAFE
 enum CamMode { MODE_SAFE, MODE_ARMED };
@@ -144,12 +147,10 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // RGB565 at VGA requires 614400 bytes — exceeds reliable PSRAM allocation.
-  // Cap at QVGA (320x240 = 153600 bytes) for both paths.
   if (psramFound()) {
-    config.frame_size   = STREAM_FRAME_SIZE;  // QVGA — safe for RGB565
+    config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 2;
+    config.fb_count     = 2;   // 2 slots: one for stream, one for detection
   } else {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY + 4;
@@ -174,12 +175,9 @@ bool initCamera() {
 // ════════════════════════════════════════════════════════════
 
 // GET /stream  — MJPEG
-// Camera captures RGB565; frames are converted to JPEG via frame2jpg() before sending.
 void handleStream() {
-  // Grab the client before handing off
   WiFiClient client = server.client();
 
-  // Send the initial HTTP header directly
   String header =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -188,17 +186,14 @@ void handleStream() {
     "\r\n";
   client.print(header);
 
-  // Spin off a FreeRTOS task so handleClient() is no longer blocked
   WiFiClient* clientPtr = new WiFiClient(client);
   xTaskCreatePinnedToCore(
     [](void* arg) {
       WiFiClient* c = (WiFiClient*)arg;
-      streamActive = true;
       while (c->connected()) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) break;
 
-        // Camera is in RGB565 mode — convert to JPEG for MJPEG stream
         if (fb->format == PIXFORMAT_JPEG) {
             String partHeader =
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
@@ -211,28 +206,25 @@ void handleStream() {
 
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
-      streamActive = false;
       Serial.println("[CAM] Stream client disconnected");
       delete c;
       vTaskDelete(NULL);
     },
     "stream_task",
-    8192,        // stack size — needs to be generous for camera ops
+    8192,
     clientPtr,
-    1,           // priority
+    1,
     NULL,
-    1            // pin to core 1 (core 0 runs WiFi)
+    1
   );
 }
 
-// GET /snapshot  — single JPEG at full res
+// GET /snapshot  — single JPEG
 void handleSnapshot() {
-  // RGB565 mode: stay at STREAM_FRAME_SIZE (QVGA) — VGA would overflow the frame buffer
   camera_fb_t* fb = esp_camera_fb_get();
 
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
 
-  // Convert RGB565 to JPEG for snapshot delivery
   uint8_t* jpgBuf = nullptr;
   size_t   jpgLen = 0;
   bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
@@ -265,7 +257,7 @@ void handleMode() {
     Serial.println("[MODE] ARMED");
   } else if (m == "safe") {
     camMode = MODE_SAFE;
-    pumpOff();   // safety: immediately cut pump when entering safe mode
+    pumpOff();
     Serial.println("[MODE] SAFE");
   } else {
     server.send(400, "text/plain", "Unknown mode");
@@ -421,7 +413,6 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
 
-  // Pump pin — start as input (high-Z / off)
   pinMode(PIN_PUMP, INPUT);
 
   if (!initCamera()) {
@@ -455,8 +446,12 @@ void loop() {
     pumpOff();
   }
 
-  // Periodic detection + overlay push — skip while pump is firing (Fix D)
-  if (!pumpActive && !streamActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
+  // Periodic detection + overlay push.
+  // Runs independently of stream — stream task uses its own fb_get calls
+  // on a separate frame buffer slot (fb_count=2 on PSRAM path).
+  // Detection is only skipped while pump is firing to avoid camera
+  // contention during a critical actuation window.
+  if (!pumpActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
     lastDetectionMs = millis();
     runDetectionAndPush();
   }

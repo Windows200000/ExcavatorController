@@ -75,6 +75,15 @@ Browser (pump / mode actions)
 Browser  ->  GET http://<camIP>/status  ->  { mode, pumpActive }  ->  SAFE/ARMED badge
 ```
 
+### Autonomous Action (future)
+
+```
+ESP32-CAM  ->  POST /overlay (detections)  ->  Controller
+Controller ->  reads /overlay in loop()    ->  setPinActive / setPinIdle autonomously
+```
+
+The controller is the single decision-maker. The cam detects and reports; the controller acts. This keeps all actuation logic in one place and means the cam never needs to know about motors or buttons.
+
 ---
 
 ## Required Libraries
@@ -400,38 +409,27 @@ To put the device into flash mode: connect **IO0 to GND** before power-on. Remov
 ### Stream / Quality Constants
 
 ```cpp
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;   // 320x240
-const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640x480
+const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;    // 640×480
+const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640×480
 const uint8_t     JPEG_QUALITY      = 12;   // 0 = best ... 63 = worst; 10-15 sweet spot
 const int         STREAM_DELAY_MS   = 0;    // extra inter-frame delay (ms)
 ```
 
-If PSRAM is present, `SNAP_FRAME_SIZE` is used for the initial frame buffer with `fb_count = 2`; otherwise `STREAM_FRAME_SIZE` with `fb_count = 1` and `JPEG_QUALITY + 4`.
-
 ### Pixel Format
 
-The camera is initialised with `PIXFORMAT_RGB565` (not JPEG). This gives direct access to raw pixel data for colour thresholding in the detection pipeline. The MJPEG stream and `/snapshot` endpoint both use `frame2jpg()` to convert each RGB565 frame to JPEG before transmission.
+The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding. This avoids keeping a second raw frame buffer resident at all times.
 
-### MJPEG Stream Format
+### Concurrent Stream and Detection
 
-```
-Content-Type: multipart/x-mixed-replace; boundary=frame
-Access-Control-Allow-Origin: *
+The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.
 
---frame
-Content-Type: image/jpeg
-Content-Length: <N>
-
-<JPEG bytes>   (converted from RGB565 via frame2jpg() per frame)
+```cpp
+const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms regardless of stream state
 ```
 
 ### Image Processing
 
 Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller's `/overlay` endpoint:
-
-```cpp
-const uint32_t DETECTION_INTERVAL_MS = 500;   // How often to run detection and push overlay
-```
 
 ```cpp
 struct Detection {
@@ -452,22 +450,17 @@ Detection result JSON schema:
 }
 ```
 
-#### Red Dot Detection (RGB565 Colour Thresholding)
+#### Red Dot Detection (RGB888 Colour Thresholding)
 
-The active detection algorithm finds a bright red dot using per-pixel RGB565 colour thresholding followed by a simple bounding-box blob finder.
+The active detection algorithm finds a bright red dot using per-pixel RGB888 colour thresholding followed by a simple bounding-box blob finder. The JPEG frame is decoded to RGB888 via `fmt2rgb888()` before thresholding.
 
-**RGB565 bit layout** (after little-endian byte-swap):
-- R (5-bit): bits [15:11]
-- G (6-bit): bits [10:5]
-- B (5-bit): bits [4:0]
+**Thresholds** (tuned for a bright red dot, 8-bit per channel):
 
-**Thresholds** (tuned for a bright red dot):
-
-| Channel | Min | Max | Rationale |
-|---------|-----|-----|-----------|
-| R (5-bit) | 15 | 31 | Saturated red |
-| G (6-bit) | 0 | 12 | Low green |
-| B (5-bit) | 0 | 12 | Low blue |
+| Channel | Threshold | Rationale |
+|---------|-----|-----------|
+| R | > 160 | Saturated red |
+| G | < 80 | Low green |
+| B | < 80 | Low blue |
 
 **Blob finder**: Iterates all pixels, accumulates a bounding box (bx1, by1, bx2, by2) and pixel count for matching pixels. If `blobCount >= MIN_BLOB` (30), a `Detection` is emitted with label `"red_dot"`, normalised bounding box coordinates, and confidence scaled as `min(1.0, blobCount / 500.0)`.
 
@@ -486,11 +479,8 @@ The active detection algorithm finds a bright red dot using per-pixel RGB565 col
 ### Pump Control
 
 ```cpp
-// Pump relay pin
-#define GPIO_PUMP  13   // hold-while-pressed
-
-// Pump heartbeat timeout (ms) - auto-releases if no hold heartbeat arrives
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;
+const int PIN_PUMP = 4;  // Temp for LED; change digitalWrite to LOW for real pump relay
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 ```
 
 ### Safe / Armed Mode
@@ -505,16 +495,16 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/stream` | MJPEG multipart stream |
-| `GET` | `/snapshot` | Single JPEG at `SNAP_FRAME_SIZE`, then restores stream resolution |
+| `GET` | `/snapshot` | Single JPEG at `SNAP_FRAME_SIZE` |
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
-| `GET` | `/pump?action=press\|hold\|release` | Controls pump relay on GPIO 13 |
+| `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
 
 ### Main Loop
 
 ```
 setup():
-  initCamera()          <- PIXFORMAT_RGB565
+  initCamera()          <- PIXFORMAT_JPEG, fb_count=2 (PSRAM)
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
   register HTTP routes
@@ -522,10 +512,11 @@ setup():
 
 loop():
   server.handleClient()
-  if (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS) {
-    runDetectionAndPush()   <- RGB565 red dot detection + POST /overlay
-  }
-  // pump heartbeat watchdog (same pattern as controller held-pin)
+  // pump heartbeat watchdog
+  if pumpActive and timeout: pumpOff()
+  // detection — always runs, independent of stream
+  if (!pumpActive && millis() - lastDetectionMs >= DETECTION_INTERVAL_MS):
+    runDetectionAndPush()
 ```
 
 ---
@@ -537,6 +528,7 @@ The detection overlay pipeline is designed to support future autonomous operatio
 - Detections from on-device image processing are already available on the controller via `/overlay`
 - The controller can read these detections in `loop()` and autonomously issue `setPinActive` / `setPinIdle` calls without browser involvement
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
+- The controller is the single decision-maker: the cam detects and reports, the controller acts. This keeps all actuation logic in one place.
 - Suggested detection algorithms: colour thresholding (simple, implemented), ArUco marker tracking (positioning), TFLite model inference (object recognition)
 
 ---
