@@ -603,7 +603,7 @@ void setup() {
   // and WiFi task preemption, without requiring ESP_TIMER_ISR.
   hw_timer_t* hwTimer = timerBegin(SAMPLE_FREQ_HZ);
   timerAttachInterrupt(hwTimer, &onSampleTimer);
-  timerStart(hwTimer);
+  timerAlarm(hwTimer, 20, true, 0);                 // alarm every 20 ticks = 20 µs = 50 kHz, auto-reload
 
   lastDbgMs = millis();
   Serial.println("\nTemporary oscilloscope + DAC firmware");
