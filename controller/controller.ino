@@ -73,7 +73,7 @@ const PinDef PIN_TABLE[] = {
   { 26, PIN_MOSFET,  nullptr,       0,     nullptr,    "turn_left",   "turn_right"   },
   { 33, PIN_MOSFET,  nullptr,       0,     nullptr,    "arm_forward", "arm_backward" },
   { 15, PIN_MOSFET,  nullptr,       0,     nullptr,    "light_on",    "light_off"    },
-  {  4, PIN_SIMPLE,  "test",        LOW,  nullptr,    nullptr,       nullptr        },
+  {  4, PIN_SIMPLE,  "test",        LOW,   nullptr,    nullptr,       nullptr        },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
