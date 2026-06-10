@@ -713,11 +713,9 @@ const MODE_POLL      = 1500;  // poll cam /status for armed/safe
 // ── State ──────────────────────────────────────────────────
 let camIP = null;
 let lightToggleOn = false;
-// Map of active holds: actionName → {timer, pins (visual)}
 const activeHolds = {};
 
 // ── Visual model parts map ──────────────────────────────────
-// Maps action name → SVG element IDs to activate
 const ACTION_SVG = {
   fwd:        ['lt-fill','rt-fill','lt-arrow-fwd','rt-arrow-fwd'],
   back:       ['lt-fill','rt-fill','lt-arrow-back','rt-arrow-back'],
@@ -736,7 +734,6 @@ const ACTION_SVG = {
   pump:       ['svg-pump-body','pump-spray-1','pump-spray-2','pump-spray-3'],
 };
 
-// Color overrides for specific elements when active
 const SVG_COLORS = {
   'svg-turntable': '#3ab8ff',
   'tt-arrow-left': '#3ab8ff',
@@ -771,7 +768,6 @@ function svgDeactivate(action) {
   ids.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    // Only remove active if no other current action still uses this id
     const stillActive = Object.keys(activeHolds).some(a =>
       a !== action && (ACTION_SVG[a]||[]).includes(id)
     );
@@ -791,20 +787,16 @@ function camCmd(c) {
   fetch('/camcmd?cmd=' + c).catch(() => {});
 }
 
-// ── Hold logic (multi-simultaneous) ────────────────────────
+// ── Hold logic ──────────────────────────────────────────────
 function startHold(action, isCamAction) {
   if (activeHolds[action]) return;
-  if (isCamAction) {
-    camCmd(action + '_press');
-  } else {
-    cmd(action, 'press');
-  }
+  if (isCamAction) camCmd(action + '_press');
+  else cmd(action, 'press');
   activeHolds[action] = setInterval(() => {
     if (isCamAction) camCmd(action + '_hold');
     else cmd(action, 'hold');
   }, HEARTBEAT_MS);
   svgActivate(action);
-  // highlight button
   document.querySelector('[data-action="'+action+'"]')?.classList.add('held');
   document.querySelector('[data-camaction="'+action+'"]')?.classList.add('held');
 }
@@ -813,11 +805,8 @@ function stopHold(action, isCamAction) {
   if (!activeHolds[action]) return;
   clearInterval(activeHolds[action]);
   delete activeHolds[action];
-  if (isCamAction) {
-    camCmd(action + '_release');
-  } else {
-    cmd(action, 'release');
-  }
+  if (isCamAction) camCmd(action + '_release');
+  else cmd(action, 'release');
   svgDeactivate(action);
   document.querySelector('[data-action="'+action+'"]')?.classList.remove('held');
   document.querySelector('[data-camaction="'+action+'"]')?.classList.remove('held');
@@ -826,8 +815,7 @@ function stopHold(action, isCamAction) {
 function stopAllHolds() {
   Object.keys(activeHolds).forEach(a => {
     const el = document.querySelector('[data-camaction="'+a+'"]');
-    const isCam = !!el;
-    stopHold(a, isCam);
+    stopHold(a, !!el);
   });
 }
 
@@ -836,13 +824,11 @@ document.querySelectorAll('button.ctrl').forEach(btn => {
   const action    = btn.dataset.action;
   const camAction = btn.dataset.camaction;
   const isToggle  = !!btn.dataset.toggle;
-
   if (!action && !camAction) return;
 
   function onDown(e) {
     e.preventDefault();
     if (isToggle) {
-      // light toggle — fire once
       lightToggleOn = !lightToggleOn;
       cmd('light', 'press');
       btn.classList.toggle('toggle-on', lightToggleOn);
@@ -853,7 +839,6 @@ document.querySelectorAll('button.ctrl').forEach(btn => {
     if (camAction) startHold(camAction, true);
     else startHold(action, false);
   }
-
   function onUp(e) {
     e.preventDefault();
     if (isToggle) return;
@@ -870,61 +855,49 @@ document.querySelectorAll('button.ctrl').forEach(btn => {
 document.addEventListener('pointerup', stopAllHolds);
 window.addEventListener('blur', stopAllHolds);
 
-// ── Safety badge (send to cam, read back live) ──────────────
+// ── Safety badge ────────────────────────────────────────────
 const safetyBadge = document.getElementById('safety-badge');
-let currentMode = 'safe'; // local mirror; real truth comes from cam /status poll
+let currentMode = 'safe';
 
 const updateSafetyBadge = (mode) => {
   currentMode = mode;
   if (mode === 'armed') {
     safetyBadge.className = 'armed';
-    safetyBadge.innerHTML = '(💢 -_•)╦̵̵̿╤── ARMED';
+    safetyBadge.innerHTML = '(&#x1F4A2; -_&bull;)&#x256C;&#x336;&#x336;&#x33F;&#x2564;&#x2500;&#x2500; ARMED';
   } else {
     safetyBadge.className = 'safe';
-    safetyBadge.textContent = '🔒 SAFE';
+    safetyBadge.textContent = '\uD83D\uDD12 SAFE';
   }
-}
+};
 
 safetyBadge.addEventListener('click', () => {
-  const target = currentMode === 'safe' ? 'mode_arm' : 'mode_safe';
-  camCmd(target);
-  // Don't update badge here — wait for cam poll to confirm
+  camCmd(currentMode === 'safe' ? 'mode_arm' : 'mode_safe');
 });
 
 // ── Keyboard shortcuts ──────────────────────────────────────
 const KEY_MAP = {
   'w':'fwd','s':'back','a':'spin_left','d':'spin_right',
   'ArrowLeft':'turn_left','ArrowRight':'turn_right',
-  'ArrowUp':'up','ArrowDown':'down',
-  't':'test',
+  'ArrowUp':'up','ArrowDown':'down','t':'test',
 };
 const TOGGLE_KEYS = new Set(['l']);
-const CAM_KEYS = new Set([' ']); // space = pump
-const activeKeys = new Set();
+const CAM_KEYS    = new Set([' ']);
+const activeKeys  = new Set();
 
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA') return;
   ev.preventDefault();
-
   if (TOGGLE_KEYS.has(ev.key)) {
     if (ev.repeat) return;
     lightToggleOn = !lightToggleOn;
     cmd('light', 'press');
-    const btn = document.getElementById('btn-light');
-    btn?.classList.toggle('toggle-on', lightToggleOn);
+    document.getElementById('btn-light')?.classList.toggle('toggle-on', lightToggleOn);
     if (lightToggleOn) svgActivate('light'); else svgDeactivate('light');
     return;
   }
-
-  if (CAM_KEYS.has(ev.key)) {
-    if (ev.repeat) return;
-    startHold('pump', true);
-    return;
-  }
-
+  if (CAM_KEYS.has(ev.key)) { if (!ev.repeat) startHold('pump', true); return; }
   const action = KEY_MAP[ev.key];
-  if (!action) return;
-  if (activeKeys.has(ev.key)) return;
+  if (!action || activeKeys.has(ev.key)) return;
   activeKeys.add(ev.key);
   startHold(action, false);
 });
@@ -944,6 +917,12 @@ const canvas      = document.getElementById('overlay-canvas');
 const ctx         = canvas.getContext('2d');
 const camStatus   = document.getElementById('cam-status');
 
+function resizeCanvas() { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+// Re-sync canvas size once the feed image is loaded and displayed
+feedImg.addEventListener('load', resizeCanvas);
+
 function startFeed(ip) {
   feedImg.src = 'http://' + ip + '/stream';
   feedImg.style.display = 'block';
@@ -953,7 +932,7 @@ function startFeed(ip) {
   feedImg.onerror = () => {
     feedImg.style.display = 'none';
     placeholder.style.display = 'flex';
-    placeholder.textContent = 'Stream error — retrying…';
+    placeholder.textContent = 'Stream error \u2014 retrying\u2026';
     camStatus.classList.remove('online');
     setTimeout(() => { if (camIP) startFeed(camIP); }, 3000);
   };
@@ -963,41 +942,44 @@ function pollCamIP() {
   fetch('/camip').then(r => r.text()).then(ip => {
     ip = ip.trim();
     if (ip && ip !== camIP) { camIP = ip; startFeed(ip); }
-    else if (!ip) { camStatus.textContent = 'CAM: searching…'; camStatus.classList.remove('online'); }
+    else if (!ip) { camStatus.textContent = 'CAM: searching\u2026'; camStatus.classList.remove('online'); }
   }).catch(() => {});
 }
 setInterval(pollCamIP, CAM_POLL); pollCamIP();
 
-// ── Live cam status poll (mode + pump state) ─────────────────
+// ── Live cam status poll ─────────────────────────────────────
 function pollCamStatus() {
   if (!camIP) return;
-  fetch('http://' + camIP + '/status')
-    .then(r => r.json())
-    .then(d => {
-      if (d.mode) updateSafetyBadge(d.mode);
-    })
-    .catch(() => {});
+  fetch('http://' + camIP + '/status').then(r => r.json()).then(d => {
+    if (d.mode) updateSafetyBadge(d.mode);
+  }).catch(() => {});
 }
 setInterval(pollCamStatus, MODE_POLL);
 
-// ── Canvas overlay ───────────────────────────────────────────
-function resizeCanvas() { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; }
-window.addEventListener('resize', resizeCanvas); resizeCanvas();
-
+// ── Canvas overlay — detection bounding boxes ────────────────
+// red_dot detections are drawn with a red box; other labels use amber.
 function drawOverlay(detections) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!detections || !detections.length) return;
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
-    const x = d.x*W, y = d.y*H, w = d.w*W, h = d.h*H;
-    ctx.strokeStyle = '#f0a500'; ctx.lineWidth = 2; ctx.strokeRect(x, y, w, h);
-    const label = d.label + ' ' + Math.round(d.confidence*100) + '%';
+    const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
+    const color = d.label === 'red_dot' ? '#ff3030' : '#f0a500';
+    // Bounding box
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+    // Label tag
+    const label = d.label + ' ' + Math.round(d.confidence * 100) + '%';
     ctx.font = 'bold 12px "Share Tech Mono",monospace';
     const tw = ctx.measureText(label).width;
-    ctx.fillStyle = 'rgba(240,165,0,0.85)'; ctx.fillRect(x, y-18, tw+8, 18);
-    ctx.fillStyle = '#0a0e14'; ctx.fillText(label, x+4, y-4);
+    ctx.fillStyle = d.label === 'red_dot' ? 'rgba(255,48,48,0.85)' : 'rgba(240,165,0,0.85)';
+    ctx.fillRect(x, y - 18, tw + 8, 18);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, x + 4, y - 4);
   });
 }
+
 function pollOverlay() {
   fetch('/overlay').then(r => r.json()).then(d => drawOverlay(d.detections)).catch(() => {});
 }
