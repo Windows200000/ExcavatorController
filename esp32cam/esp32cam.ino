@@ -141,7 +141,7 @@ bool initCamera() {
   config.pin_pwdn     = CAM_PIN_PWDN;
   config.pin_reset    = CAM_PIN_RESET;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = PIXFORMAT_RGB565;  // RGB565 required for colour thresholding
 
   if (psramFound()) {
     config.frame_size   = SNAP_FRAME_SIZE;
@@ -171,7 +171,7 @@ bool initCamera() {
 // ════════════════════════════════════════════════════════════
 
 // GET /stream  — MJPEG
-// Replace handleStream() with this:
+// Camera captures RGB565; frames are converted to JPEG via frame2jpg() before sending.
 void handleStream() {
   // Grab the client before handing off
   WiFiClient client = server.client();
@@ -193,13 +193,23 @@ void handleStream() {
       while (c->connected()) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) break;
-        String partHeader =
-          "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-          + String(fb->len) + "\r\n\r\n";
-        c->print(partHeader);
-        c->write(fb->buf, fb->len);
-        c->print("\r\n");
+
+        // Camera is in RGB565 mode — convert to JPEG for MJPEG stream
+        uint8_t* jpgBuf = nullptr;
+        size_t   jpgLen = 0;
+        bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
         esp_camera_fb_return(fb);
+
+        if (converted && jpgLen > 0) {
+          String partHeader =
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + String(jpgLen) + "\r\n\r\n";
+          c->print(partHeader);
+          c->write(jpgBuf, jpgLen);
+          c->print("\r\n");
+          free(jpgBuf);
+        }
+
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
       Serial.println("[CAM] Stream client disconnected");
@@ -222,9 +232,17 @@ void handleSnapshot() {
   camera_fb_t* fb = esp_camera_fb_get();
   s->set_framesize(s, STREAM_FRAME_SIZE);
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+
+  // Convert RGB565 to JPEG for snapshot delivery
+  uint8_t* jpgBuf = nullptr;
+  size_t   jpgLen = 0;
+  bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
   esp_camera_fb_return(fb);
+
+  if (!converted || jpgLen == 0) { server.send(500, "text/plain", "JPEG conversion failed"); return; }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
+  free(jpgBuf);
 }
 
 // GET /pump?action=press|hold|release
@@ -272,7 +290,7 @@ void handleStatus() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Image processing stub  (extend here)
+//  Detection struct
 // ════════════════════════════════════════════════════════════
 struct Detection {
   String label;
@@ -280,38 +298,88 @@ struct Detection {
   float  confidence;
 };
 
+// ════════════════════════════════════════════════════════════
+//  Image processing — Red dot detection + overlay push
+// ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // ── TODO: insert your image processing here ──────────────
-  // Example stub (uncomment and adapt):
-  //   Detection d;
-  //   d.label = "rock"; d.x=0.30f; d.y=0.20f;
-  //   d.w=0.10f; d.h=0.15f; d.confidence=0.87f;
-  //   detections.push_back(d);
-  // ─────────────────────────────────────────────────────────
   std::vector<Detection> detections;
+
+  // ── Red dot detection via RGB565 colour thresholding ──────
+  // RGB565: each pixel = 2 bytes, big-endian
+  // R[4:0] = bits[15:11], G[5:0] = bits[10:5], B[4:0] = bits[4:0]
+  const int W = fb->width;
+  const int H = fb->height;
+  const uint16_t* pixels = (const uint16_t*)fb->buf;
+
+  // Thresholds tuned for a bright red dot
+  const uint8_t R_MIN = 15, R_MAX = 31;  // 5-bit red   (>=15 = saturated red)
+  const uint8_t G_MAX = 12;              // 6-bit green  (low green)
+  const uint8_t B_MAX = 12;              // 5-bit blue   (low blue)
+  const int MIN_BLOB  = 30;              // min pixels to count as a dot
+
+  // Simple bounding-box blob finder
+  int bx1 = W, by1 = H, bx2 = 0, by2 = 0;
+  int blobCount = 0;
+
+  for (int y = 0; y < H; y++) {
+    for (int x = 0; x < W; x++) {
+      uint16_t px = pixels[y * W + x];
+      // RGB565 byte-swap (ESP32 stores little-endian)
+      px = (px >> 8) | (px << 8);
+      uint8_t r = (px >> 11) & 0x1F;
+      uint8_t g = (px >>  5) & 0x3F;
+      uint8_t b =  px        & 0x1F;
+
+      if (r >= R_MIN && r <= R_MAX && g <= G_MAX && b <= B_MAX) {
+        if (x < bx1) bx1 = x;
+        if (x > bx2) bx2 = x;
+        if (y < by1) by1 = y;
+        if (y > by2) by2 = y;
+        blobCount++;
+      }
+    }
+  }
+
+  if (blobCount >= MIN_BLOB) {
+    Detection d;
+    d.label      = "red_dot";
+    d.x          = (float)bx1 / W;
+    d.y          = (float)by1 / H;
+    d.w          = (float)(bx2 - bx1) / W;
+    d.h          = (float)(by2 - by1) / H;
+    d.confidence = min(1.0f, (float)blobCount / 500.0f);  // scale to 0..1
+    detections.push_back(d);
+    Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
+                  d.x, d.y, d.w, d.h, d.confidence);
+  }
+  // ── end detection ─────────────────────────────────────────
+
   esp_camera_fb_return(fb);
 
+  // Serialize + POST to /overlay
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
     JsonObject o = arr.createNestedObject();
-    o["label"]      = d.label;
-    o["x"]          = d.x; o["y"] = d.y;
-    o["w"]          = d.w; o["h"] = d.h;
+    o["label"] = d.label;
+    o["x"] = d.x; o["y"] = d.y;
+    o["w"] = d.w; o["h"] = d.h;
     o["confidence"] = d.confidence;
   }
   doc["ts"] = millis();
   String body; serializeJson(doc, body);
 
   HTTPClient http;
-  String url = "http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/overlay";
+  String url = "http://" + String(CONTROLLER_IP) + ":" +
+               String(CONTROLLER_PORT) + "/overlay";
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
-  if (code < 0) Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
+  if (code < 0)
+    Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
   http.end();
 }
 

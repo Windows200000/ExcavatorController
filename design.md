@@ -387,6 +387,10 @@ const int         STREAM_DELAY_MS   = 0;    // extra inter-frame delay (ms)
 
 If PSRAM is present, `SNAP_FRAME_SIZE` is used for the initial frame buffer with `fb_count = 2`; otherwise `STREAM_FRAME_SIZE` with `fb_count = 1` and `JPEG_QUALITY + 4`.
 
+### Pixel Format
+
+The camera is initialised with `PIXFORMAT_RGB565` (not JPEG). This gives direct access to raw pixel data for colour thresholding in the detection pipeline. The MJPEG stream and `/snapshot` endpoint both use `frame2jpg()` to convert each RGB565 frame to JPEG before transmission.
+
 ### MJPEG Stream Format
 
 ```
@@ -397,7 +401,7 @@ Access-Control-Allow-Origin: *
 Content-Type: image/jpeg
 Content-Length: <N>
 
-<JPEG bytes>
+<JPEG bytes>   (converted from RGB565 via frame2jpg() per frame)
 ```
 
 ### Image Processing
@@ -421,10 +425,34 @@ Detection result JSON schema:
 ```json
 {
   "detections": [
-    { "label": "rock", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 }
+    { "label": "red_dot", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 }
   ],
   "ts": 12345
 }
+```
+
+#### Red Dot Detection (RGB565 Colour Thresholding)
+
+The active detection algorithm finds a bright red dot using per-pixel RGB565 colour thresholding followed by a simple bounding-box blob finder.
+
+**RGB565 bit layout** (after little-endian byte-swap):
+- R (5-bit): bits [15:11]
+- G (6-bit): bits [10:5]
+- B (5-bit): bits [4:0]
+
+**Thresholds** (tuned for a bright red dot):
+
+| Channel | Min | Max | Rationale |
+|---------|-----|-----|-----------|
+| R (5-bit) | 15 | 31 | Saturated red |
+| G (6-bit) | 0 | 12 | Low green |
+| B (5-bit) | 0 | 12 | Low blue |
+
+**Blob finder**: Iterates all pixels, accumulates a bounding box (bx1, by1, bx2, by2) and pixel count for matching pixels. If `blobCount >= MIN_BLOB` (30), a `Detection` is emitted with label `"red_dot"`, normalised bounding box coordinates, and confidence scaled as `min(1.0, blobCount / 500.0)`.
+
+**Serial output** on detection:
+```
+[PROC] Red dot @ (x,y) size WxH conf=C
 ```
 
 #### Extension Points
@@ -465,7 +493,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;
 
 ```
 setup():
-  initCamera()
+  initCamera()          <- PIXFORMAT_RGB565
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
   register HTTP routes
@@ -474,7 +502,7 @@ setup():
 loop():
   server.handleClient()
   if (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS) {
-    runDetectionAndPush()
+    runDetectionAndPush()   <- RGB565 red dot detection + POST /overlay
   }
   // pump heartbeat watchdog (same pattern as controller held-pin)
 ```
@@ -488,14 +516,14 @@ The detection overlay pipeline is designed to support future autonomous operatio
 - Detections from on-device image processing are already available on the controller via `/overlay`
 - The controller can read these detections in `loop()` and autonomously issue `pressPin` / `releasePin` calls without browser involvement
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
-- Suggested detection algorithms: colour thresholding (simple), ArUco marker tracking (positioning), TFLite model inference (object recognition)
+- Suggested detection algorithms: colour thresholding (simple, implemented), ArUco marker tracking (positioning), TFLite model inference (object recognition)
 
 ---
 
 ## Tester – ESP32 ADC/DAC Oscilloscope
 
 A separate `tester/tester.ino` sketch turns the NodeMCU-ESP32 into a high-speed
-single-channel oscilloscope and DAC playground for debugging the excavator’s
+single-channel oscilloscope and DAC playground for debugging the excavator's
 hydraulic and electrical signals.
 
 - WiFi: runs its own AP `ExcavatorAP` on 192.168.4.1, matching the controller.
@@ -511,7 +539,7 @@ hydraulic and electrical signals.
 
 The browser decompresses the delta-encoded stream back into a staircase
 waveform before drawing and CSV export. For every compressed sample after
-the first it injects an extra “hold” point one sampling interval before the
+the first it injects an extra "hold" point one sampling interval before the
 new sample at the previous voltage level, so each plateau is represented
 by exactly two points: a start and an end. The in-browser buffers retain
 the full decompressed timeline since page load or last Clear and the
