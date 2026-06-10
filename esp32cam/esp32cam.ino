@@ -83,6 +83,7 @@ WebServer server(80);
 //  Runtime state
 // ─────────────────────────────────────────────
 uint32_t lastDetectionMs = 0;
+volatile bool streamActive = false;
 
 // Safe/Armed mode — boots in SAFE
 enum CamMode { MODE_SAFE, MODE_ARMED };
@@ -192,6 +193,7 @@ void handleStream() {
   xTaskCreatePinnedToCore(
     [](void* arg) {
       WiFiClient* c = (WiFiClient*)arg;
+      streamActive = true;
       while (c->connected()) {
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) break;
@@ -209,6 +211,7 @@ void handleStream() {
 
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
+      streamActive = false;
       Serial.println("[CAM] Stream client disconnected");
       delete c;
       vTaskDelete(NULL);
@@ -469,7 +472,7 @@ void loop() {
   }
 
   // Periodic detection + overlay push — skip while pump is firing (Fix D)
-  if (!pumpActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
+  if (!pumpActive && !streamActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
     lastDetectionMs = millis();
     runDetectionAndPush();
   }
