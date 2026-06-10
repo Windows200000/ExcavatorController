@@ -193,14 +193,14 @@ int buttonToHeldPins(const String& btn, HeldPin* out) {
     for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
     return c1 + c2;
   }
-  if (btn == "spin_left") {
+  if (btn == "spin_right") {
     HeldPin tmp[4];
     int c1 = buttonToHeldPins("left_back", tmp);
     int c2 = buttonToHeldPins("right_fwd", tmp + c1);
     for (int i = 0; i < c1 + c2; i++) out[i] = tmp[i];
     return c1 + c2;
   }
-  if (btn == "spin_right") {
+  if (btn == "spin_left") {
     HeldPin tmp[4];
     int c1 = buttonToHeldPins("left_fwd",  tmp);
     int c2 = buttonToHeldPins("right_back", tmp + c1);
