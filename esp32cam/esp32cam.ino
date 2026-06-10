@@ -64,7 +64,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 300;  // Fix B: was 300 — widened to 800
 // ─────────────────────────────────────────────
 //  Stream settings
 // ─────────────────────────────────────────────
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_QVGA;   // 320×240
+const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;    // 640×480 — sharper image
 const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640×480
 const uint8_t     JPEG_QUALITY      = 12;
 const int         STREAM_DELAY_MS   = 0;
@@ -141,7 +141,7 @@ bool initCamera() {
   config.pin_pwdn     = CAM_PIN_PWDN;
   config.pin_reset    = CAM_PIN_RESET;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565;  // RGB565 required for colour thresholding
+  config.pixel_format = PIXFORMAT_JPEG;
 
   // RGB565 at VGA requires 614400 bytes — exceeds reliable PSRAM allocation.
   // Cap at QVGA (320x240 = 153600 bytes) for both paths.
@@ -197,20 +197,15 @@ void handleStream() {
         if (!fb) break;
 
         // Camera is in RGB565 mode — convert to JPEG for MJPEG stream
-        uint8_t* jpgBuf = nullptr;
-        size_t   jpgLen = 0;
-        bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
-        esp_camera_fb_return(fb);
-
-        if (converted && jpgLen > 0) {
-          String partHeader =
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-            + String(jpgLen) + "\r\n\r\n";
-          c->print(partHeader);
-          c->write(jpgBuf, jpgLen);
-          c->print("\r\n");
-          free(jpgBuf);
+        if (fb->format == PIXFORMAT_JPEG) {
+            String partHeader =
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + String(fb->len) + "\r\n\r\n";
+            c->print(partHeader);
+            c->write(fb->buf, fb->len);
+            c->print("\r\n");
         }
+        esp_camera_fb_return(fb);
 
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
@@ -231,7 +226,7 @@ void handleStream() {
 void handleSnapshot() {
   // RGB565 mode: stay at STREAM_FRAME_SIZE (QVGA) — VGA would overflow the frame buffer
   camera_fb_t* fb = esp_camera_fb_get();
-  
+
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
 
   // Convert RGB565 to JPEG for snapshot delivery
@@ -303,6 +298,10 @@ struct Detection {
 //  Image processing — Red dot detection + overlay push
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_pixformat(s, PIXFORMAT_RGB565);
+  delay(100); // let sensor settle
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) return;
 
@@ -347,10 +346,17 @@ void runDetectionAndPush() {
   if (blobCount >= MIN_BLOB) {
     Detection d;
     d.label      = "red_dot";
-    d.x          = (float)bx1 / W;
-    d.y          = (float)by1 / H;
-    d.w          = (float)(bx2 - bx1) / W;
-    d.h          = (float)(by2 - by1) / H;
+    float cx = (float)(bx1 + bx2) / 2.0f;
+    float cy = (float)(by1 + by2) / 2.0f;
+    float hw = (float)(bx2 - bx1) / 2.0f;
+    float hh = (float)(by2 - by1) / 2.0f;
+    // Shrink box by 20% to cut edge noise
+    hw *= 0.8f;
+    hh *= 0.8f;
+    d.x = (cx - hw) / W;
+    d.y = (cy - hh) / H;
+    d.w = (hw * 2.0f) / W;
+    d.h = (hh * 2.0f) / H;
     d.confidence = min(1.0f, (float)blobCount / 500.0f);  // scale to 0..1
     detections.push_back(d);
     Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
@@ -359,6 +365,8 @@ void runDetectionAndPush() {
   // ── end detection ─────────────────────────────────────────
 
   esp_camera_fb_return(fb);
+
+  s->set_pixformat(s, PIXFORMAT_JPEG);
 
   // Serialize + POST to /overlay
   DynamicJsonDocument doc(1024);
