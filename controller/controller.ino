@@ -50,7 +50,7 @@ struct PinDef {
   int         gpio;
   PinMode_t   mode;
   // SIMPLE fields
-  const char* action;       // e.g. "up", "down", "turn_left"
+  const char* action;       // e.g. "arm_forward", "arm_backward", "turn_left"
   int         activeLevel;  // HIGH or LOW
   // MOSFET fields
   const char* actionHigh;   // OUTPUT HIGH state (track off); nullptr = no binding
@@ -68,12 +68,12 @@ struct PinDef {
 const PinDef PIN_TABLE[] = {
   //                                       Nothing     Green          Cyan
   // gpio  mode      action         level  actionHigh  actionHiZ      actionLow
-  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",    "left_back"  },
-  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",   "right_back" },
-  { 26, PIN_MOSFET,  nullptr,       0,     nullptr,    "turn_left",   "turn_right" },
-  { 33, PIN_MOSFET,  nullptr,       0,     nullptr,    "down",        "up"         },
-  { 15, PIN_MOSFET,  nullptr,       0,     nullptr,    "light_on",    "light_off"  },
-  {  4, PIN_SIMPLE,  "test",        HIGH,  nullptr,    nullptr,       nullptr      },
+  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",    "left_back"    },
+  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",   "right_back"   },
+  { 26, PIN_MOSFET,  nullptr,       0,     nullptr,    "turn_left",   "turn_right"   },
+  { 33, PIN_MOSFET,  nullptr,       0,     nullptr,    "arm_forward", "arm_backward" },
+  { 15, PIN_MOSFET,  nullptr,       0,     nullptr,    "light_on",    "light_off"    },
+  {  4, PIN_SIMPLE,  "test",        HIGH,  nullptr,    nullptr,       nullptr        },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
@@ -682,8 +682,8 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   <div class="control-group">
     <div class="group-label">Arm</div>
     <div class="btn-row">
-      <button class="ctrl" data-action="up"><span class="icon">&#11014;</span><span class="label">UP</span><span class="key">&#8593;</span></button>
-      <button class="ctrl" data-action="down"><span class="icon">&#11015;</span><span class="label">DOWN</span><span class="key">&#8595;</span></button>
+      <button class="ctrl" data-action="arm_forward"><span class="icon">&#11014;</span><span class="label">FORWARD</span><span class="key">&#8593;</span></button>
+      <button class="ctrl" data-action="arm_backward"><span class="icon">&#11015;</span><span class="label">BACKWARD</span><span class="key">&#8595;</span></button>
     </div>
   </div>
 
