@@ -917,11 +917,13 @@ const canvas      = document.getElementById('overlay-canvas');
 const ctx         = canvas.getContext('2d');
 const camStatus   = document.getElementById('cam-status');
 
+// ResizeObserver keeps canvas pixel dimensions in sync with #feed-wrap
+// at all times — on page load, window resize, and when the stream
+// starts rendering. Replaces the old window resize + feedImg.load listeners
+// which could fire before the element had its final layout size.
 function resizeCanvas() { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; }
-window.addEventListener('resize', resizeCanvas);
+new ResizeObserver(resizeCanvas).observe(document.getElementById('feed-wrap'));
 resizeCanvas();
-// Re-sync canvas size once the feed image is loaded and displayed
-feedImg.addEventListener('load', resizeCanvas);
 
 function startFeed(ip) {
   feedImg.src = 'http://' + ip + '/stream';
