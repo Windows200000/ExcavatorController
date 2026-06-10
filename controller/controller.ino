@@ -66,15 +66,13 @@ struct PinDef {
 //  All others: simple button-press pins
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
-  // gpio  mode         action        level  actionHigh  actionHiZ      actionLow
-  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",   "left_back"  },
-  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",  "right_back" },
-  { 26, PIN_SIMPLE,  "turn_left",   HIGH,  nullptr,    nullptr,       nullptr      },
-  { 25, PIN_SIMPLE,  "turn_right",  LOW,   nullptr,    nullptr,       nullptr      },
-  { 33, PIN_SIMPLE,  "up",          LOW,   nullptr,    nullptr,       nullptr      },
-  { 32, PIN_SIMPLE,  "down",        HIGH,  nullptr,    nullptr,       nullptr      },
-  { 15, PIN_SIMPLE,  "light_on",    LOW,   nullptr,    nullptr,       nullptr      },
-  {  2, PIN_SIMPLE,  "light_off",   HIGH,  nullptr,    nullptr,       nullptr      },
+  //                                       Nothing     Green          Cyan
+  // gpio  mode      action         level  actionHigh  actionHiZ      actionLow
+  { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",    "left_back"  },
+  { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",   "right_back" },
+  { 26, PIN_MOSFET,  nullptr,       0,     nullptr,    "turn_left",   "turn_right" },
+  { 33, PIN_MOSFET,  nullptr,       0,     nullptr,    "down",        "up"         },
+  { 15, PIN_MOSFET,  nullptr,       0,     nullptr,    "light_on",    "light_off"  },
   {  4, PIN_SIMPLE,  "test",        HIGH,  nullptr,    nullptr,       nullptr      },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
