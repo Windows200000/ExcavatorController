@@ -60,13 +60,9 @@ struct PinDef {
 
 // ─────────────────────────────────────────────
 //  Pin table — one entry per physical GPIO used.
-//
-//  GPIO13: Left  track MOSFET gate
-//  GPIO14: Right track MOSFET gate
-//  All others: simple button-press pins
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
-  //                                       Nothing     Green          Cyan
+  // Weirdo mode:                          Nothing     Green          Cyan
   // gpio  mode      action         level  actionHigh  actionHiZ      actionLow
   { 13, PIN_MOSFET,  nullptr,       0,     nullptr,    "left_fwd",    "left_back"    },
   { 14, PIN_MOSFET,  nullptr,       0,     nullptr,    "right_fwd",   "right_back"   },
