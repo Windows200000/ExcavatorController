@@ -143,8 +143,10 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;  // RGB565 required for colour thresholding
 
+  // RGB565 at VGA requires 614400 bytes — exceeds reliable PSRAM allocation.
+  // Cap at QVGA (320x240 = 153600 bytes) for both paths.
   if (psramFound()) {
-    config.frame_size   = SNAP_FRAME_SIZE;
+    config.frame_size   = STREAM_FRAME_SIZE;  // QVGA — safe for RGB565
     config.jpeg_quality = JPEG_QUALITY;
     config.fb_count     = 2;
   } else {
@@ -227,10 +229,9 @@ void handleStream() {
 
 // GET /snapshot  — single JPEG at full res
 void handleSnapshot() {
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, SNAP_FRAME_SIZE);
+  // RGB565 mode: stay at STREAM_FRAME_SIZE (QVGA) — VGA would overflow the frame buffer
   camera_fb_t* fb = esp_camera_fb_get();
-  s->set_framesize(s, STREAM_FRAME_SIZE);
+  
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
 
   // Convert RGB565 to JPEG for snapshot delivery
