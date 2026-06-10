@@ -118,34 +118,42 @@ const IPAddress AP_SUBNET (255, 255, 255, 0);
 
 > **Important:** GPIO 34, 35, 36, 39 are **INPUT-ONLY** on the ESP32 — they have no output driver and will silently fail. Safe output-capable GPIOs on the NodeMCU-ESP32: 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
 
-Pin definitions use a unified `PinDef` struct with a `PinMode_t` enum that selects between simple push-button emulation and MOSFET-driven track control:
+Pin definitions use a unified `PinDef` struct. Every GPIO is described by an explicit idle state and up to three action bindings (one per driven state). There is no separate mode enum — the `idle` field fully determines what `setPinIdle()` does, and each `actionXxx` field is either a button name string or `nullptr` (unbound).
+
+`PinState_t` values:
+- `HIGH` → `pinMode(OUTPUT); digitalWrite(HIGH)`
+- `LOW`  → `pinMode(OUTPUT); digitalWrite(LOW)`
+- `HiZ`  → `pinMode(INPUT)` — floating / high-impedance
 
 ```cpp
-enum PinMode_t { PIN_SIMPLE, PIN_MOSFET };
+enum PinState_t { HIGH_STATE, LOW_STATE, HIZ_STATE };
 
 struct PinDef {
   int         gpio;
-  PinMode_t   mode;
-  // PIN_SIMPLE fields
-  const char* action;       // logical button name, e.g. "up", "turn_left"
-  int         activeLevel;  // HIGH or LOW
-  // PIN_MOSFET fields
-  const char* actionHigh;   // OUTPUT HIGH state (track off); nullptr = no binding
-  const char* actionHiZ;    // INPUT (Hi-Z) state  → track forward
-  const char* actionLow;    // OUTPUT LOW  state  → track back
+  PinState_t  idle;        // state applied by setPinIdle()
+  const char* actionHigh;  // button name that drives this pin HIGH   (nullptr = unbound)
+  const char* actionHiZ;   // button name that drives this pin to HiZ (nullptr = unbound)
+  const char* actionLow;   // button name that drives this pin LOW    (nullptr = unbound)
 };
 ```
 
-#### PIN_SIMPLE
+#### Typical Wiring Patterns
 
-Used for all buttons except the track MOSFET gates. `setPinActive()` drives OUTPUT + `activeLevel`; `setPinIdle()` returns the pin to INPUT (Hi-Z), letting the external pull-up/pull-down restore the idle state.
+**MOSFET gate (track / turntable / arm / light):**
+- `idle = HIGH` — MOSFET fully on, drain clamped to GND (track off / no button)
+- `actionHiZ` drives the "forward / on" button via the internal analog path (Hi-Z gate)
+- `actionLow` drives the "back / pulse" button by pulling the gate low
 
-#### PIN_MOSFET (N-channel MOSFET per track)
+**Simple button (active-LOW):**
+- `idle = HiZ` — pin floating, external pull-up holds line idle
+- `actionLow` drives the button line to GND
+
+#### MOSFET (N-channel, one per track/axis)
 
 The excavator tracks are driven through a single N-channel MOSFET per track. One ESP32 GPIO controls three logical states:
 
 | ESP32 GPIO state | MOSFET effect | Track action |
-|-----------------|---------------|--------------|
+|-----------------|---------------|--------------| 
 | OUTPUT HIGH | Gate fully on → Drain–Source closed to GND | Track **off** (no button) |
 | INPUT (Hi-Z) | Gate at intermediate voltage via internal paths | Track **forward** |
 | OUTPUT LOW | Gate off → Drain–Source open | Track **back** |
@@ -153,24 +161,20 @@ The excavator tracks are driven through a single N-channel MOSFET per track. One
 **Wiring (per button pair):**
 - Gate → Excavator remote "S" for shared. It's a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It's mostly at ground, but has frequent spikes to HIGH that seem to be random and don't follow a pattern.
 - Drain → ESP32 GPIO  
-- Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground nand the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
-
-**Emulation (per button pair):**
-
-`setPinIdle()` on MOSFET drain emulates both buttons off. `setPinActive()` uses the `useHiZ` flag: `true` → emulates the button from P to S, `false` → OUTPUT LOW emulates the button from P to ground.
+- Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
 
 ### Pin Table
 
 All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactly one entry per GPIO:
 
-| GPIO | Mode | Action(s) | Notes |
-|------|------|-----------|-------|
-| 13 | MOSFET | HiZ=`left_fwd`, LOW=`left_back` | Left track gate |
-| 14 | MOSFET | HiZ=`right_fwd`, LOW=`right_back` | Right track gate |
-| 26 | MOSFET | HiZ=`turn_left`, LOW=`turn_right` | Turntable |
-| 33 | MOSFET | HiZ=`arm_forward`, LOW=`arm_backward` | Arm / bucket |
-| 15 | MOSFET | HiZ=`light_on`, LOW=`light_off` | Light (Pulse) |
-| 4 | SIMPLE | `test` (HIGH) | Test hold |
+| GPIO | idle | actionHigh | actionHiZ | actionLow | Notes |
+|------|------|------------|-----------|-----------|-------|
+| 13 | HIGH | — | `left_fwd` | `left_back` | Left track gate |
+| 14 | HIGH | — | `right_fwd` | `right_back` | Right track gate |
+| 26 | HIGH | — | `turn_left` | `turn_right` | Turntable |
+| 33 | HIGH | — | `arm_fwd` | `arm_back` | Arm / bucket |
+| 15 | HIGH | — | `light_on` | `light_off` | Light (Pulse) |
+| 4 | HiZ | — | — | `test` | Test hold (active LOW) |
 
 ### Timing Constants
 
@@ -193,10 +197,10 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat
 | `spin_right` | Hold | Left forward + Right back (clockwise) |
 | `turn_left` | Hold | Turntable rotate left |
 | `turn_right` | Hold | Turntable rotate right |
-| `up` | Hold | Arm / bucket up |
-| `down` | Hold | Arm / bucket down |
+| `arm_fwd` | Hold | Arm / bucket forward (GPIO33 Hi-Z) |
+| `arm_back` | Hold | Arm / bucket backward (GPIO33 LOW) |
 | `light` | Pulse | Toggle: pulses `light_on` or `light_off` pin |
-| `test` | Hold | Active while held |
+| `test` | Hold | Active while held (GPIO4 LOW) |
 
 Up to `MAX_HELD = 6` simultaneous held actions are supported.
 
@@ -213,12 +217,12 @@ Composite buttons fan out to multiple `HeldPin` entries via recursive calls to `
 
 ### Multi-Button Hold State
 
-The controller supports up to `MAX_HELD = 6` simultaneous held actions. Each slot is a `HeldAction` struct. `HeldPin` stores a pointer into `PIN_TABLE` plus a `useHiZ` flag (relevant for MOSFET pins):
+The controller supports up to `MAX_HELD = 6` simultaneous held actions. Each slot is a `HeldAction` struct. `HeldPin` stores a pointer into `PIN_TABLE` plus a `targetState` (the `PinState_t` to drive when active):
 
 ```cpp
 struct HeldPin {
   const PinDef* pin;
-  bool          useHiZ;  // MOSFET: true=INPUT(fwd), false=LOW(back)
+  PinState_t    targetState;  // which state to drive this pin to when active
 };
 
 struct HeldAction {
@@ -234,19 +238,16 @@ HeldAction heldActions[MAX_HELD];
 ### Pin-Control Pattern
 
 ```cpp
-// Put a pin in its idle / safe state
+// Put a pin in its idle / safe state (drives p.idle: HIGH, LOW, or HiZ)
 void setPinIdle(const PinDef& p);
-  // SIMPLE  → pinMode(INPUT)
-  // MOSFET  → pinMode(OUTPUT); digitalWrite(HIGH)  [track off]
 
-// Activate a pin
-void setPinActive(const PinDef& p, bool hiZForMosfet);
-  // SIMPLE         → pinMode(OUTPUT); digitalWrite(activeLevel)
-  // MOSFET + hiZ   → pinMode(INPUT)                [track forward]
-  // MOSFET + !hiZ  → pinMode(OUTPUT); digitalWrite(LOW) [track back]
+// Activate a pin to a specific state
+void setPinActive(const PinDef& p, PinState_t targetState);
 
 void releaseAllPins();  // iterates PIN_TABLE, calls setPinIdle; clears all heldActions
-void pulseSimplePin(const PinDef& p, uint32_t durationMs);  // SIMPLE pins only
+
+// Pulse a pin to activeState for durationMs, then return to idle
+void pulsePin(const PinDef& p, PinState_t activeState, uint32_t durationMs);
 ```
 
 ### Heartbeat Watchdog
@@ -281,7 +282,8 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 - Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
 - A top-down excavator model SVG that glows live for tracks / turntable / arm / pump / test / light
-- Live **SAFE / ARMED** badge polled from cam `/status` endpoint
+- Live **SAFE / ARMED** badge polled directly from the cam's `/status` endpoint
+- All held actions are released on both `pointerup` and `window blur` (tab loses focus), as a second safety path
 
 #### Keyboard Shortcuts
 
@@ -293,15 +295,17 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 | `D` | Spin right (clockwise) |
 | `←` Arrow Left | Turntable rotate left |
 | `→` Arrow Right | Turntable rotate right |
-| `↑` Arrow Up | Arm / bucket up |
-| `↓` Arrow Down | Arm / bucket down |
+| `↑` Arrow Up | Arm forward (`arm_fwd`) |
+| `↓` Arrow Down | Arm backward (`arm_back`) |
 | `L` | Light toggle (pulse) |
 | `T` | Test hold |
 | `Space` | Pump hold (relayed to cam via `/camcmd`) |
 
+> **Known bug:** `ArrowUp`/`ArrowDown` currently map to `up`/`down` in the JS `KEY_MAP`, but the arm pin actions are `arm_fwd`/`arm_back`. The arrow keys for the arm are silently broken until the JS `KEY_MAP` is updated to use `arm_fwd`/`arm_back`.
+
 #### Overlay Canvas
 
-The browser polls `/overlay` every 500 ms. Detection boxes are drawn in amber (`#f0a500`) with label and confidence percentage. The canvas is sized to match the feed container on every `resize` event.
+The browser polls `/overlay` every 500 ms. Detection boxes are drawn in amber (`#f0a500`) with label and confidence percentage. The canvas is sized to match the feed container on every resize event.
 
 #### Camera Feed Polling
 
@@ -312,7 +316,7 @@ The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedIm
 ```
 setup():
   releaseAllPins()      <- ensure all pins start in idle state
-                           (SIMPLE → Hi-Z, MOSFET → OUTPUT HIGH / track off)
+                           (MOSFET gates → OUTPUT HIGH / track off; simple buttons → Hi-Z)
   WiFi.softAP(...)
   register HTTP routes
   server.begin()
@@ -423,7 +427,7 @@ The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames d
 The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.
 
 ```cpp
-const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms regardless of stream state
+const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
 ```
 
 ### Image Processing
@@ -456,7 +460,7 @@ The active detection algorithm finds a bright red dot using per-pixel RGB888 col
 **Thresholds** (tuned for a bright red dot, 8-bit per channel):
 
 | Channel | Threshold | Rationale |
-|---------|-----|-----------|
+|---------|-----|-----------| 
 | R | > 160 | Saturated red |
 | G | < 80 | Low green |
 | B | < 80 | Low blue |
@@ -487,7 +491,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 - **Boots in SAFE mode** by default.
 - In **SAFE mode**: pump is blocked; entering SAFE mode immediately turns the pump off.
 - In **ARMED mode**: pump operation is permitted.
-- The controller web UI reads the mode from `/status` and displays a live **SAFE / ARMED** badge.
+- The controller web UI reads the mode from the cam's `/status` endpoint and displays a live **SAFE / ARMED** badge.
 
 ### HTTP Endpoints
 
@@ -513,7 +517,7 @@ loop():
   server.handleClient()
   // pump heartbeat watchdog
   if pumpActive and timeout: pumpOff()
-  // detection — always runs, independent of stream
+  // detection — runs independently of stream; suppressed only while pump is active
   if (!pumpActive && millis() - lastDetectionMs >= DETECTION_INTERVAL_MS):
     runDetectionAndPush()
 ```
