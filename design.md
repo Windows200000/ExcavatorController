@@ -4,7 +4,7 @@
 
 ## Overview
 
-This document describes the full firmware architecture for a two-module wireless excavator robot. One module is the **ESP32-CAM** (Joy-IT SBC-ESP32-Cam), which streams video and performs on-device image processing. The other is the **NodeMCU ESP32** (Berrybase NMCU-ESP32), which acts as the WiFi Access Point, hosts the web control console, and drives the physical remote-control buttons of the excavator via GPIO. The controller runs on the Berrybase NodeMCU-ESP32 and the camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM), which connects to the controller's AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. The camera also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
+This document describes the full firmware architecture for a two-module wireless excavator robot. One module is the **ESP32-CAM** (Joy-IT SBC-ESP32-Cam), which streams video and performs on-device image processing. The other is the **NodeMCU ESP32** (Berrybase NMCU-ESP32), which acts as the WiFi Access Point, hosts the web control console, and drives the physical remote-control buttons of the excavator via GPIO by trying to emulate presses. The controller runs on the Berrybase NodeMCU-ESP32 and the camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM), which connects to the controller's AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. The camera also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
 
 ---
 
@@ -150,12 +150,14 @@ The excavator tracks are driven through a single N-channel MOSFET per track. One
 | INPUT (Hi-Z) | Gate at intermediate voltage via internal paths | Track **forward** |
 | OUTPUT LOW | Gate off → Drain–Source open | Track **back** |
 
-**Wiring (per track):**
-- Gate → ESP32 GPIO (series resistor ~1 kΩ from remote S node)
-- Drain → excavator remote P node
-- Source → excavator remote G (GND), tied to ESP32 GND
+**Wiring (per button pair):**
+- Gate → Excavator remote "S" for shared. It's a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It's mostly at ground, but has frequent spikes to HIGH that seem to be random and don't follow a pattern.
+- Drain → ESP32 GPIO  
+- Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground nand the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
 
-`setPinIdle()` on a MOSFET pin drives OUTPUT HIGH (track off). `setPinActive()` uses the `useHiZ` flag: `true` → INPUT (forward), `false` → OUTPUT LOW (back).
+**Emulation (per button pair):**
+
+`setPinIdle()` on MOSFET drain emulates both buttons off. `setPinActive()` uses the `useHiZ` flag: `true` → emulates the button from P to S, `false` → OUTPUT LOW emulates the button from P to ground.
 
 ### Pin Table
 
@@ -165,12 +167,9 @@ All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactl
 |------|------|-----------|-------|
 | 13 | MOSFET | HiZ=`left_fwd`, LOW=`left_back` | Left track gate |
 | 14 | MOSFET | HiZ=`right_fwd`, LOW=`right_back` | Right track gate |
-| 26 | SIMPLE | `turn_left` (HIGH) | Turntable left |
-| 25 | SIMPLE | `turn_right` (LOW) | Turntable right |
-| 33 | SIMPLE | `up` (LOW) | Arm / bucket up |
-| 32 | SIMPLE | `down` (HIGH) | Arm / bucket down |
-| 15 | SIMPLE | `light_on` (LOW) | Light ON pulse |
-| 2 | SIMPLE | `light_off` (HIGH) | Light OFF pulse |
+| 26 | MOSFET | HiZ=`turn_left`, LOW=`turn_right` | Turntable |
+| 33 | MOSFET | HiZ=`arm_forward`, LOW=`arm_backward` | Arm / bucket |
+| 15 | MOSFET | HiZ=`light_on`, LOW=`light_off` | Light (Pulse) |
 | 4 | SIMPLE | `test` (HIGH) | Test hold |
 
 ### Timing Constants
