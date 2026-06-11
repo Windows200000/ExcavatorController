@@ -455,7 +455,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     border-radius:var(--radius);overflow:hidden;aspect-ratio:4/3;
   }
   #feed-img{width:100%;height:100%;object-fit:contain;display:block;}
-  #overlay-canvas{position:absolute;inset:0;pointer-events:none;}
+  #overlay-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
   #feed-placeholder{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     font-family:'Share Tech Mono',monospace;font-size:.8rem;color:var(--dim);background:#000;
@@ -921,18 +921,20 @@ document.addEventListener('keyup', ev => {
 });
 
 // ── Camera feed ─────────────────────────────────────────────
+const feedWrap    = document.getElementById('feed-wrap');
 const feedImg     = document.getElementById('feed-img');
 const placeholder = document.getElementById('feed-placeholder');
 const canvas      = document.getElementById('overlay-canvas');
 const ctx         = canvas.getContext('2d');
 const camStatus   = document.getElementById('cam-status');
 
-// ResizeObserver keeps canvas pixel dimensions in sync with #feed-wrap
-// at all times — on page load, window resize, and when the stream
-// starts rendering. Replaces the old window resize + feedImg.load listeners
-// which could fire before the element had its final layout size.
-function resizeCanvas() { canvas.width = canvas.offsetWidth; canvas.height = canvas.offsetHeight; }
-new ResizeObserver(resizeCanvas).observe(document.getElementById('feed-wrap'));
+// Always measure the parent container, not the canvas itself.
+// canvas.offsetWidth is circular once a width attribute has been set.
+function resizeCanvas() {
+  canvas.width  = feedWrap.clientWidth;
+  canvas.height = feedWrap.clientHeight;
+}
+new ResizeObserver(resizeCanvas).observe(feedWrap);
 resizeCanvas();
 
 function startFeed(ip) {
