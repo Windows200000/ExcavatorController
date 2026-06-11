@@ -79,7 +79,8 @@ const int         STREAM_DELAY_MS   = 0;
 // ─────────────────────────────────────────────
 //  Detection settings
 // ─────────────────────────────────────────────
-const uint32_t DETECTION_INTERVAL_MS = 500;
+const uint32_t DETECTION_INTERVAL_MS = 2000;  // runs on Core 0 — no stream impact
+const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;  // auto-clear after 4s
 const int      ARUCO_DSAMPLE         = 4;
 const uint8_t  ARUCO_BINARIZE_THRESH = 100;
 const int      ARUCO_MIN_CELL_PX     = 2;
@@ -100,6 +101,13 @@ CamMode camMode = MODE_SAFE;
 
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
+
+// Stream client tracking — set by stream task so detection skips while streaming
+volatile bool streamClientActive = false;
+
+// ArUco detection state — written by Core 0 task, read by HTTP handler
+volatile int      lastDetectedArucoId = -1;
+volatile uint32_t arucoDetectedAt     = 0;
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -183,6 +191,7 @@ void handleStream() {
   WiFiClient* clientPtr = new WiFiClient(client);
   xTaskCreatePinnedToCore(
     [](void* arg) {
+      streamClientActive = true;
       WiFiClient* c = (WiFiClient*)arg;
       while (c->connected()) {
         camera_fb_t* fb = esp_camera_fb_get();
@@ -198,6 +207,7 @@ void handleStream() {
         esp_camera_fb_return(fb);
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
+      streamClientActive = false;
       Serial.println("[CAM] Stream client disconnected");
       delete c;
       vTaskDelete(NULL);
@@ -249,6 +259,21 @@ void handleStatus() {
   doc["heap"]       = ESP.getFreeHeap();
   doc["mode"]       = (camMode == MODE_ARMED) ? "armed" : "safe";
   doc["pumpActive"] = pumpActive;
+  String out; serializeJson(doc, out);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", out);
+}
+
+// Returns current ArUco detection state for UI polling.
+// aruco_detected: true if a marker was seen within the last ARUCO_CLEAR_MS.
+// aruco_id: the last detected marker ID, or -1 if none active.
+void handleDetectionStatus() {
+  bool active = (lastDetectedArucoId >= 0) &&
+                ((millis() - arucoDetectedAt) < ARUCO_CLEAR_MS);
+  StaticJsonDocument<128> doc;
+  doc["aruco_detected"] = active;
+  doc["aruco_id"]       = active ? lastDetectedArucoId : -1;
+  doc["ts"]             = millis();
   String out; serializeJson(doc, out);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", out);
@@ -408,6 +433,10 @@ void runArucoDetection(std::vector<Detection>& detections) {
       if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
         int id = lookupAruco(bits);
         if (id >= 0) {
+          // Update shared state for /detection_status endpoint
+          lastDetectedArucoId = id;
+          arucoDetectedAt     = millis();
+
           Detection d;
           d.label = "aruco_" + String(id);
           d.x = (float)bx1/W; d.y = (float)by1/H;
@@ -425,6 +454,8 @@ void runArucoDetection(std::vector<Detection>& detections) {
 
 // ════════════════════════════════════════════════════════════
 //  Red dot detection
+//  Tightened thresholds to prevent false positives on ArUco ink:
+//  r > 180, g < 60, b < 60, red must dominate by 3x, min 200px blob
 // ════════════════════════════════════════════════════════════
 void runRedDotDetection(std::vector<Detection>& detections) {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -443,13 +474,13 @@ void runRedDotDetection(std::vector<Detection>& detections) {
     for (int y = 0; y < H; y++)
       for (int x = 0; x < W; x++) {
         uint8_t r = rgb[(y*W+x)*3], g = rgb[(y*W+x)*3+1], b = rgb[(y*W+x)*3+2];
-        if (r > 160 && g < 80 && b < 80) {
+        if (r > 180 && g < 60 && b < 60 && r > (uint8_t)(g * 3) && r > (uint8_t)(b * 3)) {
           if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
           if (y < by1) by1 = y; if (y > by2) by2 = y;
           blobCount++;
         }
       }
-    if (blobCount >= 30) {
+    if (blobCount >= 200) {
       Detection d;
       d.label = "red_dot";
       float cx = (bx1+bx2)/2.0f, cy = (by1+by2)/2.0f;
@@ -487,6 +518,22 @@ void runDetectionAndPush() {
   int code = http.POST(body);
   if (code < 0) Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
   http.end();
+}
+
+// ════════════════════════════════════════════════════════════
+//  Detection task — runs on Core 0 so it never blocks the
+//  stream task (which is pinned to Core 1).
+//  Skips a cycle if a stream client is active to avoid
+//  competing for the camera framebuffer.
+// ════════════════════════════════════════════════════════════
+void detectionTask(void*) {
+  for (;;) {
+    if (!streamClientActive)
+      runDetectionAndPush();
+    else
+      Serial.println("[DET] Skipping — stream active");
+    vTaskDelay(pdMS_TO_TICKS(DETECTION_INTERVAL_MS));
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -532,17 +579,23 @@ void setup() {
   }
   connectWiFi();
   registerWithController();
-  server.on("/stream",   HTTP_GET, handleStream);
-  server.on("/snapshot", HTTP_GET, handleSnapshot);
-  server.on("/pump",     HTTP_GET, handlePump);
-  server.on("/mode",     HTTP_GET, handleMode);
-  server.on("/status",   HTTP_GET, handleStatus);
+  server.on("/stream",           HTTP_GET, handleStream);
+  server.on("/snapshot",         HTTP_GET, handleSnapshot);
+  server.on("/pump",             HTTP_GET, handlePump);
+  server.on("/mode",             HTTP_GET, handleMode);
+  server.on("/status",           HTTP_GET, handleStatus);
+  server.on("/detection_status", HTTP_GET, handleDetectionStatus);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
+
+  // Spawn detection on Core 0; stream task uses Core 1
+  xTaskCreatePinnedToCore(detectionTask, "det_task", 16384, NULL, 1, NULL, 0);
+
   Serial.println("[BOOT] HTTP server started");
-  Serial.printf("[BOOT] Stream   : http://%s/stream\n",   WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Snapshot : http://%s/snapshot\n", WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Mode     : SAFE (boots safe, pump blocked)\n");
+  Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Snapshot        : http://%s/snapshot\n",         WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Detection status: http://%s/detection_status\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Mode            : SAFE (boots safe, pump blocked)\n");
 }
 
 void loop() {
@@ -550,9 +603,5 @@ void loop() {
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
     pumpOff();
-  }
-  if (!pumpActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
-    lastDetectionMs = millis();
-    runDetectionAndPush();
   }
 }
