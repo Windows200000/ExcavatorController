@@ -79,9 +79,11 @@ const int         STREAM_DELAY_MS   = 0;
 // ─────────────────────────────────────────────
 //  Detection settings
 // ─────────────────────────────────────────────
-const uint32_t DETECTION_INTERVAL_MS = 2000;  // runs on Core 0 — no stream impact
-const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;  // auto-clear after 4s
-const int      ARUCO_DSAMPLE         = 4;
+const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
+const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;  // auto-clear after 1s
+const framesize_t ARUCO_FRAME_SIZE   = FRAMESIZE_QQVGA;  // 160×120 — ArUco detection frame
+const int      ARUCO_W               = 160;
+const int      ARUCO_H               = 120;
 const uint8_t  ARUCO_BINARIZE_THRESH = 100;
 const int      ARUCO_MIN_CELL_PX     = 2;
 const float    ARUCO_MIN_CONF        = 0.60f;
@@ -102,11 +104,8 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-// Stream client tracking — set by stream task so detection skips while streaming
-volatile bool streamClientActive = false;
-
-// ArUco detection state — written by Core 0 task, read by HTTP handler
-volatile int      lastDetectedArucoId = -1;
+// ArUco detection state — written by loop(), read by HTTP handler
+int      lastDetectedArucoId = -1;
 volatile uint32_t arucoDetectedAt     = 0;
 
 // ════════════════════════════════════════════════════════════
@@ -358,6 +357,8 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
                      int rx, int ry, int rw, int rh, uint16_t& outBits) {
   float cellW = (float)rw / 6.0f;
   float cellH = (float)rh / 6.0f;
+  // Remove min cell size check — QQVGA is small enough
+  const int MIN_CELL_PX = 1;  // was ARUCO_MIN_CELL_PX = 2
   bool cells[6][6];
   for (int row = 0; row < 6; row++) {
     for (int col = 0; col < 6; col++) {
@@ -394,14 +395,22 @@ int lookupAruco(uint16_t bits) {
 }
 
 void runArucoDetection(std::vector<Detection>& detections) {
+  // Temporarily switch to QQVGA for smaller detection frame
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_framesize(s, ARUCO_FRAME_SIZE);
+  
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
-    if (fb) esp_camera_fb_return(fb);
+    esp_camera_fb_return(fb);
+    s->set_framesize(s, STREAM_FRAME_SIZE);  // restore
     return;
   }
-  const int srcW = fb->width, srcH = fb->height;
+  
+  const int srcW = ARUCO_W, srcH = ARUCO_H;  // use fixed QQVGA size
+  s->set_framesize(s, STREAM_FRAME_SIZE);  // restore immediately
   const int W = srcW / ARUCO_DSAMPLE, H = srcH / ARUCO_DSAMPLE;
 
+  
   size_t rgbLen = (size_t)srcW * srcH * 3;
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
@@ -426,9 +435,9 @@ void runArucoDetection(std::vector<Detection>& detections) {
   free(rgb);
 
   int bx1, by1, bx2, by2;
-  if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
+    if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
     int rw = bx2 - bx1, rh = by2 - by1;
-    if (rw >= 6 * ARUCO_MIN_CELL_PX && rh >= 6 * ARUCO_MIN_CELL_PX) {
+    if (rw >= 6 * MIN_CELL_PX && rh >= 6 * MIN_CELL_PX) {
       uint16_t bits = 0;
       if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
         int id = lookupAruco(bits);
@@ -439,14 +448,14 @@ void runArucoDetection(std::vector<Detection>& detections) {
 
           Detection d;
           d.label = "aruco_" + String(id);
-          d.x = (float)bx1/W; d.y = (float)by1/H;
-          d.w = (float)rw/W;  d.h = (float)rh/H;
+          d.x = (float)bx1/srcW; d.y = (float)by1/srcH;
+          d.w = (float)rw/srcW;  d.h = (float)rh/srcH;
           d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
           detections.push_back(d);
           Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                         id, d.x, d.y, d.w, d.h, d.confidence);
         }
-      }
+      }size_t rgbLen = (size_t)srcW * srcH * 3;
     }
   }
   free(gray);
@@ -521,22 +530,6 @@ void runDetectionAndPush() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Detection task — runs on Core 0 so it never blocks the
-//  stream task (which is pinned to Core 1).
-//  Skips a cycle if a stream client is active to avoid
-//  competing for the camera framebuffer.
-// ════════════════════════════════════════════════════════════
-void detectionTask(void*) {
-  for (;;) {
-    if (!streamClientActive)
-      runDetectionAndPush();
-    else
-      Serial.println("[DET] Skipping — stream active");
-    vTaskDelay(pdMS_TO_TICKS(DETECTION_INTERVAL_MS));
-  }
-}
-
-// ════════════════════════════════════════════════════════════
 //  WiFi helpers
 // ════════════════════════════════════════════════════════════
 void connectWiFi() {
@@ -589,7 +582,7 @@ void setup() {
   server.begin();
 
   // Spawn detection on Core 0; stream task uses Core 1
-  xTaskCreatePinnedToCore(detectionTask, "det_task", 16384, NULL, 1, NULL, 0);
+  server.begin();
 
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
@@ -600,8 +593,16 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  
+  // Pump heartbeat watchdog
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
     pumpOff();
+  }
+  
+  // Detection — runs independently of stream; suppressed only while pump is active
+  if (!pumpActive && (millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
+    lastDetectionMs = millis();
+    runDetectionAndPush();
   }
 }
