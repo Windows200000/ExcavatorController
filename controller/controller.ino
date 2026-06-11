@@ -977,14 +977,19 @@ function drawOverlay(detections) {
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
     const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
-    const color = d.label === 'red_dot' ? '#ff3030' : '#f0a500';
+    // red_dot: red, aruco_*: cyan, everything else: amber
+    const isRedDot = d.label === 'red_dot';
+    const isAruco = d.label.startsWith('aruco_');
+    const color = isRedDot ? '#ff3030' : (isAruco ? '#00e5ff' : '#f0a500');
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.strokeRect(x, y, w, h);
     const label = d.label + ' ' + Math.round(d.confidence * 100) + '%';
     ctx.font = 'bold 12px "Share Tech Mono",monospace';
     const tw = ctx.measureText(label).width;
-    ctx.fillStyle = d.label === 'red_dot' ? 'rgba(255,48,48,0.85)' : 'rgba(240,165,0,0.85)';
+    const bgAlpha = isRedDot ? 0.85 : (isAruco ? 0.85 : 0.85);
+    const bgColor = isRedDot ? 'rgba(255,48,48,' : (isAruco ? 'rgba(0,229,255,' : 'rgba(240,165,0,');
+    ctx.fillStyle = bgColor + bgAlpha + ')';
     ctx.fillRect(x, y - 18, tw + 8, 18);
     ctx.fillStyle = '#fff';
     ctx.fillText(label, x + 4, y - 4);
