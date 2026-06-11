@@ -8,7 +8,17 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include "Detection.h"
+
+// Detection struct — defined here with guard so the Arduino preprocessor
+// cannot duplicate it when it auto-includes all .h files in the sketch folder.
+#ifndef DETECTION_STRUCT_DEFINED
+#define DETECTION_STRUCT_DEFINED
+struct Detection {
+  String label;
+  float  x, y, w, h;   // normalised 0..1 (top-left origin)
+  float  confidence;
+};
+#endif
 
 // ─────────────────────────────────────────────
 //  WiFi  (controller is the AP)
@@ -50,7 +60,6 @@ const uint32_t REG_RETRY_DELAY_MS = 1000;
 
 // ─────────────────────────────────────────────
 //  Pump pin
-//  Temp for LED; change digitalWrite to LOW for real pump relay
 // ─────────────────────────────────────────────
 const int PIN_PUMP = 4;
 
@@ -62,19 +71,16 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 // ─────────────────────────────────────────────
 //  Stream settings
 // ─────────────────────────────────────────────
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;   // 640x480
+const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;
 const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;
 const uint8_t     JPEG_QUALITY      = 12;
 const int         STREAM_DELAY_MS   = 0;
 
 // ─────────────────────────────────────────────
 //  Detection settings
-//  Both detectors capture at full VGA. ArUco downsamples 4x in software
-//  to ~160x120 during grayscale conversion — no framesize switch needed,
-//  which means the stream task is never disrupted.
 // ─────────────────────────────────────────────
 const uint32_t DETECTION_INTERVAL_MS = 500;
-const int      ARUCO_DSAMPLE         = 4;     // downsample factor: VGA 640x480 -> 160x120
+const int      ARUCO_DSAMPLE         = 4;
 const uint8_t  ARUCO_BINARIZE_THRESH = 100;
 const int      ARUCO_MIN_CELL_PX     = 2;
 const float    ARUCO_MIN_CONF        = 0.60f;
@@ -249,13 +255,7 @@ void handleStatus() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Minimal ArUco detector — grayscale binarize + grid sampler
-//
-//  Captures at full VGA, decodes to RGB888, then downsamples 4x in software
-//  to a ~160x120 grayscale buffer. No set_framesize() call — the sensor
-//  stays at STREAM_FRAME_SIZE so the concurrent stream task is never disrupted.
-//
-//  IDs 0-49 only (4x4_50 dictionary). Single marker per frame.
+//  ArUco dictionary + helpers
 // ════════════════════════════════════════════════════════════
 
 static const uint16_t ARUCO_4X4_50[50] = {
@@ -326,119 +326,93 @@ bool findDarkBlob(const uint8_t* gray, int W, int H,
         if (y < by1) by1 = y; if (y > by2) by2 = y;
         count++;
       }
-  int area = (bx2 - bx1) * (by2 - by1);
-  return (count >= 36 && area >= 36);
+  return ((bx2 - bx1) * (by2 - by1) >= 36 && count >= 36);
 }
 
 bool sampleArucoGrid(const uint8_t* gray, int W, int H,
-                     int rx, int ry, int rw, int rh,
-                     uint16_t& outBits) {
+                     int rx, int ry, int rw, int rh, uint16_t& outBits) {
   float cellW = (float)rw / 6.0f;
   float cellH = (float)rh / 6.0f;
   bool cells[6][6];
   for (int row = 0; row < 6; row++) {
     for (int col = 0; col < 6; col++) {
-      int x0 = rx + (int)(col * cellW + cellW * 0.25f);
-      int y0 = ry + (int)(row * cellH + cellH * 0.25f);
-      int x1 = rx + (int)(col * cellW + cellW * 0.75f);
-      int y1 = ry + (int)(row * cellH + cellH * 0.75f);
-      x0 = max(0, min(W-1, x0)); x1 = max(0, min(W-1, x1));
-      y0 = max(0, min(H-1, y0)); y1 = max(0, min(H-1, y1));
+      int x0 = max(0, min(W-1, rx + (int)(col * cellW + cellW * 0.25f)));
+      int y0 = max(0, min(H-1, ry + (int)(row * cellH + cellH * 0.25f)));
+      int x1 = max(0, min(W-1, rx + (int)(col * cellW + cellW * 0.75f)));
+      int y1 = max(0, min(H-1, ry + (int)(row * cellH + cellH * 0.75f)));
       long sum = 0; int cnt = 0;
       for (int py = y0; py <= y1; py++)
         for (int px = x0; px <= x1; px++) { sum += gray[py * W + px]; cnt++; }
-      cells[row][col] = (cnt > 0) ? ((sum / cnt) < ARUCO_BINARIZE_THRESH) : false;
+      cells[row][col] = cnt > 0 && (sum / cnt) < ARUCO_BINARIZE_THRESH;
     }
   }
   for (int i = 0; i < 6; i++)
     if (!cells[0][i] || !cells[5][i] || !cells[i][0] || !cells[i][5]) return false;
   outBits = 0;
   for (int r = 1; r <= 4; r++)
-    for (int c = 1; c <= 4; c++) {
-      outBits <<= 1;
-      if (!cells[r][c]) outBits |= 1;
-    }
+    for (int c = 1; c <= 4; c++) { outBits <<= 1; if (!cells[r][c]) outBits |= 1; }
   return true;
 }
 
 int lookupAruco(uint16_t bits) {
   for (int rot = 0; rot < 4; rot++) {
-    for (int id = 0; id < 50; id++)
-      if (ARUCO_4X4_50[id] == bits) return id;
+    for (int id = 0; id < 50; id++) if (ARUCO_4X4_50[id] == bits) return id;
     uint16_t rotated = 0;
     for (int r = 0; r < 4; r++)
       for (int c = 0; c < 4; c++) {
-        int srcBit = (3 - c) * 4 + r;
-        int dstBit = r * 4 + c;
-        if (bits & (1 << (15 - srcBit))) rotated |= (1 << (15 - dstBit));
+        if (bits & (1 << (15 - ((3 - c) * 4 + r))))
+          rotated |= (1 << (15 - (r * 4 + c)));
       }
     bits = rotated;
   }
   return -1;
 }
 
-// Capture VGA frame, downsample 4x in software to ~160x120 grayscale, run ArUco pipeline.
-// No set_framesize() call — stream task is never disrupted.
 void runArucoDetection(std::vector<Detection>& detections) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     if (fb) esp_camera_fb_return(fb);
     return;
   }
+  const int srcW = fb->width, srcH = fb->height;
+  const int W = srcW / ARUCO_DSAMPLE, H = srcH / ARUCO_DSAMPLE;
 
-  const int srcW = fb->width;    // 640
-  const int srcH = fb->height;   // 480
-  const int W    = srcW / ARUCO_DSAMPLE;  // 160
-  const int H    = srcH / ARUCO_DSAMPLE;  // 120
-
-  // Decode full VGA JPEG to RGB888
-  size_t   rgbLen = (size_t)srcW * srcH * 3;
-  uint8_t* rgb    = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rgb) rgb   = (uint8_t*)malloc(rgbLen);
-
-  bool decoded = false;
-  if (rgb) decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
+  size_t rgbLen = (size_t)srcW * srcH * 3;
+  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
+  bool decoded = rgb && fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
   esp_camera_fb_return(fb);
+  if (!decoded) { if (rgb) free(rgb); return; }
 
-  if (!decoded || !rgb) { if (rgb) free(rgb); return; }
-
-  // Allocate downsampled grayscale buffer
   uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
   if (!gray) { free(rgb); return; }
 
-  // Downsample 4x: average 4x4 pixel blocks -> single gray value
-  for (int dy = 0; dy < H; dy++) {
+  for (int dy = 0; dy < H; dy++)
     for (int dx = 0; dx < W; dx++) {
       long sum = 0;
       for (int by = 0; by < ARUCO_DSAMPLE; by++)
         for (int bx = 0; bx < ARUCO_DSAMPLE; bx++) {
-          int sx = dx * ARUCO_DSAMPLE + bx;
-          int sy = dy * ARUCO_DSAMPLE + by;
-          int idx = (sy * srcW + sx) * 3;
+          int idx = ((dy * ARUCO_DSAMPLE + by) * srcW + (dx * ARUCO_DSAMPLE + bx)) * 3;
           sum += toGray(rgb[idx], rgb[idx+1], rgb[idx+2]);
         }
       gray[dy * W + dx] = (uint8_t)(sum / (ARUCO_DSAMPLE * ARUCO_DSAMPLE));
     }
-  }
   free(rgb);
 
   int bx1, by1, bx2, by2;
   if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
-    int rw = bx2 - bx1;
-    int rh = by2 - by1;
+    int rw = bx2 - bx1, rh = by2 - by1;
     if (rw >= 6 * ARUCO_MIN_CELL_PX && rh >= 6 * ARUCO_MIN_CELL_PX) {
       uint16_t bits = 0;
       if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
         int id = lookupAruco(bits);
         if (id >= 0) {
           Detection d;
-          d.label      = "aruco_" + String(id);
-          d.x          = (float)bx1 / W;
-          d.y          = (float)by1 / H;
-          d.w          = (float)rw  / W;
-          d.h          = (float)rh  / H;
-          d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw * rh) / (float)(W * H / 4));
+          d.label = "aruco_" + String(id);
+          d.x = (float)bx1/W; d.y = (float)by1/H;
+          d.w = (float)rw/W;  d.h = (float)rh/H;
+          d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
           detections.push_back(d);
           Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                         id, d.x, d.y, d.w, d.h, d.confidence);
@@ -458,24 +432,17 @@ void runRedDotDetection(std::vector<Detection>& detections) {
     if (fb) esp_camera_fb_return(fb);
     return;
   }
-
-  const int W = fb->width;
-  const int H = fb->height;
-  size_t   rgbLen = (size_t)W * H * 3;
-  uint8_t* rgb    = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rgb) rgb   = (uint8_t*)malloc(rgbLen);
-
-  bool decoded = false;
-  if (rgb) decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
+  const int W = fb->width, H = fb->height;
+  size_t rgbLen = (size_t)W * H * 3;
+  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
+  bool decoded = rgb && fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
   esp_camera_fb_return(fb);
-
   if (decoded) {
     int bx1 = W, by1 = H, bx2 = 0, by2 = 0, blobCount = 0;
     for (int y = 0; y < H; y++)
       for (int x = 0; x < W; x++) {
-        uint8_t r = rgb[(y * W + x) * 3 + 0];
-        uint8_t g = rgb[(y * W + x) * 3 + 1];
-        uint8_t b = rgb[(y * W + x) * 3 + 2];
+        uint8_t r = rgb[(y*W+x)*3], g = rgb[(y*W+x)*3+1], b = rgb[(y*W+x)*3+2];
         if (r > 160 && g < 80 && b < 80) {
           if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
           if (y < by1) by1 = y; if (y > by2) by2 = y;
@@ -485,13 +452,10 @@ void runRedDotDetection(std::vector<Detection>& detections) {
     if (blobCount >= 30) {
       Detection d;
       d.label = "red_dot";
-      float cx = (float)(bx1 + bx2) / 2.0f;
-      float cy = (float)(by1 + by2) / 2.0f;
-      float hw = (float)(bx2 - bx1) / 2.0f * 0.8f;
-      float hh = (float)(by2 - by1) / 2.0f * 0.8f;
-      d.x = (cx - hw) / W; d.y = (cy - hh) / H;
-      d.w = (hw * 2.0f) / W; d.h = (hh * 2.0f) / H;
-      d.confidence = min(1.0f, (float)blobCount / 500.0f);
+      float cx = (bx1+bx2)/2.0f, cy = (by1+by2)/2.0f;
+      float hw = (bx2-bx1)/2.0f*0.8f, hh = (by2-by1)/2.0f*0.8f;
+      d.x=(cx-hw)/W; d.y=(cy-hh)/H; d.w=hw*2/W; d.h=hh*2/H;
+      d.confidence = min(1.0f, (float)blobCount/500.0f);
       detections.push_back(d);
       Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                     d.x, d.y, d.w, d.h, d.confidence);
@@ -512,22 +476,16 @@ void runDetectionAndPush() {
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
     JsonObject o = arr.createNestedObject();
-    o["label"] = d.label;
-    o["x"] = d.x; o["y"] = d.y;
-    o["w"] = d.w; o["h"] = d.h;
-    o["confidence"] = d.confidence;
+    o["label"]=d.label; o["x"]=d.x; o["y"]=d.y; o["w"]=d.w; o["h"]=d.h; o["confidence"]=d.confidence;
   }
   doc["ts"] = millis();
   String body; serializeJson(doc, body);
 
   HTTPClient http;
-  String url = "http://" + String(CONTROLLER_IP) + ":" +
-               String(CONTROLLER_PORT) + "/overlay";
-  http.begin(url);
+  http.begin("http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/overlay");
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
-  if (code < 0)
-    Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
+  if (code < 0) Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
   http.end();
 }
 
@@ -551,11 +509,9 @@ void registerWithController() {
   String body = "{\"ip\":\"" + WiFi.localIP().toString() + "\"}";
   for (int attempt = 1; attempt <= REG_MAX_RETRIES; attempt++) {
     Serial.printf("[REG] Registering (attempt %d/%d)...\n", attempt, REG_MAX_RETRIES);
-    HTTPClient http;
-    http.begin(url);
+    HTTPClient http; http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    int code = http.POST(body);
-    http.end();
+    int code = http.POST(body); http.end();
     if (code == 200) { Serial.printf("[REG] Registered at %s\n", WiFi.localIP().toString().c_str()); return; }
     Serial.printf("[REG] Failed (HTTP %d) — retrying in %dms\n", code, REG_RETRY_DELAY_MS);
     delay(REG_RETRY_DELAY_MS);
@@ -569,17 +525,13 @@ void registerWithController() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
-
   pinMode(PIN_PUMP, INPUT);
-
   if (!initCamera()) {
     Serial.println("[BOOT] Camera init failed — halting");
     while (true) delay(1000);
   }
-
   connectWiFi();
   registerWithController();
-
   server.on("/stream",   HTTP_GET, handleStream);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
   server.on("/pump",     HTTP_GET, handlePump);
@@ -587,7 +539,6 @@ void setup() {
   server.on("/status",   HTTP_GET, handleStatus);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
-
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream   : http://%s/stream\n",   WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Snapshot : http://%s/snapshot\n", WiFi.localIP().toString().c_str());
@@ -596,12 +547,10 @@ void setup() {
 
 void loop() {
   server.handleClient();
-
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
     pumpOff();
   }
-
   if (!pumpActive && (millis() - lastDetectionMs >= DETECTION_INTERVAL_MS)) {
     lastDetectionMs = millis();
     runDetectionAndPush();

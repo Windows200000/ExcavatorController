@@ -1,7 +1,3 @@
 #pragma once
-
-struct Detection {
-  String label;
-  float  x, y, w, h;
-  float  confidence;
-};
+// Intentionally empty — Detection struct is defined in esp32cam.ino
+// This file exists only to prevent 'file not found' if cached by IDE.
