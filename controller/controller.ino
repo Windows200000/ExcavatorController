@@ -716,7 +716,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
 const HEARTBEAT_MS   = 150;
 const OVERLAY_POLL   = 500;
 const CAM_POLL       = 2000;
-const MODE_POLL      = 1500;  // poll cam /status for armed/safe
+const MODE_POLL      = 300;  // poll cam /status for armed/safe
 
 // ── State ──────────────────────────────────────────────────
 let camIP = null;
