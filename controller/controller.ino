@@ -77,17 +77,22 @@ struct PinDef {
 
 // ─────────────────────────────────────────────
 //  Pin table — one entry per physical GPIO used.
-//
-//  Weirdo mode:    Nothing        Green            Cyan
-//  gpio  idle      actionHigh     actionHiZ        actionLow
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
-  { 13 , HIGH , nullptr      , "left_fwd"     , "left_back"   },
-  { 14 , HIGH , nullptr      , "right_fwd"    , "right_back"  },
-  { 26 , HIGH , nullptr      , "turn_left"    , "turn_right"  },
-  { 33 , HIGH , nullptr      , "arm_fwd"      , "arm_back"    },
-  { 15 , HIGH , nullptr      , "light_on"     , "light_off"   },
-  {  4 , HiZ  , nullptr      , nullptr        , "test"        },
+//Weirdo mode:                 Green            Cyan
+// gpio  idle   actionHigh     actionHiZ        actionLow
+  { 12 , LOW  , "left_fwd"   ,  nullptr     ,  nullptr      },
+  { 26 , LOW  , "right_fwd"  ,  nullptr     ,  nullptr      },
+  { 32 , LOW  , "arm_fwd"    ,  nullptr     ,  nullptr      },
+  { 14 , HiZ  ,  nullptr     ,  nullptr     , "left_back"   },
+  { 25 , HiZ  ,  nullptr     ,  nullptr     , "right_back"  },
+  { 35 , HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
+//{ 13 , HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
+//{ 14 , HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
+//{ 26 , HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
+//{ 33 , HIGH ,  nullptr     , "arm_fwd"    , "arm_back"    },
+//{ 15 , HIGH ,  nullptr     , "light_on"   , "light_off"   },
+  {  4 , HiZ  ,  nullptr     , nullptr      , "test"        },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
