@@ -724,6 +724,7 @@ let lightToggleOn = false;
 const activeHolds = {};
 
 // ── Visual model parts map ──────────────────────────────────
+// Keys must match the action names sent to /cmd and used in PIN_TABLE.
 const ACTION_SVG = {
   fwd:        ['lt-fill','rt-fill','lt-arrow-fwd','rt-arrow-fwd'],
   back:       ['lt-fill','rt-fill','lt-arrow-back','rt-arrow-back'],
@@ -735,8 +736,8 @@ const ACTION_SVG = {
   right_back: ['rt-fill','rt-arrow-back'],
   turn_left:  ['svg-turntable','tt-arrow-left'],
   turn_right: ['svg-turntable','tt-arrow-right'],
-  up:         ['svg-boom','svg-stick','svg-bucket','arm-arrow-up'],
-  down:       ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
+  arm_fwd:    ['svg-boom','svg-stick','svg-bucket','arm-arrow-up'],
+  arm_back:   ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
   test:       ['svg-test'],
   light:      ['svg-light'],
   pump:       ['svg-pump-body','pump-spray-1','pump-spray-2','pump-spray-3'],
@@ -883,10 +884,11 @@ safetyBadge.addEventListener('click', () => {
 });
 
 // ── Keyboard shortcuts ──────────────────────────────────────
+// ArrowUp/Down map to arm_fwd/arm_back to match PIN_TABLE action names.
 const KEY_MAP = {
   'w':'fwd','s':'back','a':'spin_left','d':'spin_right',
   'ArrowLeft':'turn_left','ArrowRight':'turn_right',
-  'ArrowUp':'up','ArrowDown':'down','t':'test',
+  'ArrowUp':'arm_fwd','ArrowDown':'arm_back','t':'test',
 };
 const TOGGLE_KEYS = new Set(['l']);
 const CAM_KEYS    = new Set([' ']);
