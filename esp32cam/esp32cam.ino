@@ -69,21 +69,15 @@ const int         STREAM_DELAY_MS   = 0;
 
 // ─────────────────────────────────────────────
 //  Detection settings
-//  Detection runs on its own timer independently of the MJPEG stream.
-//  Stream and detection each call esp_camera_fb_get() independently;
-//  with fb_count=2 (PSRAM path) the driver hands out separate buffer
-//  slots so concurrent access is safe.
-//
-//  ArUco uses a separate QQVGA capture (160x120) — faster decode, less PSRAM.
-//  Red dot detection uses the full VGA frame.
+//  Both detectors capture at full VGA. ArUco downsamples 4x in software
+//  to ~160x120 during grayscale conversion — no framesize switch needed,
+//  which means the stream task is never disrupted.
 // ─────────────────────────────────────────────
-const uint32_t    DETECTION_INTERVAL_MS  = 500;
-const framesize_t ARUCO_FRAME_SIZE       = FRAMESIZE_QQVGA;  // 160x120
-const int         ARUCO_W                = 160;
-const int         ARUCO_H                = 120;
-const uint8_t     ARUCO_BINARIZE_THRESH  = 100;
-const int         ARUCO_MIN_CELL_PX      = 2;
-const float       ARUCO_MIN_CONF         = 0.60f;
+const uint32_t DETECTION_INTERVAL_MS = 500;
+const int      ARUCO_DSAMPLE         = 4;     // downsample factor: VGA 640x480 -> 160x120
+const uint8_t  ARUCO_BINARIZE_THRESH = 100;
+const int      ARUCO_MIN_CELL_PX     = 2;
+const float    ARUCO_MIN_CONF        = 0.60f;
 
 // ─────────────────────────────────────────────
 //  Web server
@@ -257,21 +251,13 @@ void handleStatus() {
 // ════════════════════════════════════════════════════════════
 //  Minimal ArUco detector — grayscale binarize + grid sampler
 //
-//  How it works:
-//  1. Decode QQVGA JPEG -> RGB888 -> convert to grayscale
-//  2. Scan for dark square blobs (candidate marker outer border)
-//  3. For each candidate region, sample a 6x6 grid (4x4 data + 1px border)
-//  4. Decode the 4x4 bit pattern -> look up in 4x4_50 ArUco dictionary
-//  5. Emit Detection with label "aruco_N" (N = marker ID, 0-49)
+//  Captures at full VGA, decodes to RGB888, then downsamples 4x in software
+//  to a ~160x120 grayscale buffer. No set_framesize() call — the sensor
+//  stays at STREAM_FRAME_SIZE so the concurrent stream task is never disrupted.
 //
-//  Limitations at QQVGA (160x120):
-//  - Reliable from ~15 cm at typical indoor lighting
-//  - No rotation correction — marker must be roughly upright (+-30 deg)
-//  - IDs 0-49 only (4x4_50 dictionary)
-//  - Single marker per frame (finds largest dark blob only)
+//  IDs 0-49 only (4x4_50 dictionary). Single marker per frame.
 // ════════════════════════════════════════════════════════════
 
-// 4x4_50 ArUco dictionary — each entry is the 16-bit data bitfield (row-major, MSB first)
 static const uint16_t ARUCO_4X4_50[50] = {
   0b0111001001101101, // 0
   0b0111011000001101, // 1
@@ -325,12 +311,10 @@ static const uint16_t ARUCO_4X4_50[50] = {
   0b1111010000101000, // 49
 };
 
-// RGB888 -> grayscale (fast integer approx)
 inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
   return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 }
 
-// Find bounding box of largest dark blob in grayscale image
 bool findDarkBlob(const uint8_t* gray, int W, int H,
                   int& bx1, int& by1, int& bx2, int& by2) {
   bx1 = W; by1 = H; bx2 = 0; by2 = 0;
@@ -346,13 +330,11 @@ bool findDarkBlob(const uint8_t* gray, int W, int H,
   return (count >= 36 && area >= 36);
 }
 
-// Sample 6x6 cell grid over region, validate black border, extract 4x4 data bits
 bool sampleArucoGrid(const uint8_t* gray, int W, int H,
                      int rx, int ry, int rw, int rh,
                      uint16_t& outBits) {
   float cellW = (float)rw / 6.0f;
   float cellH = (float)rh / 6.0f;
-
   bool cells[6][6];
   for (int row = 0; row < 6; row++) {
     for (int col = 0; col < 6; col++) {
@@ -368,12 +350,8 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
       cells[row][col] = (cnt > 0) ? ((sum / cnt) < ARUCO_BINARIZE_THRESH) : false;
     }
   }
-
-  // Border must be all dark
   for (int i = 0; i < 6; i++)
     if (!cells[0][i] || !cells[5][i] || !cells[i][0] || !cells[i][5]) return false;
-
-  // Extract inner 4x4 bits — row-major MSB first, white=1
   outBits = 0;
   for (int r = 1; r <= 4; r++)
     for (int c = 1; c <= 4; c++) {
@@ -383,12 +361,10 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
   return true;
 }
 
-// Try all 4 rotations against dictionary, return ID or -1
 int lookupAruco(uint16_t bits) {
   for (int rot = 0; rot < 4; rot++) {
     for (int id = 0; id < 50; id++)
       if (ARUCO_4X4_50[id] == bits) return id;
-    // Rotate 4x4 grid 90 deg clockwise
     uint16_t rotated = 0;
     for (int r = 0; r < 4; r++)
       for (int c = 0; c < 4; c++) {
@@ -401,26 +377,24 @@ int lookupAruco(uint16_t bits) {
   return -1;
 }
 
-// Capture QQVGA frame, run ArUco pipeline, append detections
+// Capture VGA frame, downsample 4x in software to ~160x120 grayscale, run ArUco pipeline.
+// No set_framesize() call — stream task is never disrupted.
 void runArucoDetection(std::vector<Detection>& detections) {
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, ARUCO_FRAME_SIZE);
-
   camera_fb_t* fb = esp_camera_fb_get();
-
-  // Restore stream frame size immediately
-  s->set_framesize(s, STREAM_FRAME_SIZE);
-
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     if (fb) esp_camera_fb_return(fb);
     return;
   }
 
-  const int W = ARUCO_W;
-  const int H = ARUCO_H;
-  size_t rgbLen = (size_t)W * H * 3;
-  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
+  const int srcW = fb->width;    // 640
+  const int srcH = fb->height;   // 480
+  const int W    = srcW / ARUCO_DSAMPLE;  // 160
+  const int H    = srcH / ARUCO_DSAMPLE;  // 120
+
+  // Decode full VGA JPEG to RGB888
+  size_t   rgbLen = (size_t)srcW * srcH * 3;
+  uint8_t* rgb    = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) rgb   = (uint8_t*)malloc(rgbLen);
 
   bool decoded = false;
   if (rgb) decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
@@ -428,10 +402,26 @@ void runArucoDetection(std::vector<Detection>& detections) {
 
   if (!decoded || !rgb) { if (rgb) free(rgb); return; }
 
-  // Convert RGB888 to grayscale in-place (first W*H bytes)
-  uint8_t* gray = rgb;
-  for (int i = 0; i < W * H; i++)
-    gray[i] = toGray(rgb[i*3], rgb[i*3+1], rgb[i*3+2]);
+  // Allocate downsampled grayscale buffer
+  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
+  if (!gray) { free(rgb); return; }
+
+  // Downsample 4x: average 4x4 pixel blocks -> single gray value
+  for (int dy = 0; dy < H; dy++) {
+    for (int dx = 0; dx < W; dx++) {
+      long sum = 0;
+      for (int by = 0; by < ARUCO_DSAMPLE; by++)
+        for (int bx = 0; bx < ARUCO_DSAMPLE; bx++) {
+          int sx = dx * ARUCO_DSAMPLE + bx;
+          int sy = dy * ARUCO_DSAMPLE + by;
+          int idx = (sy * srcW + sx) * 3;
+          sum += toGray(rgb[idx], rgb[idx+1], rgb[idx+2]);
+        }
+      gray[dy * W + dx] = (uint8_t)(sum / (ARUCO_DSAMPLE * ARUCO_DSAMPLE));
+    }
+  }
+  free(rgb);
 
   int bx1, by1, bx2, by2;
   if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
@@ -456,8 +446,7 @@ void runArucoDetection(std::vector<Detection>& detections) {
       }
     }
   }
-
-  free(rgb);
+  free(gray);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -516,7 +505,6 @@ void runRedDotDetection(std::vector<Detection>& detections) {
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   std::vector<Detection> detections;
-
   runRedDotDetection(detections);
   runArucoDetection(detections);
 
