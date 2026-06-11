@@ -254,7 +254,7 @@ void handleStatus() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Detection struct
+//  Detection struct — must be defined before any detection functions
 // ════════════════════════════════════════════════════════════
 struct Detection {
   String label;
