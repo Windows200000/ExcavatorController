@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "Detection.h"
 
 // ─────────────────────────────────────────────
 //  WiFi  (controller is the AP)
@@ -252,15 +253,6 @@ void handleStatus() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", out);
 }
-
-// ════════════════════════════════════════════════════════════
-//  Detection struct — must be defined before any detection functions
-// ════════════════════════════════════════════════════════════
-struct Detection {
-  String label;
-  float  x, y, w, h;   // normalised 0..1 (top-left origin)
-  float  confidence;
-};
 
 // ════════════════════════════════════════════════════════════
 //  Minimal ArUco detector — grayscale binarize + grid sampler
