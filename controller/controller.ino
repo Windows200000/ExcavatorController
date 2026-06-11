@@ -61,11 +61,7 @@ const IPAddress AP_SUBNET (255, 255, 255, 0);
 //    GPIO 32  — output / input                                 HIGH / LOW / HiZ
 //    GPIO 33  — output / input                                 HIGH / LOW / HiZ  ← arm
 // ─────────────────────────────────────────────
-enum PinState_t { HIGH_STATE, LOW_STATE, HIZ_STATE };
-// Friendly aliases so the pin table reads HIGH / LOW / HiZ naturally
-#define HIGH HIGH_STATE
-#define LOW  LOW_STATE
-#define HiZ  HIZ_STATE
+enum PinState_t { _HIGH, _LOW, _HiZ };
 
 struct PinDef {
   int         gpio;
@@ -80,19 +76,19 @@ struct PinDef {
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
 //Weirdo mode:                 Green            Cyan
-// gpio  idle   actionHigh     actionHiZ        actionLow
-  { 12 , LOW  , "left_fwd"   ,  nullptr     ,  nullptr      },
-  { 26 , LOW  , "right_fwd"  ,  nullptr     ,  nullptr      },
-  { 32 , LOW  , "arm_fwd"    ,  nullptr     ,  nullptr      },
-  { 14 , HiZ  ,  nullptr     ,  nullptr     , "left_back"   },
-  { 25 , HiZ  ,  nullptr     ,  nullptr     , "right_back"  },
-  { 35 , HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
-//{ 13 , HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
-//{ 14 , HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
-//{ 26 , HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
-//{ 33 , HIGH ,  nullptr     , "arm_fwd"    , "arm_back"    },
-//{ 15 , HIGH ,  nullptr     , "light_on"   , "light_off"   },
-  {  4 , HiZ  ,  nullptr     , nullptr      , "test"        },
+// gpio   idle   actionHigh     actionHiZ        actionLow
+  { 12 , _LOW  , "left_fwd"   ,  nullptr     ,  nullptr      },
+  { 26 , _LOW  , "right_fwd"  ,  nullptr     ,  nullptr      },
+  { 33 , _LOW  , "arm_fwd"    ,  nullptr     ,  nullptr      },
+  { 14 , _HiZ  ,  nullptr     ,  nullptr     , "left_back"   },
+  { 25 , _HiZ  ,  nullptr     ,  nullptr     , "right_back"  },
+  { 32 , _HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
+//{ 13 , _HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
+//{ 14 , _HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
+//{ 26 , _HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
+//{ 33 , _HIGH ,  nullptr     , "arm_fwd"    , "arm_back"    },
+//{ 15 , _HIGH ,  nullptr     , "light_on"   , "light_off"   },
+  {  4 , _HiZ  ,  nullptr     , nullptr      , "test"        },
 };
 const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 
@@ -139,9 +135,9 @@ bool lightOn = false;
 // ════════════════════════════════════════════════════════════
 static void applyPinState(int gpio, PinState_t state) {
   switch (state) {
-    case HIGH_STATE: pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH); break;
-    case LOW_STATE:  pinMode(gpio, OUTPUT); digitalWrite(gpio, LOW);  break;
-    case HIZ_STATE:  pinMode(gpio, INPUT);                            break;
+    case _HIGH: pinMode(gpio, OUTPUT); digitalWrite(gpio, HIGH); break;
+    case _LOW:  pinMode(gpio, OUTPUT); digitalWrite(gpio, LOW);  break;
+    case _HiZ:  pinMode(gpio, INPUT);                            break;
   }
 }
 
@@ -221,9 +217,9 @@ int buttonToHeldPins(const String& btn, HeldPin* out) {
   // Primitives — walk PIN_TABLE, check all three action slots
   for (int i = 0; i < PIN_COUNT; i++) {
     const PinDef& p = PIN_TABLE[i];
-    if (p.actionHigh && btn == p.actionHigh) { out[0] = { &p, HIGH_STATE }; return 1; }
-    if (p.actionHiZ  && btn == p.actionHiZ)  { out[0] = { &p, HIZ_STATE  }; return 1; }
-    if (p.actionLow  && btn == p.actionLow)  { out[0] = { &p, LOW_STATE  }; return 1; }
+    if (p.actionHigh && btn == p.actionHigh) { out[0] = { &p, _HIGH }; return 1; }
+    if (p.actionHiZ  && btn == p.actionHiZ)  { out[0] = { &p, _HiZ  }; return 1; }
+    if (p.actionLow  && btn == p.actionLow)  { out[0] = { &p, _LOW  }; return 1; }
   }
   return 0;
 }
@@ -312,9 +308,9 @@ void handleCmd() {
         if ((p.actionHiZ  && String(p.actionHiZ)  == desired) ||
             (p.actionLow  && String(p.actionLow)   == desired) ||
             (p.actionHigh && String(p.actionHigh)  == desired)) {
-          PinState_t s = (p.actionHiZ  && String(p.actionHiZ)  == desired) ? HIZ_STATE
-                       : (p.actionLow  && String(p.actionLow)   == desired) ? LOW_STATE
-                       : HIGH_STATE;
+          PinState_t s = (p.actionHiZ  && String(p.actionHiZ)  == desired) ? _HiZ
+                       : (p.actionLow  && String(p.actionLow)   == desired) ? _LOW
+                       : _HIGH;
           pulsePin(p, s, PULSE_DURATION_MS);
           break;
         }
