@@ -190,7 +190,6 @@ void handleStream() {
   WiFiClient* clientPtr = new WiFiClient(client);
   xTaskCreatePinnedToCore(
     [](void* arg) {
-      streamClientActive = true;
       WiFiClient* c = (WiFiClient*)arg;
       while (c->connected()) {
         camera_fb_t* fb = esp_camera_fb_get();
@@ -206,7 +205,6 @@ void handleStream() {
         esp_camera_fb_return(fb);
         if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
-      streamClientActive = false;
       Serial.println("[CAM] Stream client disconnected");
       delete c;
       vTaskDelete(NULL);
@@ -395,22 +393,22 @@ int lookupAruco(uint16_t bits) {
 }
 
 void runArucoDetection(std::vector<Detection>& detections) {
-  // Temporarily switch to QQVGA for smaller detection frame
+  // Switch to QQVGA for smaller detection frame
   sensor_t* s = esp_camera_sensor_get();
   s->set_framesize(s, ARUCO_FRAME_SIZE);
-  
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
-    esp_camera_fb_return(fb);
-    s->set_framesize(s, STREAM_FRAME_SIZE);  // restore
+    if (fb) esp_camera_fb_return(fb);
+    s->set_framesize(s, STREAM_FRAME_SIZE);
     return;
   }
-  
-  const int srcW = ARUCO_W, srcH = ARUCO_H;  // use fixed QQVGA size
-  s->set_framesize(s, STREAM_FRAME_SIZE);  // restore immediately
-  const int W = srcW / ARUCO_DSAMPLE, H = srcH / ARUCO_DSAMPLE;
 
-  
+  // Restore stream framesize immediately after grab
+  s->set_framesize(s, STREAM_FRAME_SIZE);
+
+  const int srcW = ARUCO_W, srcH = ARUCO_H;
+
   size_t rgbLen = (size_t)srcW * srcH * 3;
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
@@ -418,44 +416,38 @@ void runArucoDetection(std::vector<Detection>& detections) {
   esp_camera_fb_return(fb);
   if (!decoded) { if (rgb) free(rgb); return; }
 
-  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
+  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)srcW * srcH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!gray) gray = (uint8_t*)malloc((size_t)srcW * srcH);
   if (!gray) { free(rgb); return; }
 
-  for (int dy = 0; dy < H; dy++)
-    for (int dx = 0; dx < W; dx++) {
-      long sum = 0;
-      for (int by = 0; by < ARUCO_DSAMPLE; by++)
-        for (int bx = 0; bx < ARUCO_DSAMPLE; bx++) {
-          int idx = ((dy * ARUCO_DSAMPLE + by) * srcW + (dx * ARUCO_DSAMPLE + bx)) * 3;
-          sum += toGray(rgb[idx], rgb[idx+1], rgb[idx+2]);
-        }
-      gray[dy * W + dx] = (uint8_t)(sum / (ARUCO_DSAMPLE * ARUCO_DSAMPLE));
+  // Direct grayscale — no downsampling needed at QQVGA
+  for (int y = 0; y < srcH; y++)
+    for (int x = 0; x < srcW; x++) {
+      int idx = (y * srcW + x) * 3;
+      gray[y * srcW + x] = toGray(rgb[idx], rgb[idx+1], rgb[idx+2]);
     }
   free(rgb);
 
   int bx1, by1, bx2, by2;
-    if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
+  if (findDarkBlob(gray, srcW, srcH, bx1, by1, bx2, by2)) {
     int rw = bx2 - bx1, rh = by2 - by1;
-    if (rw >= 6 * MIN_CELL_PX && rh >= 6 * MIN_CELL_PX) {
+    if (rw >= 6 && rh >= 6) {
       uint16_t bits = 0;
-      if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
+      if (sampleArucoGrid(gray, srcW, srcH, bx1, by1, rw, rh, bits)) {
         int id = lookupAruco(bits);
         if (id >= 0) {
-          // Update shared state for /detection_status endpoint
           lastDetectedArucoId = id;
           arucoDetectedAt     = millis();
-
           Detection d;
           d.label = "aruco_" + String(id);
           d.x = (float)bx1/srcW; d.y = (float)by1/srcH;
           d.w = (float)rw/srcW;  d.h = (float)rh/srcH;
-          d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
+          d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(srcW*srcH/4));
           detections.push_back(d);
           Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                         id, d.x, d.y, d.w, d.h, d.confidence);
         }
-      }size_t rgbLen = (size_t)srcW * srcH * 3;
+      }
     }
   }
   free(gray);
@@ -579,9 +571,6 @@ void setup() {
   server.on("/status",           HTTP_GET, handleStatus);
   server.on("/detection_status", HTTP_GET, handleDetectionStatus);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
-  server.begin();
-
-  // Spawn detection on Core 0; stream task uses Core 1
   server.begin();
 
   Serial.println("[BOOT] HTTP server started");
