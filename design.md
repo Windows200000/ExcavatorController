@@ -412,15 +412,21 @@ To put the device into flash mode: connect **IO0 to GND** before power-on. Remov
 ### Stream / Quality Constants
 
 ```cpp
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;    // 640×480
-const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;    // 640×480
-const uint8_t     JPEG_QUALITY      = 12;   // 0 = best ... 63 = worst; 10-15 sweet spot
-const int         STREAM_DELAY_MS   = 0;    // extra inter-frame delay (ms)
+const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;      // 640×480
+const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;      // 640×480
+const uint8_t     JPEG_QUALITY      = 12;                 // 0 = best ... 63 = worst; 10-15 sweet spot
+const int         STREAM_DELAY_MS   = 0;                  // extra inter-frame delay (ms)
+const framesize_t ARUCO_FRAME_SIZE  = FRAMESIZE_QQVGA;    // 160×120 — ArUco detection frame
+const int         ARUCO_W           = 160;
+const int         ARUCO_H           = 120;
+const uint8_t     ARUCO_BINARIZE_THRESH = 100;
+const int         ARUCO_MIN_CELL_PX = 2;
+const float       ARUCO_MIN_CONF    = 0.60f;
 ```
 
 ### Pixel Format
 
-The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding. This avoids keeping a second raw frame buffer resident at all times.
+The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding or ArUco preprocessing. This avoids keeping a second raw frame buffer resident at all times.
 
 ### `/snapshot` Endpoint
 
@@ -433,6 +439,8 @@ The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames d
 ### Concurrent Stream and Detection
 
 The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.
+
+The ArUco path temporarily switches the sensor framesize to `FRAMESIZE_QQVGA` to capture a smaller detection frame, then restores `STREAM_FRAME_SIZE` immediately. This keeps stream quality high while reducing ArUco decode cost and PSRAM usage.
 
 ```cpp
 const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
@@ -455,7 +463,8 @@ Detection result JSON schema:
 ```json
 {
   "detections": [
-    { "label": "red_dot", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 }
+    { "label": "red_dot", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 },
+    { "label": "aruco_7", "x": 0.42, "y": 0.18, "w": 0.22, "h": 0.29, "confidence": 0.81 }
   ],
   "ts": 12345
 }
@@ -463,7 +472,7 @@ Detection result JSON schema:
 
 #### Red Dot Detection (RGB888 Colour Thresholding)
 
-The active detection algorithm finds a bright red dot using per-pixel RGB888 colour thresholding followed by a simple bounding-box blob finder. The JPEG frame is decoded to RGB888 via `fmt2rgb888()` before thresholding.
+The active colour detector finds a bright red dot using per-pixel RGB888 thresholding followed by a simple bounding-box blob finder. The JPEG frame is decoded to RGB888 via `fmt2rgb888()` before thresholding.
 
 **Thresholds** (tuned for a bright red dot, 8-bit per channel):
 
@@ -473,19 +482,53 @@ The active detection algorithm finds a bright red dot using per-pixel RGB888 col
 | G | < 80 | Low green |
 | B | < 80 | Low blue |
 
-**Blob finder**: Iterates all pixels, accumulates a bounding box (bx1, by1, bx2, by2) and pixel count for matching pixels. If `blobCount >= MIN_BLOB` (30), a `Detection` is emitted with label `"red_dot"`, normalised bounding box coordinates, and confidence scaled as `min(1.0, blobCount / 500.0)`.
+**Blob finder**: Iterates all pixels, accumulates a bounding box (`bx1`, `by1`, `bx2`, `by2`) and pixel count for matching pixels. If `blobCount >= 30`, a `Detection` is emitted with label `"red_dot"`, normalised bounding box coordinates, and confidence scaled as `min(1.0, blobCount / 500.0)`.
 
 **Serial output** on detection:
 ```
 [PROC] Red dot @ (x,y) size WxH conf=C
 ```
 
+#### ArUco Marker Detection (4x4_50, lightweight)
+
+A lightweight ArUco detector is implemented for marker-based target recognition and positioning. It is designed to fit the ESP32-CAM limits without OpenCV.
+
+**Processing steps:**
+1. Temporarily switch framesize to `FRAMESIZE_QQVGA` (160×120)
+2. Capture JPEG frame and decode to RGB888
+3. Convert to grayscale
+4. Find the largest dark blob as candidate marker region
+5. Sample a 6×6 cell grid over the region (black border + 4×4 payload)
+6. Validate black border, extract the 4×4 payload bits, and compare against the built-in `4x4_50` dictionary across all 4 rotations
+7. Emit a `Detection` with label `"aruco_N"` where `N` is the marker ID
+
+**Current limitations:**
+- Tuned for one dominant marker in frame
+- Best results when marker is roughly upright
+- Uses the largest dark blob only, so cluttered scenes may confuse detection
+- Optimised for detection / demo use, not precise pose estimation
+
+**Serial output** on detection:
+```
+[ARUCO] ID N @ (x,y) size WxH conf=C
+```
+
 #### Extension Points
 
-1. Capture a frame (`fb->buf`, `fb->len`, `fb->width`, `fb->height`)
-2. Run algorithm: edge detection, blob tracking, TFLite model inference, ArUco markers, colour thresholding, etc.
+1. Capture frame suited to algorithm (`STREAM_FRAME_SIZE` for colour thresholding, `ARUCO_FRAME_SIZE` for marker detection)
+2. Run detection algorithm
 3. Populate the `detections` vector with `Detection` structs
-4. The rest is handled automatically (JSON serialisation + POST to `/overlay`)
+4. JSON serialisation and POST to `/overlay` are reused unchanged
+
+Current algorithms:
+- Colour thresholding for `red_dot` (implemented)
+- ArUco marker tracking for `aruco_N` IDs (implemented)
+
+Future candidates:
+- Multi-colour blob tracking
+- TFLite Micro model inference
+- Optical flow / motion tracking
+- Multi-marker ArUco support
 
 ### Pump Control
 
@@ -540,7 +583,19 @@ The detection overlay pipeline is designed to support future autonomous operatio
 - The controller can read these detections in `loop()` and autonomously issue `setPinActive` / `setPinIdle` calls without browser involvement
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
 - The controller is the single decision-maker: the cam detects and reports, the controller acts. This keeps all actuation logic in one place.
-- Suggested detection algorithms: colour thresholding (simple, implemented), ArUco marker tracking (positioning), TFLite model inference (object recognition)
+
+A practical first autonomous mode for this project is **marker-guided seek-and-shoot**:
+
+1. Camera detects an ArUco marker and reports `aruco_N` with normalised bounding box
+2. Controller reads detection centre X position from `/overlay`
+3. Controller steers left or right until marker is centred in frame
+4. When marker is centred and confidence is high enough, controller can stop drive motion and activate the pump
+5. All actuation still remains gated by SAFE / ARMED mode and controlled only by the controller
+
+Suggested detection algorithms now become:
+- Colour thresholding (simple, implemented)
+- ArUco marker tracking (positioning and target ID, implemented)
+- TFLite model inference (future object recognition)
 
 ---
 
@@ -566,5 +621,5 @@ waveform before drawing and CSV export. For every compressed sample after
 the first it injects an extra "hold" point one sampling interval before the
 new sample at the previous voltage level, so each plateau is represented
 by exactly two points: a start and an end. The in-browser buffers retain
-the full decompressed timeline since page load or last Clear and the
+nthe full decompressed timeline since page load or last Clear and the
 Download CSV button exports this full history.
