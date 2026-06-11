@@ -422,6 +422,14 @@ const int         STREAM_DELAY_MS   = 0;    // extra inter-frame delay (ms)
 
 The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding. This avoids keeping a second raw frame buffer resident at all times.
 
+### `/snapshot` Endpoint
+
+`handleSnapshot()` checks `fb->format` before encoding:
+- If `PIXFORMAT_JPEG`: `fb->buf` sent directly via `send_P`; `fb` returned before the send to free the buffer slot for the stream task sooner.
+- Otherwise: `frame2jpg()` called with `JPEG_QUALITY` to convert raw pixel data to JPEG, then buffer is freed after send.
+
+`frame2jpg()` expects raw pixel data (RGB/YUV). Calling it on an already-JPEG frame produces corrupted output and must be avoided.
+
 ### Concurrent Stream and Detection
 
 The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.

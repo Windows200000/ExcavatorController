@@ -222,18 +222,24 @@ void handleStream() {
 // GET /snapshot  — single JPEG
 void handleSnapshot() {
   camera_fb_t* fb = esp_camera_fb_get();
-
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
 
-  uint8_t* jpgBuf = nullptr;
-  size_t   jpgLen = 0;
-  bool converted = frame2jpg(fb, 12, &jpgBuf, &jpgLen);
-  esp_camera_fb_return(fb);
-
-  if (!converted || jpgLen == 0) { server.send(500, "text/plain", "JPEG conversion failed"); return; }
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
-  free(jpgBuf);
+  if (fb->format == PIXFORMAT_JPEG) {
+    // Frame already JPEG — send directly, no re-encode
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+  } else {
+    // Raw format — convert to JPEG
+    uint8_t* jpgBuf = nullptr;
+    size_t   jpgLen = 0;
+    bool converted = frame2jpg(fb, JPEG_QUALITY, &jpgBuf, &jpgLen);
+    esp_camera_fb_return(fb);
+    if (!converted || jpgLen == 0) { server.send(500, "text/plain", "JPEG conversion failed"); return; }
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
+    free(jpgBuf);
+  }
 }
 
 // GET /pump?action=press|hold|release
