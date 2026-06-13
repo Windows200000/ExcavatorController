@@ -465,6 +465,14 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     font-family:'Share Tech Mono',monospace;font-size:.8rem;color:var(--dim);background:#000;
   }
+  #btn-debug-view{
+    position:absolute;bottom:6px;right:6px;z-index:10;
+    font-family:'Share Tech Mono',monospace;font-size:.62rem;
+    background:#0d1520cc;border:1px solid var(--border);color:var(--dim);
+    border-radius:4px;padding:3px 8px;cursor:pointer;
+    transition:color .15s,border-color .15s;
+  }
+  #btn-debug-view.active{color:var(--accent);border-color:var(--accent);}
 
   /* ── Excavator model panel ── */
   #model-panel{
@@ -546,6 +554,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     <div id="feed-placeholder">Waiting for camera&hellip;</div>
     <img id="feed-img" src="" alt="camera feed" style="display:none">
     <canvas id="overlay-canvas"></canvas>
+    <button id="btn-debug-view">&#128301; DEBUG VIEW</button>
   </div>
 
   <!-- Excavator model -->
@@ -716,6 +725,7 @@ const MODE_POLL      = 300;  // poll cam /status for armed/safe
 // ── State ──────────────────────────────────────────────────
 let camIP = null;
 let lightToggleOn = false;
+let debugView = false;
 const activeHolds = {};
 
 // ── Visual model parts map ──────────────────────────────────
@@ -933,7 +943,9 @@ new ResizeObserver(resizeCanvas).observe(feedWrap);
 resizeCanvas();
 
 function startFeed(ip) {
-  feedImg.src = 'http://' + ip + '/stream';
+  if (!debugView) {
+    feedImg.src = 'http://' + ip + '/stream';
+  }
   feedImg.style.display = 'block';
   placeholder.style.display = 'none';
   camStatus.textContent = 'CAM: ' + ip;
@@ -955,6 +967,24 @@ function pollCamIP() {
   }).catch(() => {});
 }
 setInterval(pollCamIP, CAM_POLL); pollCamIP();
+
+// ── Debug view toggle ────────────────────────────────────────
+// Switches feedImg.src directly to cam /stream/gray (achromatic-filtered
+// grayscale used by ArUco detection). Zero impact on the live pipeline —
+// the cam stashes a pre-encoded JPEG every DETECTION_INTERVAL_MS and
+// serves it from dbgFrameBuf without calling esp_camera_fb_get().
+const btnDebug = document.getElementById('btn-debug-view');
+btnDebug.addEventListener('click', () => {
+  if (!camIP) return;
+  debugView = !debugView;
+  if (debugView) {
+    feedImg.src = 'http://' + camIP + '/stream/gray';
+    btnDebug.classList.add('active');
+  } else {
+    feedImg.src = 'http://' + camIP + '/stream';
+    btnDebug.classList.remove('active');
+  }
+});
 
 // ── Live cam status poll ─────────────────────────────────────
 function pollCamStatus() {
