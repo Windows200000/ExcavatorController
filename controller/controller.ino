@@ -969,10 +969,10 @@ function pollCamIP() {
 setInterval(pollCamIP, CAM_POLL); pollCamIP();
 
 // ── Debug view toggle ────────────────────────────────────────
-// Switches feedImg.src directly to cam /stream/gray (achromatic-filtered
-// grayscale used by ArUco detection). Zero impact on the live pipeline —
-// the cam stashes a pre-encoded JPEG every DETECTION_INTERVAL_MS and
-// serves it from dbgFrameBuf without calling esp_camera_fb_get().
+// Switches feedImg.src to cam /stream/gray (AprilTag detection grayscale).
+// Zero impact on the live pipeline — the cam stashes a pre-encoded JPEG
+// every DETECTION_INTERVAL_MS and serves it from dbgFrameBuf without
+// calling esp_camera_fb_get().
 const btnDebug = document.getElementById('btn-debug-view');
 btnDebug.addEventListener('click', () => {
   if (!camIP) return;
@@ -996,8 +996,9 @@ function pollCamStatus() {
 setInterval(pollCamStatus, MODE_POLL);
 
 // ── Canvas overlay — detection bounding boxes ────────────────
-// red_dot detections are drawn with a red box; other labels use amber.
-// Green dashed border is always drawn as a canvas-alignment indicator.
+// red_dot detections are drawn with a red box; qr_* (AprilTag) use cyan;
+// everything else uses amber. Green dashed border is always drawn as a
+// canvas-alignment indicator.
 function drawOverlay(detections) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   // Green dashed border — confirms canvas covers full feed area
@@ -1011,19 +1012,18 @@ function drawOverlay(detections) {
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
     const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
-    // red_dot: red, aruco_*: cyan, everything else: amber
+    // red_dot: red, qr_*: cyan, everything else: amber
     const isRedDot = d.label === 'red_dot';
-    const isAruco = d.label.startsWith('aruco_');
-    const color = isRedDot ? '#ff3030' : (isAruco ? '#00e5ff' : '#f0a500');
+    const isMarker = d.label.startsWith('qr_');
+    const color = isRedDot ? '#ff3030' : (isMarker ? '#00e5ff' : '#f0a500');
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.strokeRect(x, y, w, h);
     const label = d.label + ' ' + Math.round(d.confidence * 100) + '%';
     ctx.font = 'bold 12px "Share Tech Mono",monospace';
     const tw = ctx.measureText(label).width;
-    const bgAlpha = isRedDot ? 0.85 : (isAruco ? 0.85 : 0.85);
-    const bgColor = isRedDot ? 'rgba(255,48,48,' : (isAruco ? 'rgba(0,229,255,' : 'rgba(240,165,0,');
-    ctx.fillStyle = bgColor + bgAlpha + ')';
+    const bgColor = isRedDot ? 'rgba(255,48,48,' : (isMarker ? 'rgba(0,229,255,' : 'rgba(240,165,0,');
+    ctx.fillStyle = bgColor + '0.85)';
     ctx.fillRect(x, y - 18, tw + 8, 18);
     ctx.fillStyle = '#fff';
     ctx.fillText(label, x + 4, y - 4);
