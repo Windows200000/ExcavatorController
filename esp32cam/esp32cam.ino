@@ -73,11 +73,27 @@ const uint8_t     JPEG_QUALITY      = 12;
 const int         STREAM_DELAY_MS   = 0;
 
 // ─────────────────────────────────────────────
+//  Frame dimensions — single source of truth derived from STREAM_FRAME_SIZE.
+//  fb->width/height are 0 in PIXFORMAT_JPEG mode, so we look up dims here.
+// ─────────────────────────────────────────────
+static void getFrameDims(framesize_t fs, int& w, int& h) {
+  switch (fs) {
+    case FRAMESIZE_QQVGA: w = 160;  h = 120;  break;
+    case FRAMESIZE_QVGA:  w = 320;  h = 240;  break;
+    case FRAMESIZE_VGA:   w = 640;  h = 480;  break;
+    case FRAMESIZE_SVGA:  w = 800;  h = 600;  break;
+    case FRAMESIZE_XGA:   w = 1024; h = 768;  break;
+    case FRAMESIZE_SXGA:  w = 1280; h = 1024; break;
+    case FRAMESIZE_UXGA:  w = 1600; h = 1200; break;
+    default:              w = 640;  h = 480;  break;
+  }
+}
+
+// ─────────────────────────────────────────────
 //  Detection settings
-//  Detection runs every DETECTION_INTERVAL_MS independently of the stream.
-//  One fb_get() per cycle: the same decoded RGB888 buffer feeds both
+//  One fb_get() per cycle: same decoded RGB888 buffer feeds both
 //  red-dot (colour threshold) and ArUco (grayscale) detection.
-//  No set_framesize() calls — detection runs at stream resolution (VGA).
+//  No set_framesize() calls — detection runs at STREAM_FRAME_SIZE.
 // ─────────────────────────────────────────────
 const uint32_t DETECTION_INTERVAL_MS = 500;
 const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;
@@ -100,8 +116,8 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-int              lastDetectedArucoId = -1;
-volatile uint32_t arucoDetectedAt   = 0;
+int               lastDetectedArucoId = -1;
+volatile uint32_t arucoDetectedAt     = 0;
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -166,7 +182,9 @@ bool initCamera() {
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
 
-  Serial.println("[CAM] Camera ready");
+  int w, h;
+  getFrameDims(STREAM_FRAME_SIZE, w, h);
+  Serial.printf("[CAM] Camera ready — %dx%d JPEG, fb_count=%d\n", w, h, psramFound() ? 2 : 1);
   return true;
 }
 
@@ -339,6 +357,7 @@ bool findDarkBlob(const uint8_t* gray, int W, int H,
         if (y < by1) by1 = y; if (y > by2) by2 = y;
         count++;
       }
+  Serial.printf("[ARUCO] Dark pixel count=%d bbox=(%d,%d)-(%d,%d)\n", count, bx1, by1, bx2, by2);
   return ((bx2 - bx1) * (by2 - by1) >= 36 && count >= 36);
 }
 
@@ -359,11 +378,17 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
       cells[row][col] = cnt > 0 && (sum / cnt) < ARUCO_BINARIZE_THRESH;
     }
   }
-  for (int i = 0; i < 6; i++)
-    if (!cells[0][i] || !cells[5][i] || !cells[i][0] || !cells[i][5]) return false;
+  // Check border cells are all dark (solid black border required)
+  for (int i = 0; i < 6; i++) {
+    if (!cells[0][i] || !cells[5][i] || !cells[i][0] || !cells[i][5]) {
+      Serial.printf("[ARUCO] Border check failed at i=%d\n", i);
+      return false;
+    }
+  }
   outBits = 0;
   for (int r = 1; r <= 4; r++)
     for (int c = 1; c <= 4; c++) { outBits <<= 1; if (!cells[r][c]) outBits |= 1; }
+  Serial.printf("[ARUCO] Grid sampled — bits=0x%04X\n", outBits);
   return true;
 }
 
@@ -378,6 +403,7 @@ int lookupAruco(uint16_t bits) {
       }
     bits = rotated;
   }
+  Serial.println("[ARUCO] No dictionary match");
   return -1;
 }
 
@@ -385,29 +411,47 @@ int lookupAruco(uint16_t bits) {
 //  Combined detection + overlay push
 //
 //  Single fb_get() per cycle — no set_framesize() calls.
-//  1. Grab one JPEG frame at stream resolution (VGA)
+//  W/H derived from STREAM_FRAME_SIZE (single source of truth)
+//  because fb->width/height are 0 in PIXFORMAT_JPEG mode.
+//
+//  1. Grab one JPEG frame at STREAM_FRAME_SIZE
 //  2. fmt2rgb888() once into PSRAM → RGB888 buffer
 //  3. Red dot detection on RGB888 (colour threshold)
-//  4. Convert RGB888 → grayscale in a second PSRAM buffer
-//  5. ArUco detection on grayscale — runs at full VGA resolution
+//  4. Convert RGB888 → grayscale into second PSRAM buffer
+//  5. ArUco detection on grayscale at full stream resolution
 //  6. fb_return, free buffers, POST all detections
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
+  Serial.println("[DET] Detection cycle start");
+
+  int W, H;
+  getFrameDims(STREAM_FRAME_SIZE, W, H);
+  Serial.printf("[DET] Expected frame dims: %dx%d\n", W, H);
+
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
-    if (fb) esp_camera_fb_return(fb);
+  if (!fb) { Serial.println("[DET] fb_get failed — null"); return; }
+  Serial.printf("[DET] fb: len=%d format=%d fb->w=%d fb->h=%d\n",
+                fb->len, fb->format, fb->width, fb->height);
+  if (fb->format != PIXFORMAT_JPEG || fb->len == 0) {
+    Serial.printf("[DET] Unexpected format or empty frame, skipping\n");
+    esp_camera_fb_return(fb);
     return;
   }
 
-  const int W = fb->width, H = fb->height;
-  const size_t rgbLen = (size_t)W * H * 3;
-
   // ── Decode JPEG → RGB888 ──────────────────────────────────
+  const size_t rgbLen = (size_t)W * H * 3;
+  Serial.printf("[DET] Allocating RGB buffer: %u bytes\n", (unsigned)rgbLen);
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
-  bool decoded = rgb && fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
-  esp_camera_fb_return(fb);   // return camera buffer immediately after decode
-  if (!decoded) { if (rgb) free(rgb); return; }
+  if (!rgb) {
+    Serial.println("[DET] RGB alloc failed — out of memory");
+    esp_camera_fb_return(fb);
+    return;
+  }
+  bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
+  esp_camera_fb_return(fb);
+  Serial.printf("[DET] fmt2rgb888 result: %s\n", decoded ? "OK" : "FAILED");
+  if (!decoded) { free(rgb); return; }
 
   std::vector<Detection> detections;
 
@@ -423,6 +467,7 @@ void runDetectionAndPush() {
           blobCount++;
         }
       }
+    Serial.printf("[RED] blob count=%d (threshold=200)\n", blobCount);
     if (blobCount >= 200) {
       Detection d;
       d.label = "red_dot";
@@ -431,26 +476,36 @@ void runDetectionAndPush() {
       d.x=(cx-hw)/W; d.y=(cy-hh)/H; d.w=hw*2/W; d.h=hh*2/H;
       d.confidence = min(1.0f, (float)blobCount/500.0f);
       detections.push_back(d);
-      Serial.printf("[PROC] Red dot @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
+      Serial.printf("[RED] Detected @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
                     d.x, d.y, d.w, d.h, d.confidence);
     }
   }
 
-  // ── Convert RGB888 → grayscale (reuse PSRAM) ──────────────
+  // ── Convert RGB888 → grayscale ────────────────────────────
+  Serial.printf("[DET] Allocating gray buffer: %u bytes\n", (unsigned)(W * H));
   uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
-  if (gray) {
+  if (!gray) {
+    Serial.println("[DET] Gray alloc failed — skipping ArUco");
+  } else {
     for (int i = 0; i < W * H; i++)
       gray[i] = toGray(rgb[i*3], rgb[i*3+1], rgb[i*3+2]);
+    Serial.println("[DET] Grayscale conversion done");
 
-    // ── ArUco detection (grayscale, VGA resolution) ───────────
+    // ── ArUco detection ───────────────────────────────────────
     int bx1, by1, bx2, by2;
-    if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
+    bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2);
+    Serial.printf("[ARUCO] Dark blob found: %s\n", blobFound ? "YES" : "NO");
+    if (blobFound) {
       int rw = bx2 - bx1, rh = by2 - by1;
+      Serial.printf("[ARUCO] Blob size %dx%d\n", rw, rh);
       if (rw >= 6 && rh >= 6) {
         uint16_t bits = 0;
-        if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
+        bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits);
+        Serial.printf("[ARUCO] Grid sample: %s\n", gridOk ? "OK" : "border fail");
+        if (gridOk) {
           int id = lookupAruco(bits);
+          Serial.printf("[ARUCO] Lookup result: %d\n", id);
           if (id >= 0) {
             lastDetectedArucoId = id;
             arucoDetectedAt     = millis();
@@ -471,6 +526,7 @@ void runDetectionAndPush() {
   free(rgb);
 
   // ── POST detections to controller /overlay ────────────────
+  Serial.printf("[DET] Posting %d detections\n", (int)detections.size());
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -484,7 +540,8 @@ void runDetectionAndPush() {
   http.begin("http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/overlay");
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
-  if (code < 0) Serial.printf("[PROC] POST failed: %s\n", http.errorToString(code).c_str());
+  if (code < 0) Serial.printf("[DET] POST failed: %s\n", http.errorToString(code).c_str());
+  else Serial.printf("[DET] POST /overlay -> HTTP %d\n", code);
   http.end();
 }
 
