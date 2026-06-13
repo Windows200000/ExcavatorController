@@ -25,7 +25,7 @@ const char*    CONTROLLER_IP   = "192.168.4.1";
 const uint16_t CONTROLLER_PORT = 80;
 const int      REG_MAX_RETRIES    = 5;
 const uint32_t REG_RETRY_DELAY_MS = 1000;
-const uint32_t MARKER_CONFIDENCE_CUTOFF = 20;
+const uint32_t MARKER_CONFIDENCE_CUTOFF = 50;
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
