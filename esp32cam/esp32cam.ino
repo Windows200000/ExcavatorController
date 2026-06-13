@@ -12,31 +12,17 @@
 
 struct Detection {
   String label;
-  float  x, y, w, h;   // normalised 0..1 (top-left origin)
+  float  x, y, w, h;
   float  confidence;
 };
 
-// ─────────────────────────────────────────────
-//  WiFi  (controller is the AP)
-// ─────────────────────────────────────────────
 const char* WIFI_SSID     = "ExcavatorAP";
 const char* WIFI_PASSWORD = "exc@vator123";
-
-// ─────────────────────────────────────────────
-//  Controller address (AP default gateway)
-// ─────────────────────────────────────────────
 const char*    CONTROLLER_IP   = "192.168.4.1";
 const uint16_t CONTROLLER_PORT = 80;
-
-// ─────────────────────────────────────────────
-//  Registration retry settings
-// ─────────────────────────────────────────────
 const int      REG_MAX_RETRIES    = 5;
 const uint32_t REG_RETRY_DELAY_MS = 1000;
 
-// ─────────────────────────────────────────────
-//  Camera  (AI-Thinker / Joy-IT ESP32-CAM pinout)
-// ─────────────────────────────────────────────
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
 #define CAM_PIN_XCLK     0
@@ -54,29 +40,14 @@ const uint32_t REG_RETRY_DELAY_MS = 1000;
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-// ─────────────────────────────────────────────
-//  Pump pin
-// ─────────────────────────────────────────────
 const int PIN_PUMP = 4;
-
-// ─────────────────────────────────────────────
-//  Pump heartbeat timeout
-// ─────────────────────────────────────────────
 const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
-// ─────────────────────────────────────────────
-//  Stream settings
-// ─────────────────────────────────────────────
 const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;
 const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;
 const uint8_t     JPEG_QUALITY      = 12;
 const int         STREAM_DELAY_MS   = 0;
 
-// ─────────────────────────────────────────────
-//  Frame dimensions — single source of truth derived from STREAM_FRAME_SIZE.
-//  fb->width/height are populated in PIXFORMAT_JPEG mode on this board,
-//  but getFrameDims() is kept as a fallback.
-// ─────────────────────────────────────────────
 static void getFrameDims(framesize_t fs, int& w, int& h) {
   switch (fs) {
     case FRAMESIZE_QQVGA: w = 160;  h = 120;  break;
@@ -90,54 +61,31 @@ static void getFrameDims(framesize_t fs, int& w, int& h) {
   }
 }
 
-// ─────────────────────────────────────────────
-//  Detection settings
-//
-//  Red dot thresholds — restored from bc9eced (confirmed working):
-//    r > 160, g < 80, b < 80, blobCount >= 30
-//  No ratio tests — they were added later and caused false negatives.
-//
-//  One fb_get() per cycle: same decoded RGB888 buffer feeds both
-//  red-dot (colour threshold) and ArUco (grayscale) detection.
-//  No set_framesize() calls — detection runs at STREAM_FRAME_SIZE.
-// ─────────────────────────────────────────────
 const uint32_t DETECTION_INTERVAL_MS = 500;
 const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;
-
-// Red dot thresholds (from bc9eced — do not tighten without testing)
 const uint8_t  RED_R_MIN       = 160;
 const uint8_t  RED_G_MAX       = 80;
 const uint8_t  RED_B_MAX       = 80;
 const int      RED_BLOB_MIN    = 30;
-
-// ArUco binarization — achromatic pre-filter + Otsu on filtered buffer.
-// Colored pixels (saturation > ARUCO_SAT_MAX) are forced to 255 (white)
-// before Otsu runs, so only genuinely black/white/gray pixels contribute
-// to the histogram. This makes Otsu work correctly even when the marker
-// occupies a small fraction of the frame.
-const uint8_t  ARUCO_SAT_MAX   = 30;   // max R-G-B spread to be considered achromatic
-const uint8_t  ARUCO_OTSU_MIN  = 40;   // Otsu result floor
-const uint8_t  ARUCO_OTSU_MAX  = 140;  // Otsu result ceil
+const uint8_t  ARUCO_SAT_MAX   = 30;
+const uint8_t  ARUCO_OTSU_MIN  = 40;
+const uint8_t  ARUCO_OTSU_MAX  = 140;
 const float    ARUCO_MIN_CONF  = 0.60f;
 
-// ─────────────────────────────────────────────
-//  Web server
-// ─────────────────────────────────────────────
 WebServer server(80);
 
-// ─────────────────────────────────────────────
-//  Runtime state
-// ─────────────────────────────────────────────
 uint32_t lastDetectionMs = 0;
-
 enum CamMode { MODE_SAFE, MODE_ARMED };
 CamMode camMode = MODE_SAFE;
-
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
-
 int               lastDetectedArucoId = -1;
 volatile uint32_t arucoDetectedAt     = 0;
+
+// ── Debug gray frame (stashed by detection, served via /stream/gray) ──
+static uint8_t*     dbgFrameBuf = nullptr;
+static size_t       dbgFrameLen = 0;
+static portMUX_TYPE dbgMux      = portMUX_INITIALIZER_UNLOCKED;
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -186,7 +134,7 @@ bool initCamera() {
   if (psramFound()) {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 2;   // one slot for stream, one for detection
+    config.fb_count     = 2;
   } else {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY + 4;
@@ -243,6 +191,48 @@ void handleStream() {
       vTaskDelete(NULL);
     },
     "stream_task", 8192, clientPtr, 1, NULL, 1
+  );
+}
+
+// ── Gray debug stream — sources frames from dbgFrameBuf at ~2fps.
+//  Zero impact on /stream — does not call esp_camera_fb_get().
+//  Frame updated every DETECTION_INTERVAL_MS by runDetectionAndPush().
+void handleGrayStream() {
+  WiFiClient client = server.client();
+  String header =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Connection: close\r\n\r\n";
+  client.print(header);
+
+  WiFiClient* clientPtr = new WiFiClient(client);
+  xTaskCreatePinnedToCore(
+    [](void* arg) {
+      WiFiClient* c = (WiFiClient*)arg;
+      while (c->connected()) {
+        portENTER_CRITICAL(&dbgMux);
+        size_t   len = dbgFrameLen;
+        uint8_t* buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
+        if (buf) memcpy(buf, dbgFrameBuf, len);
+        portEXIT_CRITICAL(&dbgMux);
+
+        if (buf && len > 0) {
+          String partHeader =
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + String(len) + "\r\n\r\n";
+          c->print(partHeader);
+          c->write(buf, len);
+          c->print("\r\n");
+          free(buf);
+        }
+        delay(500);
+      }
+      Serial.println("[CAM] Gray stream client disconnected");
+      delete c;
+      vTaskDelete(NULL);
+    },
+    "gray_stream", 4096, clientPtr, 1, NULL, 1
   );
 }
 
@@ -366,24 +356,15 @@ inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
   return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 }
 
-// Returns true if pixel is achromatic (black/white/gray).
-// Colored pixels are excluded from ArUco processing entirely.
 inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
   uint8_t hi = max(r, max(g, b));
   uint8_t lo = min(r, min(g, b));
   return (hi - lo) < ARUCO_SAT_MAX;
 }
 
-// ─────────────────────────────────────────────
-//  Otsu's method — O(N + 256) over achromatic pixels only.
-//  Colored pixels have already been forced to 255 in the gray buffer,
-//  so the histogram only reflects true black/white/gray content.
-//  Returns 0 and sets bimodal=false if no distinct dark population exists.
-// ─────────────────────────────────────────────
 static uint8_t otsuThreshold(const uint8_t* gray, int N, bool& bimodal) {
   uint32_t hist[256] = {};
   for (int i = 0; i < N; i++) hist[gray[i]]++;
-  // Don't count the forced-white colored pixels (255) in the histogram
   hist[255] = 0;
 
   uint64_t totalSum = 0;
@@ -393,8 +374,6 @@ static uint8_t otsuThreshold(const uint8_t* gray, int N, bool& bimodal) {
 
   if (totalCount == 0) { bimodal = false; return 0; }
 
-  // Need at least 0.5% of achromatic pixels to be genuinely dark
-  // otherwise no marker ink is present in the scene.
   uint32_t darkCount = 0;
   for (int i = 0; i < 80; i++) darkCount += hist[i];
   if (darkCount < totalCount / 200) {
@@ -442,7 +421,6 @@ bool findDarkBlob(const uint8_t* gray, int W, int H,
       }
   int rw = bx2 - bx1, rh = by2 - by1;
   Serial.printf("[ARUCO] Dark pixel count=%d bbox=(%d,%d)-(%d,%d)\n", count, bx1, by1, bx2, by2);
-  // Reject full-frame flood — background noise, not a marker
   if (rw > W * 6 / 10 || rh > H * 6 / 10) {
     Serial.println("[ARUCO] Blob too large — background noise, skip");
     return false;
@@ -513,6 +491,11 @@ int lookupAruco(uint16_t bits) {
 //  ArUco runs on grayscale derived from the same RGB888 buffer.
 //  Binarization threshold computed per-frame via Otsu's method on the
 //  achromatic-filtered grayscale image.
+//
+//  After ArUco, gray[] is JPEG-encoded and stashed in dbgFrameBuf for
+//  /stream/gray. Uses a fake camera_fb_t with PIXFORMAT_GRAYSCALE.
+//  Critical section (dbgMux) guards the swap — safe against concurrent
+//  handleGrayStream() reads on the same core.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -523,7 +506,6 @@ void runDetectionAndPush() {
     return;
   }
 
-  // Use fb dims if valid, fall back to STREAM_FRAME_SIZE lookup
   int W = fb->width, H = fb->height;
   if (W == 0 || H == 0) getFrameDims(STREAM_FRAME_SIZE, W, H);
   Serial.printf("[DET] Frame %dx%d len=%d\n", W, H, fb->len);
@@ -572,7 +554,7 @@ void runDetectionAndPush() {
     }
   }
 
-  // ── Build achromatic-filtered grayscale for ArUco ─────────
+  // ── Build achromatic-filtered grayscale for ArUco ──
   uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
   if (gray) {
@@ -613,11 +595,35 @@ void runDetectionAndPush() {
     } else {
       Serial.println("[ARUCO] No marker candidate — skipping");
     }
+
+    // ── Stash gray frame for /stream/gray debug view ──────────────────
+    // Encodes the achromatic-filtered gray[] buffer as JPEG using a fake
+    // camera_fb_t with PIXFORMAT_GRAYSCALE. Swapped into dbgFrameBuf under
+    // dbgMux so handleGrayStream() always sees a consistent pointer+length.
+    {
+      camera_fb_t fake;
+      memset(&fake, 0, sizeof(fake));
+      fake.buf    = gray;
+      fake.len    = (size_t)W * H;
+      fake.width  = W;
+      fake.height = H;
+      fake.format = PIXFORMAT_GRAYSCALE;
+      uint8_t* jBuf = nullptr; size_t jLen = 0;
+      if (frame2jpg(&fake, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
+        portENTER_CRITICAL(&dbgMux);
+        free(dbgFrameBuf);
+        dbgFrameBuf = jBuf;
+        dbgFrameLen = jLen;
+        portEXIT_CRITICAL(&dbgMux);
+        Serial.printf("[DBG] Gray frame stashed: %d bytes\n", (int)jLen);
+      }
+    }
+
     free(gray);
   }
   free(rgb);
 
-  // ── POST to controller /overlay ───────────────────────────
+  // ── POST to controller /overlay ──
   Serial.printf("[DET] Posting %d detection(s)\n", (int)detections.size());
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
@@ -681,6 +687,7 @@ void setup() {
   connectWiFi();
   registerWithController();
   server.on("/stream",           HTTP_GET, handleStream);
+  server.on("/stream/gray",      HTTP_GET, handleGrayStream);
   server.on("/snapshot",         HTTP_GET, handleSnapshot);
   server.on("/pump",             HTTP_GET, handlePump);
   server.on("/mode",             HTTP_GET, handleMode);
@@ -691,6 +698,7 @@ void setup() {
 
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Gray stream     : http://%s/stream/gray\n",      WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Snapshot        : http://%s/snapshot\n",         WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Detection status: http://%s/detection_status\n", WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode            : SAFE (boots safe, pump blocked)\n");
@@ -699,15 +707,11 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Pump heartbeat watchdog
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
     pumpOff();
   }
 
-  // Detection — runs every DETECTION_INTERVAL_MS, independent of stream.
-  // Stream task uses its own fb_get on a separate buffer slot (fb_count=2).
-  // Only suppressed while pump is active.
   if (!pumpActive && (millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
     lastDetectionMs = millis();
     runDetectionAndPush();
