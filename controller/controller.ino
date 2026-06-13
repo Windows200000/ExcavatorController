@@ -75,7 +75,7 @@ struct PinDef {
 //  Pin table — one entry per physical GPIO used.
 // ─────────────────────────────────────────────
 const PinDef PIN_TABLE[] = {
-//Weirdo mode:                 Green            Cyan
+//Weirdo mode:                  Green            Cyan
 // gpio   idle   actionHigh     actionHiZ        actionLow
   { 12 , _LOW  , "left_fwd"   ,  nullptr     ,  nullptr      },
   { 26 , _LOW  , "right_fwd"  ,  nullptr     ,  nullptr      },
@@ -83,6 +83,8 @@ const PinDef PIN_TABLE[] = {
   { 14 , _HiZ  ,  nullptr     ,  nullptr     , "left_back"   },
   { 25 , _HiZ  ,  nullptr     ,  nullptr     , "right_back"  },
   { 32 , _HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
+  { 18 , _LOW  , "turn_left"  ,  nullptr     ,  nullptr      },
+  { 19 , _HiZ  ,  nullptr     ,  nullptr     , "turn_right"  },
 //{ 13 , _HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
 //{ 14 , _HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
 //{ 26 , _HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
