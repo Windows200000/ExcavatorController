@@ -421,10 +421,6 @@ bool findDarkBlob(const uint8_t* gray, int W, int H,
       }
   int rw = bx2 - bx1, rh = by2 - by1;
   Serial.printf("[ARUCO] Dark pixel count=%d bbox=(%d,%d)-(%d,%d)\n", count, bx1, by1, bx2, by2);
-  if (rw > W * 6 / 10 || rh > H * 6 / 10) {
-    Serial.println("[ARUCO] Blob too large — background noise, skip");
-    return false;
-  }
   if (rw == 0 || rh == 0) return false;
   float asp = (float)rw / (float)rh;
   if (asp < 0.4f || asp > 2.5f) {
