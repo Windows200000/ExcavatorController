@@ -155,7 +155,7 @@ bool initCamera() {
   if (psramFound()) {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 2;
+    config.fb_count     = 3;
   } else {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY + 4;
