@@ -103,9 +103,40 @@ The controller is the single decision-maker. The cam detects and reports; the co
 | `ArduinoJson` | Both |
 | `esp_camera.h` | Camera only |
 | `HTTPClient.h` | Camera only |
-| `apriltag-esp32` | Camera only — [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), install via Arduino IDE → Sketch → Include Library → Add .ZIP Library |
+| `apriltag-esp32` | Camera only — install from the repo ZIP: [apriltag-esp32 master.zip](https://github.com/raspiduino/apriltag-esp32/archive/refs/heads/master.zip) or from the project repo copy if bundled locally |
 
 ESP32 board package URL: `https://dl.espressif.com/dl/package_esp32_index.json`
+
+### AprilTag Library Install Notes
+
+Install the AprilTag dependency through Arduino IDE:
+
+1. Download the ZIP from [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32) or use the ZIP bundled in this repo if present.
+2. In Arduino IDE, open **Sketch → Include Library → Add .ZIP Library...**
+3. Select the downloaded `apriltag-esp32` ZIP.
+4. Restart Arduino IDE if the library does not appear immediately.
+
+### AprilTag Compile Fix
+
+Some Arduino / ESP32 toolchain combinations fail while compiling the installed AprilTag library with an error similar to:
+
+```text
+error: expected '=', ',', ';', 'asm' or '__attribute__' before 'svd22'
+```
+
+This happens because `IRAM_ATTR` is not recognized in `svd22.c`. Fix it by adding the ESP attribute header at the top of the library source file:
+
+File:
+```text
+<Arduino sketchbook>/libraries/Apriltag_library_for_Arduino_ESP32/src/common/svd22.c
+```
+
+Add near the top:
+```c
+#include <esp_attr.h>
+```
+
+After adding that include, rebuild the ESP32-CAM sketch. This resolves the `IRAM_ATTR` compile error.
 
 ---
 
@@ -502,7 +533,7 @@ The active colour detector finds a bright red dot using per-pixel RGB888 thresho
 
 #### AprilTag Detection (tag16h5, raspiduino/apriltag-esp32)
 
-AprilTag detection (family `tag16h5`) is used for marker-based target recognition and positioning. The library is [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), installed via Arduino IDE → Sketch → Include Library → Add .ZIP Library.
+AprilTag detection (family `tag16h5`) is used for marker-based target recognition and positioning. The library is [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), installed from ZIP in Arduino IDE.
 
 **Detector configuration** (set once in `initAprilTag()`):
 
