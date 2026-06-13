@@ -25,6 +25,7 @@ const char*    CONTROLLER_IP   = "192.168.4.1";
 const uint16_t CONTROLLER_PORT = 80;
 const int      REG_MAX_RETRIES    = 5;
 const uint32_t REG_RETRY_DELAY_MS = 1000;
+const uint32_t MARKER_CONFIDENCE_CUTOFF = 20;
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
@@ -437,10 +438,17 @@ void runDetectionAndPush() {
       d.label      = "marker_" + String(det->id);
       d.x          = x0 / W;  d.y = y0 / H;
       d.w          = (x1 - x0) / W;  d.h = (y1 - y0) / H;
-      d.confidence = det->decision_margin / 100.0f;  // library returns 0–100 float
-      detections.push_back(d);
-      Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f margin=%.1f\n",
-                    det->id, d.x, d.y, d.w, d.h, det->decision_margin);
+      float confidence = det->decision_margin;
+      d.confidence = confidence / 100.0f;  // library returns 0–100 float
+      if (MARKER_CONFIDENCE_CUTOFF > confidence) {
+        Serial.printf("[AT] SKIPPING ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f%% while CUTOFF=%d\n",
+                      det->id, d.x, d.y, d.w, d.h, confidence, MARKER_CONFIDENCE_CUTOFF);
+
+      } else {
+        detections.push_back(d);
+        Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f\% (CUTOFF=%d)\n",
+                      det->id, d.x, d.y, d.w, d.h, confidence, MARKER_CONFIDENCE_CUTOFF);
+      }
     }
     apriltag_detections_destroy(results);
 
