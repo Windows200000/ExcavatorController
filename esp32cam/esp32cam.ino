@@ -110,11 +110,14 @@ const uint8_t  RED_G_MAX       = 80;
 const uint8_t  RED_B_MAX       = 80;
 const int      RED_BLOB_MIN    = 30;
 
-// ArUco binarization — Otsu's method computes threshold per-frame.
-// Clamp keeps result in valid range for OV2640 indoor, JPEG q=12.
-// No hardcoded ARUCO_BINARIZE_THRESH — fully adaptive to current lighting.
-const uint8_t  ARUCO_OTSU_MIN  = 40;   // floor: below true-black is noise
-const uint8_t  ARUCO_OTSU_MAX  = 140;  // ceil:  above this hits white-cell bleed
+// ArUco binarization — achromatic pre-filter + Otsu on filtered buffer.
+// Colored pixels (saturation > ARUCO_SAT_MAX) are forced to 255 (white)
+// before Otsu runs, so only genuinely black/white/gray pixels contribute
+// to the histogram. This makes Otsu work correctly even when the marker
+// occupies a small fraction of the frame.
+const uint8_t  ARUCO_SAT_MAX   = 30;   // max R-G-B spread to be considered achromatic
+const uint8_t  ARUCO_OTSU_MIN  = 40;   // Otsu result floor
+const uint8_t  ARUCO_OTSU_MAX  = 140;  // Otsu result ceil
 const float    ARUCO_MIN_CONF  = 0.60f;
 
 // ─────────────────────────────────────────────
@@ -363,20 +366,43 @@ inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
   return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 }
 
+// Returns true if pixel is achromatic (black/white/gray).
+// Colored pixels are excluded from ArUco processing entirely.
+inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t hi = max(r, max(g, b));
+  uint8_t lo = min(r, min(g, b));
+  return (hi - lo) < ARUCO_SAT_MAX;
+}
+
 // ─────────────────────────────────────────────
-//  Otsu's method — O(N + 256).
-//  Finds threshold that maximises inter-class variance between dark
-//  (marker ink) and light (paper/background) pixel populations.
-//  Fully adaptive to current room lighting and OV2640 AGC gain.
-//  Clamped to [ARUCO_OTSU_MIN, ARUCO_OTSU_MAX] to guard against
-//  degenerate uniform frames (no marker present).
+//  Otsu's method — O(N + 256) over achromatic pixels only.
+//  Colored pixels have already been forced to 255 in the gray buffer,
+//  so the histogram only reflects true black/white/gray content.
+//  Returns 0 and sets bimodal=false if no distinct dark population exists.
 // ─────────────────────────────────────────────
-static uint8_t otsuThreshold(const uint8_t* gray, int N) {
+static uint8_t otsuThreshold(const uint8_t* gray, int N, bool& bimodal) {
   uint32_t hist[256] = {};
   for (int i = 0; i < N; i++) hist[gray[i]]++;
+  // Don't count the forced-white colored pixels (255) in the histogram
+  hist[255] = 0;
 
   uint64_t totalSum = 0;
   for (int i = 0; i < 256; i++) totalSum += (uint64_t)i * hist[i];
+  uint32_t totalCount = 0;
+  for (int i = 0; i < 256; i++) totalCount += hist[i];
+
+  if (totalCount == 0) { bimodal = false; return 0; }
+
+  // Need at least 0.5% of achromatic pixels to be genuinely dark
+  // otherwise no marker ink is present in the scene.
+  uint32_t darkCount = 0;
+  for (int i = 0; i < 80; i++) darkCount += hist[i];
+  if (darkCount < totalCount / 200) {
+    Serial.printf("[ARUCO] No dark population (darkCount=%u / %u) — skip\n", darkCount, totalCount);
+    bimodal = false;
+    return 0;
+  }
+  bimodal = true;
 
   uint64_t sumBg   = 0;
   uint32_t wBg     = 0;
@@ -386,7 +412,7 @@ static uint8_t otsuThreshold(const uint8_t* gray, int N) {
   for (int t = 0; t < 256; t++) {
     wBg   += hist[t];
     if (wBg == 0) continue;
-    uint32_t wFg = (uint32_t)N - wBg;
+    uint32_t wFg = totalCount - wBg;
     if (wFg == 0) break;
     sumBg += (uint64_t)t * hist[t];
     float muBg = (float)sumBg  / (float)wBg;
@@ -397,7 +423,8 @@ static uint8_t otsuThreshold(const uint8_t* gray, int N) {
 
   if (thresh < ARUCO_OTSU_MIN) thresh = ARUCO_OTSU_MIN;
   if (thresh > ARUCO_OTSU_MAX) thresh = ARUCO_OTSU_MAX;
-  Serial.printf("[ARUCO] Otsu threshold: %d\n", thresh);
+  Serial.printf("[ARUCO] Otsu threshold: %d (darkCount=%u achromatic=%u)\n",
+                thresh, darkCount, totalCount);
   return thresh;
 }
 
@@ -484,7 +511,8 @@ int lookupAruco(uint16_t bits) {
 //
 //  Red dot thresholds: r>160, g<80, b<80, blob>=30 (from bc9eced).
 //  ArUco runs on grayscale derived from the same RGB888 buffer.
-//  Binarization threshold computed per-frame via Otsu's method.
+//  Binarization threshold computed per-frame via Otsu's method on the
+//  achromatic-filtered grayscale image.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -544,41 +572,46 @@ void runDetectionAndPush() {
     }
   }
 
-  // ── Convert RGB888 → grayscale for ArUco ─────────────────
+  // ── Build achromatic-filtered grayscale for ArUco ─────────
   uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
   if (gray) {
-    for (int i = 0; i < W * H; i++)
-      gray[i] = toGray(rgb[i*3], rgb[i*3+1], rgb[i*3+2]);
+    for (int i = 0; i < W * H; i++) {
+      uint8_t r = rgb[i*3+0], g = rgb[i*3+1], b = rgb[i*3+2];
+      gray[i] = isAchromatic(r, g, b) ? toGray(r, g, b) : 255;
+    }
 
-    // Compute adaptive binarization threshold from this frame's histogram
-    uint8_t arucoThresh = otsuThreshold(gray, W * H);
-
-    int bx1, by1, bx2, by2;
-    bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2, arucoThresh);
-    Serial.printf("[ARUCO] Dark blob: %s\n", blobFound ? "YES" : "NO");
-    if (blobFound) {
-      int rw = bx2 - bx1, rh = by2 - by1;
-      if (rw >= 6 && rh >= 6) {
-        uint16_t bits = 0;
-        bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits, arucoThresh);
-        if (gridOk) {
-          int id = lookupAruco(bits);
-          Serial.printf("[ARUCO] Lookup: %d\n", id);
-          if (id >= 0) {
-            lastDetectedArucoId = id;
-            arucoDetectedAt     = millis();
-            Detection d;
-            d.label = "aruco_" + String(id);
-            d.x = (float)bx1/W; d.y = (float)by1/H;
-            d.w = (float)rw/W;  d.h = (float)rh/H;
-            d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
-            detections.push_back(d);
-            Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
-                          id, d.x, d.y, d.w, d.h, d.confidence);
+    bool bimodal = false;
+    uint8_t arucoThresh = otsuThreshold(gray, W * H, bimodal);
+    if (bimodal) {
+      int bx1, by1, bx2, by2;
+      bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2, arucoThresh);
+      Serial.printf("[ARUCO] Dark blob: %s\n", blobFound ? "YES" : "NO");
+      if (blobFound) {
+        int rw = bx2 - bx1, rh = by2 - by1;
+        if (rw >= 6 && rh >= 6) {
+          uint16_t bits = 0;
+          bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits, arucoThresh);
+          if (gridOk) {
+            int id = lookupAruco(bits);
+            Serial.printf("[ARUCO] Lookup: %d\n", id);
+            if (id >= 0) {
+              lastDetectedArucoId = id;
+              arucoDetectedAt     = millis();
+              Detection d;
+              d.label = "aruco_" + String(id);
+              d.x = (float)bx1/W; d.y = (float)by1/H;
+              d.w = (float)rw/W;  d.h = (float)rh/H;
+              d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
+              detections.push_back(d);
+              Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
+                            id, d.x, d.y, d.w, d.h, d.confidence);
+            }
           }
         }
       }
+    } else {
+      Serial.println("[ARUCO] No marker candidate — skipping");
     }
     free(gray);
   }
