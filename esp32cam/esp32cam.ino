@@ -1,6 +1,7 @@
 /*
  * EXCAVATOR CAM — ESP32-CAM sketch
  * See design.md for full architecture and endpoint reference.
+ * AprilTag detection: raspiduino/apriltag-esp32 (ZIP install), family tag16h5.
  */
 
 #include "esp_camera.h"
@@ -9,6 +10,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <apriltag.h>
+#include <tag16h5.h>
 
 struct Detection {
   String label;
@@ -62,25 +65,30 @@ static void getFrameDims(framesize_t fs, int& w, int& h) {
 }
 
 const uint32_t DETECTION_INTERVAL_MS = 500;
-const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;
-const uint8_t  RED_R_MIN       = 160;
-const uint8_t  RED_G_MAX       = 80;
-const uint8_t  RED_B_MAX       = 80;
-const int      RED_BLOB_MIN    = 30;
-const uint8_t  ARUCO_SAT_MAX   = 30;
-const uint8_t  ARUCO_OTSU_MIN  = 40;
-const uint8_t  ARUCO_OTSU_MAX  = 140;
-const float    ARUCO_MIN_CONF  = 0.60f;
+const uint32_t MARKER_CLEAR_MS       = DETECTION_INTERVAL_MS * 2;
+const uint8_t  RED_R_MIN             = 160;
+const uint8_t  RED_G_MAX             = 80;
+const uint8_t  RED_B_MAX             = 80;
+const int      RED_BLOB_MIN          = 30;
+
+// Set true  = achromatic pre-filter (colored pixels → 255 before AprilTag).
+// Set false = plain luminance only — recommended: AprilTag's internal adaptive
+//             thresholding handles color noise better than pre-filtering did for ArUco.
+const bool    GRAY_ACHROMATIC_FILTER = false;
+const uint8_t GRAY_SAT_MAX           = 30;   // used only when GRAY_ACHROMATIC_FILTER=true
 
 WebServer server(80);
+
+apriltag_detector_t* atDetector = nullptr;
+apriltag_family_t*   atFamily   = nullptr;
 
 uint32_t lastDetectionMs = 0;
 enum CamMode { MODE_SAFE, MODE_ARMED };
 CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
-int               lastDetectedArucoId = -1;
-volatile uint32_t arucoDetectedAt     = 0;
+int               lastDetectedMarkerId = -1;
+volatile uint32_t markerDetectedAt     = 0;
 
 // ── Debug gray frame (stashed by detection, served via /stream/gray) ──
 static uint8_t*     dbgFrameBuf = nullptr;
@@ -154,6 +162,21 @@ bool initCamera() {
   getFrameDims(STREAM_FRAME_SIZE, w, h);
   Serial.printf("[CAM] Camera ready — %dx%d JPEG, fb_count=%d\n", w, h, psramFound() ? 2 : 1);
   return true;
+}
+
+// ════════════════════════════════════════════════════════════
+//  AprilTag detector init
+// ════════════════════════════════════════════════════════════
+void initAprilTag() {
+  atFamily   = tag16h5_create();
+  atDetector = apriltag_detector_create();
+  apriltag_detector_add_family(atDetector, atFamily);
+  atDetector->quad_decimate = 2.0f;  // downsample 2x before quad detection — faster, fine at VGA
+  atDetector->quad_sigma    = 0.0f;  // no blur — camera already soft enough
+  atDetector->nthreads      = 1;     // ESP32 single-core detection task
+  atDetector->debug         = 0;
+  atDetector->refine_edges  = 1;     // sub-pixel edge refinement — worth it for bad image quality
+  Serial.println("[AT] AprilTag detector ready — tag16h5");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -285,73 +308,20 @@ void handleStatus() {
 }
 
 void handleDetectionStatus() {
-  bool active = (lastDetectedArucoId >= 0) &&
-                ((millis() - arucoDetectedAt) < ARUCO_CLEAR_MS);
+  bool active = (lastDetectedMarkerId >= 0) &&
+                ((millis() - markerDetectedAt) < MARKER_CLEAR_MS);
   StaticJsonDocument<128> doc;
-  doc["aruco_detected"] = active;
-  doc["aruco_id"]       = active ? lastDetectedArucoId : -1;
-  doc["ts"]             = millis();
+  doc["marker_detected"] = active;
+  doc["marker_id"]       = active ? lastDetectedMarkerId : -1;
+  doc["ts"]              = millis();
   String out; serializeJson(doc, out);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", out);
 }
 
 // ════════════════════════════════════════════════════════════
-//  ArUco dictionary + helpers
+//  Gray helpers
 // ════════════════════════════════════════════════════════════
-static const uint16_t ARUCO_4X4_50[50] = {
-  0b0111001001101101, // 0
-  0b0111011000001101, // 1
-  0b0111101101000010, // 2
-  0b0111111100100010, // 3
-  0b0101011010011101, // 4
-  0b0101001011111101, // 5
-  0b0101111110100000, // 6
-  0b0101101111000000, // 7
-  0b0011001110001011, // 8
-  0b0011011111101011, // 9
-  0b0011101010110110, // 10
-  0b0011111011010110, // 11
-  0b0001011001111011, // 12
-  0b0001001000011011, // 13
-  0b0001111101000110, // 14
-  0b0001101100100110, // 15
-  0b1110001001010010, // 16
-  0b1110011000110010, // 17
-  0b1110101101101111, // 18
-  0b1110111100001111, // 19
-  0b1100011010100000, // 20
-  0b1100001011000000, // 21
-  0b1100111110011101, // 22
-  0b1100101111111101, // 23
-  0b1010001110010001, // 24
-  0b1010011111110001, // 25
-  0b1010101010101100, // 26
-  0b1010111011001100, // 27
-  0b1000011001100001, // 28
-  0b1000001000000001, // 29
-  0b1000111101011100, // 30
-  0b1000101100111100, // 31
-  0b0110110010001110, // 32
-  0b0110100011101110, // 33
-  0b0110010110110011, // 34
-  0b0110000111010011, // 35
-  0b0100100001111110, // 36
-  0b0100110000011110, // 37
-  0b0100000101000011, // 38
-  0b0100010100100011, // 39
-  0b0010110010011010, // 40
-  0b0010100011111010, // 41
-  0b0010010110100111, // 42
-  0b0010000111000111, // 43
-  0b0000100001101010, // 44
-  0b0000110000001010, // 45
-  0b0000000101010111, // 46
-  0b0000010100110111, // 47
-  0b1111000001001000, // 48
-  0b1111010000101000, // 49
-};
-
 inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
   return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 }
@@ -359,121 +329,7 @@ inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
 inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
   uint8_t hi = max(r, max(g, b));
   uint8_t lo = min(r, min(g, b));
-  return (hi - lo) < ARUCO_SAT_MAX;
-}
-
-static uint8_t otsuThreshold(const uint8_t* gray, int N, bool& bimodal) {
-  uint32_t hist[256] = {};
-  for (int i = 0; i < N; i++) hist[gray[i]]++;
-  hist[255] = 0;
-
-  uint64_t totalSum = 0;
-  for (int i = 0; i < 256; i++) totalSum += (uint64_t)i * hist[i];
-  uint32_t totalCount = 0;
-  for (int i = 0; i < 256; i++) totalCount += hist[i];
-
-  if (totalCount == 0) { bimodal = false; return 0; }
-
-  uint32_t darkCount = 0;
-  for (int i = 0; i < 80; i++) darkCount += hist[i];
-  if (darkCount < totalCount / 200) {
-    Serial.printf("[ARUCO] No dark population (darkCount=%u / %u) — skip\n", darkCount, totalCount);
-    bimodal = false;
-    return 0;
-  }
-  bimodal = true;
-
-  uint64_t sumBg   = 0;
-  uint32_t wBg     = 0;
-  float    bestVar = 0.0f;
-  uint8_t  thresh  = 128;
-
-  for (int t = 0; t < 256; t++) {
-    wBg   += hist[t];
-    if (wBg == 0) continue;
-    uint32_t wFg = totalCount - wBg;
-    if (wFg == 0) break;
-    sumBg += (uint64_t)t * hist[t];
-    float muBg = (float)sumBg  / (float)wBg;
-    float muFg = (float)(totalSum - sumBg) / (float)wFg;
-    float var  = (float)wBg * (float)wFg * (muBg - muFg) * (muBg - muFg);
-    if (var > bestVar) { bestVar = var; thresh = (uint8_t)t; }
-  }
-
-  if (thresh < ARUCO_OTSU_MIN) thresh = ARUCO_OTSU_MIN;
-  if (thresh > ARUCO_OTSU_MAX) thresh = ARUCO_OTSU_MAX;
-  Serial.printf("[ARUCO] Otsu threshold: %d (darkCount=%u achromatic=%u)\n",
-                thresh, darkCount, totalCount);
-  return thresh;
-}
-
-bool findDarkBlob(const uint8_t* gray, int W, int H,
-                  int& bx1, int& by1, int& bx2, int& by2,
-                  uint8_t thresh) {
-  bx1 = W; by1 = H; bx2 = 0; by2 = 0;
-  int count = 0;
-  for (int y = 0; y < H; y++)
-    for (int x = 0; x < W; x++)
-      if (gray[y * W + x] < thresh) {
-        if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
-        if (y < by1) by1 = y; if (y > by2) by2 = y;
-        count++;
-      }
-  int rw = bx2 - bx1, rh = by2 - by1;
-  Serial.printf("[ARUCO] Dark pixel count=%d bbox=(%d,%d)-(%d,%d)\n", count, bx1, by1, bx2, by2);
-  if (rw == 0 || rh == 0) return false;
-  float asp = (float)rw / (float)rh;
-  if (asp < 0.4f || asp > 2.5f) {
-    Serial.println("[ARUCO] Blob aspect bad — skip");
-    return false;
-  }
-  return (rw * rh >= 36 && count >= 36);
-}
-
-bool sampleArucoGrid(const uint8_t* gray, int W, int H,
-                     int rx, int ry, int rw, int rh, uint16_t& outBits,
-                     uint8_t thresh) {
-  float cellW = (float)rw / 6.0f;
-  float cellH = (float)rh / 6.0f;
-  bool cells[6][6];
-  for (int row = 0; row < 6; row++) {
-    for (int col = 0; col < 6; col++) {
-      int x0 = max(0, min(W-1, rx + (int)(col * cellW + cellW * 0.25f)));
-      int y0 = max(0, min(H-1, ry + (int)(row * cellH + cellH * 0.25f)));
-      int x1 = max(0, min(W-1, rx + (int)(col * cellW + cellW * 0.75f)));
-      int y1 = max(0, min(H-1, ry + (int)(row * cellH + cellH * 0.75f)));
-      long sum = 0; int cnt = 0;
-      for (int py = y0; py <= y1; py++)
-        for (int px = x0; px <= x1; px++) { sum += gray[py * W + px]; cnt++; }
-      cells[row][col] = cnt > 0 && (sum / cnt) < thresh;
-    }
-  }
-  for (int i = 0; i < 6; i++) {
-    if (!cells[0][i] || !cells[5][i] || !cells[i][0] || !cells[i][5]) {
-      Serial.printf("[ARUCO] Border check failed at i=%d\n", i);
-      return false;
-    }
-  }
-  outBits = 0;
-  for (int r = 1; r <= 4; r++)
-    for (int c = 1; c <= 4; c++) { outBits <<= 1; if (!cells[r][c]) outBits |= 1; }
-  Serial.printf("[ARUCO] Grid sampled — bits=0x%04X\n", outBits);
-  return true;
-}
-
-int lookupAruco(uint16_t bits) {
-  for (int rot = 0; rot < 4; rot++) {
-    for (int id = 0; id < 50; id++) if (ARUCO_4X4_50[id] == bits) return id;
-    uint16_t rotated = 0;
-    for (int r = 0; r < 4; r++)
-      for (int c = 0; c < 4; c++) {
-        if (bits & (1 << (15 - ((3 - c) * 4 + r))))
-          rotated |= (1 << (15 - (r * 4 + c)));
-      }
-    bits = rotated;
-  }
-  Serial.println("[ARUCO] No dictionary match");
-  return -1;
+  return (hi - lo) < GRAY_SAT_MAX;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -484,11 +340,11 @@ int lookupAruco(uint16_t bits) {
 //  getFrameDims() used as fallback if either is 0.
 //
 //  Red dot thresholds: r>160, g<80, b<80, blob>=30 (from bc9eced).
-//  ArUco runs on grayscale derived from the same RGB888 buffer.
-//  Binarization threshold computed per-frame via Otsu's method on the
-//  achromatic-filtered grayscale image.
+//  AprilTag (tag16h5) runs on grayscale derived from the same RGB888 buffer.
+//  GRAY_ACHROMATIC_FILTER selects plain luma (recommended, false) vs
+//  achromatic-filtered gray. AprilTag handles its own adaptive binarization.
 //
-//  After ArUco, gray[] is JPEG-encoded and stashed in dbgFrameBuf for
+//  After detection, gray[] is JPEG-encoded and stashed in dbgFrameBuf for
 //  /stream/gray. Uses a fake camera_fb_t with PIXFORMAT_GRAYSCALE.
 //  Critical section (dbgMux) guards the swap — safe against concurrent
 //  handleGrayStream() reads on the same core.
@@ -550,52 +406,48 @@ void runDetectionAndPush() {
     }
   }
 
-  // ── Build achromatic-filtered grayscale for ArUco ──
+  // ── Build grayscale buffer ──
   uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
   if (gray) {
     for (int i = 0; i < W * H; i++) {
       uint8_t r = rgb[i*3+0], g = rgb[i*3+1], b = rgb[i*3+2];
-      gray[i] = isAchromatic(r, g, b) ? toGray(r, g, b) : 255;
+      gray[i] = (GRAY_ACHROMATIC_FILTER && !isAchromatic(r, g, b)) ? 255 : toGray(r, g, b);
     }
 
-    bool bimodal = false;
-    uint8_t arucoThresh = otsuThreshold(gray, W * H, bimodal);
-    if (bimodal) {
-      int bx1, by1, bx2, by2;
-      bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2, arucoThresh);
-      Serial.printf("[ARUCO] Dark blob: %s\n", blobFound ? "YES" : "NO");
-      if (blobFound) {
-        int rw = bx2 - bx1, rh = by2 - by1;
-        if (rw >= 6 && rh >= 6) {
-          uint16_t bits = 0;
-          bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits, arucoThresh);
-          if (gridOk) {
-            int id = lookupAruco(bits);
-            Serial.printf("[ARUCO] Lookup: %d\n", id);
-            if (id >= 0) {
-              lastDetectedArucoId = id;
-              arucoDetectedAt     = millis();
-              Detection d;
-              d.label = "aruco_" + String(id);
-              d.x = (float)bx1/W; d.y = (float)by1/H;
-              d.w = (float)rw/W;  d.h = (float)rh/H;
-              d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
-              detections.push_back(d);
-              Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
-                            id, d.x, d.y, d.w, d.h, d.confidence);
-            }
-          }
-        }
+    // ── AprilTag detection ──
+    image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = gray };
+    zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
+    Serial.printf("[AT] Detections: %d\n", zarray_size(results));
+    for (int i = 0; i < zarray_size(results); i++) {
+      apriltag_detection_t* det;
+      zarray_get(results, i, &det);
+      // Bounding box from corner points
+      float x0 = det->p[0][0], x1 = det->p[0][0];
+      float y0 = det->p[0][1], y1 = det->p[0][1];
+      for (int k = 1; k < 4; k++) {
+        if (det->p[k][0] < x0) x0 = det->p[k][0];
+        if (det->p[k][0] > x1) x1 = det->p[k][0];
+        if (det->p[k][1] < y0) y0 = det->p[k][1];
+        if (det->p[k][1] > y1) y1 = det->p[k][1];
       }
-    } else {
-      Serial.println("[ARUCO] No marker candidate — skipping");
+      lastDetectedMarkerId = det->id;
+      markerDetectedAt     = millis();
+      Detection d;
+      d.label      = "qr_" + String(det->id);
+      d.x          = x0 / W;  d.y = y0 / H;
+      d.w          = (x1 - x0) / W;  d.h = (y1 - y0) / H;
+      d.confidence = det->decision_margin / 100.0f;  // library returns 0–100 float
+      detections.push_back(d);
+      Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f margin=%.1f\n",
+                    det->id, d.x, d.y, d.w, d.h, det->decision_margin);
     }
+    apriltag_detections_destroy(results);
 
     // ── Stash gray frame for /stream/gray debug view ──────────────────
-    // Encodes the achromatic-filtered gray[] buffer as JPEG using a fake
-    // camera_fb_t with PIXFORMAT_GRAYSCALE. Swapped into dbgFrameBuf under
-    // dbgMux so handleGrayStream() always sees a consistent pointer+length.
+    // Encodes gray[] buffer as JPEG using a fake camera_fb_t with
+    // PIXFORMAT_GRAYSCALE. Swapped into dbgFrameBuf under dbgMux so
+    // handleGrayStream() always sees a consistent pointer+length.
     {
       camera_fb_t fake;
       memset(&fake, 0, sizeof(fake));
@@ -680,6 +532,7 @@ void setup() {
     Serial.println("[BOOT] Camera init failed — halting");
     while (true) delay(1000);
   }
+  initAprilTag();
   connectWiFi();
   registerWithController();
   server.on("/stream",           HTTP_GET, handleStream);
