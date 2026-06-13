@@ -31,7 +31,7 @@ This document describes the full firmware architecture for a two-module wireless
 [ ESP32-CAM – Camera ]           192.168.4.x (DHCP)
 ```
 
-All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser – all relayed commands go through the controller's `/camcmd` endpoint.
+All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser – all relayed commands go through the controller’s `/camcmd` endpoint.
 
 ---
 
@@ -103,6 +103,7 @@ The controller is the single decision-maker. The cam detects and reports; the co
 | `ArduinoJson` | Both |
 | `esp_camera.h` | Camera only |
 | `HTTPClient.h` | Camera only |
+| `apriltag-esp32` | Camera only — [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), install via Arduino IDE → Sketch → Include Library → Add .ZIP Library |
 
 ESP32 board package URL: `https://dl.espressif.com/dl/package_esp32_index.json`
 
@@ -149,8 +150,8 @@ struct PinDef {
 
 **MOSFET gate (track / turntable / arm / light):**
 - `idle = HIGH` — MOSFET fully on, drain clamped to GND (track off / no button)
-- `actionHiZ` drives the "forward / on" button via the internal analog path (Hi-Z gate)
-- `actionLow` drives the "back / pulse" button by pulling the gate low
+- `actionHiZ` drives the “forward / on” button via the internal analog path (Hi-Z gate)
+- `actionLow` drives the “back / pulse” button by pulling the gate low
 
 **Simple button (active-LOW):**
 - `idle = HiZ` — pin floating, external pull-up holds line idle
@@ -167,9 +168,9 @@ The excavator tracks are driven through a single N-channel MOSFET per track. One
 | OUTPUT LOW | Gate off → Drain–Source open | Track **back** |
 
 **Wiring (per button pair):**
-- Gate → Excavator remote "S" for shared. It's a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It's mostly at ground, but has frequent spikes to HIGH that seem to be random and don't follow a pattern.
+- Gate → Excavator remote “S” for shared. It’s a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It’s mostly at ground, but has frequent spikes to HIGH that seem to be random and don’t follow a pattern.
 - Drain → ESP32 GPIO  
-- Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
+- Source → Excavator remote “P” for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
 
 ### Pin Table
 
@@ -268,7 +269,7 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 |--------|------|-------------|
 | `GET` | `/` | Serves the web console HTML |
 | `POST` | `/register` | Cam POSTs `{"ip":"<addr>"}` to register its IP |
-| `GET` | `/camip` | Browser polls to learn the cam's IP |
+| `GET` | `/camip` | Browser polls to learn the cam’s IP |
 | `POST` | `/overlay` | Cam pushes detection JSON |
 | `GET` | `/overlay` | Browser polls detection overlay JSON |
 | `GET` | `/cmd?btn=X&action=Y` | Browser sends button press / hold / release |
@@ -285,20 +286,20 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 
 The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
-- An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam's address
+- An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam’s address
 - A `<canvas>` overlay rendered on top of the feed for detection bounding boxes
 - A **DEBUG VIEW** toggle button (bottom-right of feed) — switches `feedImg.src` between `/stream` and `/stream/gray` directly on the cam; no controller proxy involved
 - Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
 - A top-down excavator model SVG that glows live for tracks / turntable / arm / pump / test / light
-- Live **SAFE / ARMED** badge polled directly from the cam's `/status` endpoint
+- Live **SAFE / ARMED** badge polled directly from the cam’s `/status` endpoint
 - All held actions are released on both `pointerup` and `window blur` (tab loses focus), as a second safety path
 
 #### Debug View Toggle
 
 The **🔬 DEBUG VIEW** button overlays the camera feed (bottom-right corner). Clicking it toggles `debugView` and switches `feedImg.src` directly to `http://<camIP>/stream/gray`. The `pollCamIP()` interval is guarded by the `debugView` flag and will not reset `feedImg.src` while debug view is active. Clicking again returns to the live `/stream`. Button turns amber when active.
 
-The gray stream serves the same grayscale buffer (`dbgFrameBuf`) that `runDetectionAndPush()` stashes every `DETECTION_INTERVAL_MS` before ArUco processing — exactly what the detector sees, without any additional `esp_camera_fb_get()` calls on the cam.
+The gray stream serves the same grayscale buffer (`dbgFrameBuf`) that `runDetectionAndPush()` stashes every `DETECTION_INTERVAL_MS` before AprilTag processing — exactly what the detector sees, without any additional `esp_camera_fb_get()` calls on the cam.
 
 #### Keyboard Shortcuts
 
@@ -318,11 +319,16 @@ The gray stream serves the same grayscale buffer (`dbgFrameBuf`) that `runDetect
 
 #### Overlay Canvas
 
-The browser polls `/overlay` every 500 ms. Detection boxes are drawn in amber (`#f0a500`) with label and confidence percentage. The canvas is sized to match the feed container on every resize event.
+The browser polls `/overlay` every 500 ms. Detection boxes are drawn with label and confidence percentage:
+- `red_dot` → red (`#ff3030`)
+- `qr_*` (AprilTag) → cyan (`#00e5ff`)
+- Everything else → amber (`#f0a500`)
+
+The canvas is sized to match the feed container on every resize event.
 
 #### Camera Feed Polling
 
-The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s. The `pollCamIP()` callback skips the `feedImg.src` assignment while `debugView` is `true`.
+The browser polls `/camip` every 2000 ms. When the cam’s IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s. The `pollCamIP()` callback skips the `feedImg.src` assignment while `debugView` is `true`.
 
 ### Main Loop
 
@@ -347,7 +353,7 @@ loop():
 
 ## Camera Module – Joy-IT SBC-ESP32-Cam
 
-The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller's WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
+The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller’s WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
 
 > Select `AI Thinker ESP32-CAM` in Arduino IDE under Tools -> Board -> ESP32 Arduino.
 
@@ -362,7 +368,7 @@ const uint16_t CONTROLLER_PORT   = 80;
 
 ### Registration
 
-After WiFi connect, the cam POSTs its IP to the controller's `/register` endpoint, retrying up to `REG_MAX_RETRIES` times with `REG_RETRY_DELAY_MS` between attempts:
+After WiFi connect, the cam POSTs its IP to the controller’s `/register` endpoint, retrying up to `REG_MAX_RETRIES` times with `REG_RETRY_DELAY_MS` between attempts:
 
 ```
 POST http://192.168.4.1/register
@@ -433,7 +439,7 @@ const int         STREAM_DELAY_MS   = 0;                  // extra inter-frame d
 
 ### Pixel Format
 
-The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding or ArUco preprocessing. This avoids keeping a second raw frame buffer resident at all times.
+The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding or AprilTag preprocessing. This avoids keeping a second raw frame buffer resident at all times.
 
 ### `/snapshot` Endpoint
 
@@ -453,7 +459,7 @@ const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, in
 
 ### Image Processing
 
-Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller's `/overlay` endpoint:
+Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller’s `/overlay` endpoint:
 
 ```cpp
 struct Detection {
@@ -469,7 +475,7 @@ Detection result JSON schema:
 {
   "detections": [
     { "label": "red_dot", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 },
-    { "label": "aruco_7", "x": 0.42, "y": 0.18, "w": 0.22, "h": 0.29, "confidence": 0.81 }
+    { "label": "qr_7",    "x": 0.42, "y": 0.18, "w": 0.22, "h": 0.29, "confidence": 0.81 }
   ],
   "ts": 12345
 }
@@ -491,52 +497,55 @@ The active colour detector finds a bright red dot using per-pixel RGB888 thresho
 
 **Serial output** on detection:
 ```
-[PROC] Red dot @ (x,y) size WxH conf=C
+[RED] Detected @ (x,y) size WxH conf=C
 ```
 
-#### ArUco Marker Detection (4x4_50, lightweight)
+#### AprilTag Detection (tag16h5, raspiduino/apriltag-esp32)
 
-A lightweight ArUco detector is implemented for marker-based target recognition and positioning. It is designed to fit the ESP32-CAM limits without OpenCV. Detection runs at `STREAM_FRAME_SIZE` (VGA 640×480) — no framesize switch.
+AprilTag detection (family `tag16h5`) is used for marker-based target recognition and positioning. The library is [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), installed via Arduino IDE → Sketch → Include Library → Add .ZIP Library.
+
+**Detector configuration** (set once in `initAprilTag()`):
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `quad_decimate` | 2.0 | Downsample 2× before quad detection — faster, fine at VGA |
+| `quad_sigma` | 0.0 | No blur — camera is already soft enough |
+| `nthreads` | 1 | ESP32 single-core detection task |
+| `refine_edges` | 1 | Sub-pixel edge refinement — worth it for low-res images |
+| `debug` | 0 | No debug image output |
 
 **Processing steps:**
 1. Capture JPEG frame and decode to RGB888 via `fmt2rgb888()`
-2. Convert to grayscale (BT.601 weighted: `(r*77 + g*150 + b*29) >> 8`)
-3. Compute adaptive binarization threshold via **Otsu's method** (see below)
-4. Find the largest dark blob as candidate marker region
-5. Validate blob size and aspect ratio (reject background floods)
-6. Sample a 6×6 cell grid over the region (black border + 4×4 payload)
-7. Validate black border, extract the 4×4 payload bits, and compare against the built-in `4x4_50` dictionary across all 4 rotations
-8. Emit a `Detection` with label `"aruco_N"` where `N` is the marker ID
+2. Build grayscale buffer: plain BT.601 luma (`(r*77 + g*150 + b*29) >> 8`) by default. Set `GRAY_ACHROMATIC_FILTER = true` to instead map coloured pixels to 255 before detection (legacy ArUco behaviour; generally not needed — AprilTag’s adaptive binarization handles colour noise internally)
+3. Wrap in `image_u8_t` and call `apriltag_detector_detect()`
+4. For each result: extract bounding box from the four corner points (`det->p[0..3]`), populate a `Detection` with label `"qr_<id>"`, normalised coords, and `decision_margin / 100.0` as confidence
+5. Call `apriltag_detections_destroy()` to free library-allocated results
+6. Stash the grayscale buffer as a JPEG into `dbgFrameBuf` for `/stream/gray`
 
-**Adaptive binarization — Otsu's method:**
-
-Instead of a fixed threshold, the detector computes an optimal per-frame threshold using Otsu's method — O(N + 256) over the grayscale pixel buffer. Otsu maximises inter-class variance between the dark (marker ink) and light (paper/background) pixel populations, automatically adapting to room lighting conditions and OV2640 AGC gain shifts.
+**Grayscale filter constants:**
 
 ```cpp
-const uint8_t ARUCO_OTSU_MIN = 40;   // floor: clamp for dark/featureless frames
-const uint8_t ARUCO_OTSU_MAX = 140;  // ceil:  clamp for bright/uniform frames
+const bool    GRAY_ACHROMATIC_FILTER = false;  // false = plain luma (recommended)
+const uint8_t GRAY_SAT_MAX           = 30;     // saturation threshold (used only when filter = true)
 ```
-
-The result is clamped to `[ARUCO_OTSU_MIN, ARUCO_OTSU_MAX]` to guard against degenerate frames (no marker present, fully dark, or overexposed). The computed threshold is logged each cycle:
-```
-[ARUCO] Otsu threshold: 87
-```
-
-**Blob sanity checks** (in `findDarkBlob`):
-- Blob bbox spanning >60% of frame width or height → rejected as background flood
-- Blob aspect ratio outside 0.4–2.5 → rejected as non-marker shape
-
-**Current limitations:**
-- Tuned for one dominant marker in frame (largest dark blob only)
-- Best results when marker is roughly upright
-- Cluttered dark backgrounds may still confuse the single-blob approach
-- Optimised for detection / demo use, not precise pose estimation
 
 **Serial output** on detection:
 ```
-[ARUCO] Otsu threshold: N
-[ARUCO] ID N @ (x,y) size WxH conf=C
+[AT] Detections: N
+[AT] ID N @ (x,y) size WxH margin=M
 ```
+
+**Detection labels:** `qr_<id>` where `<id>` is the raw integer from the `tag16h5` dictionary (IDs 0–29, 30 valid tags).
+
+**Performance notes:**
+- `quad_decimate = 2.0` halves the resolution before quad detection — the primary speed lever. Increase to `4.0` if heap/CPU is tight.
+- `refine_edges = 1` recovers sub-pixel accuracy after decimation; recommended at VGA.
+- AprilTag’s internal adaptive thresholding handles most lighting conditions without a pre-filter.
+
+**Known limitations:**
+- Designed for one or a few markers in frame at moderate distance
+- Very small markers (< ~40 px per side after decimation) may not be detected reliably
+- RAM usage: the library allocates intermediate buffers from heap; PSRAM allocation path in `runDetectionAndPush()` is used for the gray buffer
 
 #### Extension Points
 
@@ -547,13 +556,13 @@ The result is clamped to `[ARUCO_OTSU_MIN, ARUCO_OTSU_MAX]` to guard against deg
 
 Current algorithms:
 - Colour thresholding for `red_dot` (implemented)
-- ArUco marker tracking for `aruco_N` IDs (implemented, adaptive Otsu threshold)
+- AprilTag `tag16h5` marker tracking for `qr_N` IDs (implemented, raspiduino/apriltag-esp32)
 
 Future candidates:
 - Multi-colour blob tracking
 - TFLite Micro model inference
 - Optical flow / motion tracking
-- Multi-marker ArUco support
+- Multi-family AprilTag support (e.g. `tag36h11`)
 
 ### Pump Control
 
@@ -567,7 +576,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 - **Boots in SAFE mode** by default.
 - In **SAFE mode**: pump is blocked; entering SAFE mode immediately turns the pump off.
 - In **ARMED mode**: pump operation is permitted.
-- The controller web UI reads the mode from the cam's `/status` endpoint and displays a live **SAFE / ARMED** badge.
+- The controller web UI reads the mode from the cam’s `/status` endpoint and displays a live **SAFE / ARMED** badge.
 
 ### HTTP Endpoints
 
@@ -579,17 +588,18 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
-| `GET` | `/detection_status` | JSON: `{ aruco_detected, aruco_id, ts }` — latched for `ARUCO_CLEAR_MS` |
+| `GET` | `/detection_status` | JSON: `{ marker_detected, marker_id, ts }` — latched for `MARKER_CLEAR_MS` |
 
 #### Gray Debug Stream Detail
 
-`handleGrayStream()` serves `dbgFrameBuf` — a mutex-guarded JPEG buffer (`dbgMux`) stashed by `runDetectionAndPush()` immediately after grayscale conversion, before Otsu binarization and blob detection. This means the debug view shows exactly what the ArUco detector operates on: the same BT.601-weighted grayscale image, re-encoded as JPEG. The live MJPEG stream task is not involved and `esp_camera_fb_get()` is never called from the gray stream handler.
+`handleGrayStream()` serves `dbgFrameBuf` — a mutex-guarded JPEG buffer (`dbgMux`) stashed by `runDetectionAndPush()` immediately after grayscale conversion, before AprilTag processing. This means the debug view shows exactly what the AprilTag detector operates on: the same BT.601-weighted grayscale image (with optional achromatic filter if `GRAY_ACHROMATIC_FILTER = true`), re-encoded as JPEG. The live MJPEG stream task is not involved and `esp_camera_fb_get()` is never called from the gray stream handler.
 
 ### Main Loop
 
 ```
 setup():
   initCamera()          <- PIXFORMAT_JPEG, fb_count=2 (PSRAM)
+  initAprilTag()        <- tag16h5 family, quad_decimate=2.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
   register HTTP routes  <- includes /stream/gray
@@ -617,23 +627,23 @@ The detection overlay pipeline is designed to support future autonomous operatio
 
 A practical first autonomous mode for this project is **marker-guided seek-and-shoot**:
 
-1. Camera detects an ArUco marker and reports `aruco_N` with normalised bounding box
+1. Camera detects an AprilTag marker and reports `qr_N` with normalised bounding box
 2. Controller reads detection centre X position from `/overlay`
 3. Controller steers left or right until marker is centred in frame
 4. When marker is centred and confidence is high enough, controller can stop drive motion and activate the pump
 5. All actuation still remains gated by SAFE / ARMED mode and controlled only by the controller
 
-Suggested detection algorithms now become:
-- Colour thresholding (simple, implemented)
-- ArUco marker tracking (positioning and target ID, implemented — adaptive Otsu threshold)
-- TFLite model inference (future object recognition)
+Suggested detection algorithms now implemented:
+- Colour thresholding (`red_dot`) — simple, implemented
+- AprilTag `tag16h5` marker tracking (`qr_N`) — positioning and target ID, implemented (raspiduino/apriltag-esp32)
+- TFLite Micro model inference — future object recognition
 
 ---
 
 ## Tester – ESP32 ADC/DAC Oscilloscope
 
 A separate `tester/tester.ino` sketch turns the NodeMCU-ESP32 into a high-speed
-single-channel oscilloscope and DAC playground for debugging the excavator's
+single-channel oscilloscope and DAC playground for debugging the excavator’s
 hydraulic and electrical signals.
 
 - WiFi: runs its own AP `ExcavatorAP` on 192.168.4.1, matching the controller.
@@ -649,8 +659,8 @@ hydraulic and electrical signals.
 
 The browser decompresses the delta-encoded stream back into a staircase
 waveform before drawing and CSV export. For every compressed sample after
-the first it injects an extra "hold" point one sampling interval before the
+the first it injects an extra “hold” point one sampling interval before the
 new sample at the previous voltage level, so each plateau is represented
 by exactly two points: a start and an end. The in-browser buffers retain
-nthe full decompressed timeline since page load or last Clear and the
+the full decompressed timeline since page load or last Clear and the
 Download CSV button exports this full history.
