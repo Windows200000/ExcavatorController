@@ -434,7 +434,7 @@ void runDetectionAndPush() {
       lastDetectedMarkerId = det->id;
       markerDetectedAt     = millis();
       Detection d;
-      d.label      = "qr_" + String(det->id);
+      d.label      = "marker_" + String(det->id);
       d.x          = x0 / W;  d.y = y0 / H;
       d.w          = (x1 - x0) / W;  d.h = (y1 - y0) / H;
       d.confidence = det->decision_margin / 100.0f;  // library returns 0–100 float

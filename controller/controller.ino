@@ -996,7 +996,7 @@ function pollCamStatus() {
 setInterval(pollCamStatus, MODE_POLL);
 
 // ── Canvas overlay — detection bounding boxes ────────────────
-// red_dot detections are drawn with a red box; qr_* (AprilTag) use cyan;
+// red_dot detections are drawn with a red box; marker_* (AprilTag) use cyan;
 // everything else uses amber. Green dashed border is always drawn as a
 // canvas-alignment indicator.
 function drawOverlay(detections) {
@@ -1012,9 +1012,9 @@ function drawOverlay(detections) {
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
     const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
-    // red_dot: red, qr_*: cyan, everything else: amber
+    // red_dot: red, marker_*: cyan, everything else: amber
     const isRedDot = d.label === 'red_dot';
-    const isMarker = d.label.startsWith('qr_');
+    const isMarker = d.label.startsWith('marker_');
     const color = isRedDot ? '#ff3030' : (isMarker ? '#00e5ff' : '#f0a500');
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
