@@ -85,6 +85,8 @@ const PinDef PIN_TABLE[] = {
   { 32 , _HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
   { 18 , _LOW  , "turn_left"  ,  nullptr     ,  nullptr      },
   { 19 , _HiZ  ,  nullptr     ,  nullptr     , "turn_right"  },
+  { 16 , _LOW  , "light_on"   ,  nullptr     ,  nullptr      },
+  { 17 , _HiZ  ,  nullptr     ,  nullptr     , "light_off"   },
 //{ 13 , _HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
 //{ 14 , _HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
 //{ 26 , _HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
