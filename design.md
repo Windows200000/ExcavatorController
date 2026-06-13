@@ -301,8 +301,6 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 | `T` | Test hold |
 | `Space` | Pump hold (relayed to cam via `/camcmd`) |
 
-> **Known bug:** `ArrowUp`/`ArrowDown` currently map to `up`/`down` in the JS `KEY_MAP`, but the arm pin actions are `arm_fwd`/`arm_back`. The arrow keys for the arm are silently broken until the JS `KEY_MAP` is updated to use `arm_fwd`/`arm_back`.
-
 #### Overlay Canvas
 
 The browser polls `/overlay` every 500 ms. Detection boxes are drawn in amber (`#f0a500`) with label and confidence percentage. The canvas is sized to match the feed container on every resize event.
@@ -416,12 +414,6 @@ const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;      // 640×480
 const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;      // 640×480
 const uint8_t     JPEG_QUALITY      = 12;                 // 0 = best ... 63 = worst; 10-15 sweet spot
 const int         STREAM_DELAY_MS   = 0;                  // extra inter-frame delay (ms)
-const framesize_t ARUCO_FRAME_SIZE  = FRAMESIZE_QQVGA;    // 160×120 — ArUco detection frame
-const int         ARUCO_W           = 160;
-const int         ARUCO_H           = 120;
-const uint8_t     ARUCO_BINARIZE_THRESH = 100;
-const int         ARUCO_MIN_CELL_PX = 2;
-const float       ARUCO_MIN_CONF    = 0.60f;
 ```
 
 ### Pixel Format
@@ -439,8 +431,6 @@ The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames d
 ### Concurrent Stream and Detection
 
 The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.
-
-The ArUco path temporarily switches the sensor framesize to `FRAMESIZE_QQVGA` to capture a smaller detection frame, then restores `STREAM_FRAME_SIZE` immediately. This keeps stream quality high while reducing ArUco decode cost and PSRAM usage.
 
 ```cpp
 const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
@@ -491,38 +481,58 @@ The active colour detector finds a bright red dot using per-pixel RGB888 thresho
 
 #### ArUco Marker Detection (4x4_50, lightweight)
 
-A lightweight ArUco detector is implemented for marker-based target recognition and positioning. It is designed to fit the ESP32-CAM limits without OpenCV.
+A lightweight ArUco detector is implemented for marker-based target recognition and positioning. It is designed to fit the ESP32-CAM limits without OpenCV. Detection runs at `STREAM_FRAME_SIZE` (VGA 640×480) — no framesize switch.
 
 **Processing steps:**
-1. Temporarily switch framesize to `FRAMESIZE_QQVGA` (160×120)
-2. Capture JPEG frame and decode to RGB888
-3. Convert to grayscale
+1. Capture JPEG frame and decode to RGB888 via `fmt2rgb888()`
+2. Convert to grayscale (BT.601 weighted: `(r*77 + g*150 + b*29) >> 8`)
+3. Compute adaptive binarization threshold via **Otsu's method** (see below)
 4. Find the largest dark blob as candidate marker region
-5. Sample a 6×6 cell grid over the region (black border + 4×4 payload)
-6. Validate black border, extract the 4×4 payload bits, and compare against the built-in `4x4_50` dictionary across all 4 rotations
-7. Emit a `Detection` with label `"aruco_N"` where `N` is the marker ID
+5. Validate blob size and aspect ratio (reject background floods)
+6. Sample a 6×6 cell grid over the region (black border + 4×4 payload)
+7. Validate black border, extract the 4×4 payload bits, and compare against the built-in `4x4_50` dictionary across all 4 rotations
+8. Emit a `Detection` with label `"aruco_N"` where `N` is the marker ID
+
+**Adaptive binarization — Otsu's method:**
+
+Instead of a fixed threshold, the detector computes an optimal per-frame threshold using Otsu's method — O(N + 256) over the grayscale pixel buffer. Otsu maximises inter-class variance between the dark (marker ink) and light (paper/background) pixel populations, automatically adapting to room lighting conditions and OV2640 AGC gain shifts.
+
+```cpp
+const uint8_t ARUCO_OTSU_MIN = 40;   // floor: clamp for dark/featureless frames
+const uint8_t ARUCO_OTSU_MAX = 140;  // ceil:  clamp for bright/uniform frames
+```
+
+The result is clamped to `[ARUCO_OTSU_MIN, ARUCO_OTSU_MAX]` to guard against degenerate frames (no marker present, fully dark, or overexposed). The computed threshold is logged each cycle:
+```
+[ARUCO] Otsu threshold: 87
+```
+
+**Blob sanity checks** (in `findDarkBlob`):
+- Blob bbox spanning >60% of frame width or height → rejected as background flood
+- Blob aspect ratio outside 0.4–2.5 → rejected as non-marker shape
 
 **Current limitations:**
-- Tuned for one dominant marker in frame
+- Tuned for one dominant marker in frame (largest dark blob only)
 - Best results when marker is roughly upright
-- Uses the largest dark blob only, so cluttered scenes may confuse detection
+- Cluttered dark backgrounds may still confuse the single-blob approach
 - Optimised for detection / demo use, not precise pose estimation
 
 **Serial output** on detection:
 ```
+[ARUCO] Otsu threshold: N
 [ARUCO] ID N @ (x,y) size WxH conf=C
 ```
 
 #### Extension Points
 
-1. Capture frame suited to algorithm (`STREAM_FRAME_SIZE` for colour thresholding, `ARUCO_FRAME_SIZE` for marker detection)
+1. Capture frame suited to algorithm (`STREAM_FRAME_SIZE` for all current detectors)
 2. Run detection algorithm
 3. Populate the `detections` vector with `Detection` structs
 4. JSON serialisation and POST to `/overlay` are reused unchanged
 
 Current algorithms:
 - Colour thresholding for `red_dot` (implemented)
-- ArUco marker tracking for `aruco_N` IDs (implemented)
+- ArUco marker tracking for `aruco_N` IDs (implemented, adaptive Otsu threshold)
 
 Future candidates:
 - Multi-colour blob tracking
@@ -553,6 +563,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
+| `GET` | `/detection_status` | JSON: `{ aruco_detected, aruco_id, ts }` — latched for `ARUCO_CLEAR_MS` |
 
 ### Main Loop
 
@@ -594,7 +605,7 @@ A practical first autonomous mode for this project is **marker-guided seek-and-s
 
 Suggested detection algorithms now become:
 - Colour thresholding (simple, implemented)
-- ArUco marker tracking (positioning and target ID, implemented)
+- ArUco marker tracking (positioning and target ID, implemented — adaptive Otsu threshold)
 - TFLite model inference (future object recognition)
 
 ---

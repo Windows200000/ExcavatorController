@@ -110,9 +110,12 @@ const uint8_t  RED_G_MAX       = 80;
 const uint8_t  RED_B_MAX       = 80;
 const int      RED_BLOB_MIN    = 30;
 
-// ArUco thresholds
-const uint8_t  ARUCO_BINARIZE_THRESH = 100;
-const float    ARUCO_MIN_CONF        = 0.60f;
+// ArUco binarization — Otsu's method computes threshold per-frame.
+// Clamp keeps result in valid range for OV2640 indoor, JPEG q=12.
+// No hardcoded ARUCO_BINARIZE_THRESH — fully adaptive to current lighting.
+const uint8_t  ARUCO_OTSU_MIN  = 40;   // floor: below true-black is noise
+const uint8_t  ARUCO_OTSU_MAX  = 140;  // ceil:  above this hits white-cell bleed
+const float    ARUCO_MIN_CONF  = 0.60f;
 
 // ─────────────────────────────────────────────
 //  Web server
@@ -360,23 +363,75 @@ inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
   return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
 }
 
+// ─────────────────────────────────────────────
+//  Otsu's method — O(N + 256).
+//  Finds threshold that maximises inter-class variance between dark
+//  (marker ink) and light (paper/background) pixel populations.
+//  Fully adaptive to current room lighting and OV2640 AGC gain.
+//  Clamped to [ARUCO_OTSU_MIN, ARUCO_OTSU_MAX] to guard against
+//  degenerate uniform frames (no marker present).
+// ─────────────────────────────────────────────
+static uint8_t otsuThreshold(const uint8_t* gray, int N) {
+  uint32_t hist[256] = {};
+  for (int i = 0; i < N; i++) hist[gray[i]]++;
+
+  uint64_t totalSum = 0;
+  for (int i = 0; i < 256; i++) totalSum += (uint64_t)i * hist[i];
+
+  uint64_t sumBg   = 0;
+  uint32_t wBg     = 0;
+  float    bestVar = 0.0f;
+  uint8_t  thresh  = 128;
+
+  for (int t = 0; t < 256; t++) {
+    wBg   += hist[t];
+    if (wBg == 0) continue;
+    uint32_t wFg = (uint32_t)N - wBg;
+    if (wFg == 0) break;
+    sumBg += (uint64_t)t * hist[t];
+    float muBg = (float)sumBg  / (float)wBg;
+    float muFg = (float)(totalSum - sumBg) / (float)wFg;
+    float var  = (float)wBg * (float)wFg * (muBg - muFg) * (muBg - muFg);
+    if (var > bestVar) { bestVar = var; thresh = (uint8_t)t; }
+  }
+
+  if (thresh < ARUCO_OTSU_MIN) thresh = ARUCO_OTSU_MIN;
+  if (thresh > ARUCO_OTSU_MAX) thresh = ARUCO_OTSU_MAX;
+  Serial.printf("[ARUCO] Otsu threshold: %d\n", thresh);
+  return thresh;
+}
+
 bool findDarkBlob(const uint8_t* gray, int W, int H,
-                  int& bx1, int& by1, int& bx2, int& by2) {
+                  int& bx1, int& by1, int& bx2, int& by2,
+                  uint8_t thresh) {
   bx1 = W; by1 = H; bx2 = 0; by2 = 0;
   int count = 0;
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++)
-      if (gray[y * W + x] < ARUCO_BINARIZE_THRESH) {
+      if (gray[y * W + x] < thresh) {
         if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
         if (y < by1) by1 = y; if (y > by2) by2 = y;
         count++;
       }
+  int rw = bx2 - bx1, rh = by2 - by1;
   Serial.printf("[ARUCO] Dark pixel count=%d bbox=(%d,%d)-(%d,%d)\n", count, bx1, by1, bx2, by2);
-  return ((bx2 - bx1) * (by2 - by1) >= 36 && count >= 36);
+  // Reject full-frame flood — background noise, not a marker
+  if (rw > W * 6 / 10 || rh > H * 6 / 10) {
+    Serial.println("[ARUCO] Blob too large — background noise, skip");
+    return false;
+  }
+  if (rw == 0 || rh == 0) return false;
+  float asp = (float)rw / (float)rh;
+  if (asp < 0.4f || asp > 2.5f) {
+    Serial.println("[ARUCO] Blob aspect bad — skip");
+    return false;
+  }
+  return (rw * rh >= 36 && count >= 36);
 }
 
 bool sampleArucoGrid(const uint8_t* gray, int W, int H,
-                     int rx, int ry, int rw, int rh, uint16_t& outBits) {
+                     int rx, int ry, int rw, int rh, uint16_t& outBits,
+                     uint8_t thresh) {
   float cellW = (float)rw / 6.0f;
   float cellH = (float)rh / 6.0f;
   bool cells[6][6];
@@ -389,7 +444,7 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
       long sum = 0; int cnt = 0;
       for (int py = y0; py <= y1; py++)
         for (int px = x0; px <= x1; px++) { sum += gray[py * W + px]; cnt++; }
-      cells[row][col] = cnt > 0 && (sum / cnt) < ARUCO_BINARIZE_THRESH;
+      cells[row][col] = cnt > 0 && (sum / cnt) < thresh;
     }
   }
   for (int i = 0; i < 6; i++) {
@@ -429,6 +484,7 @@ int lookupAruco(uint16_t bits) {
 //
 //  Red dot thresholds: r>160, g<80, b<80, blob>=30 (from bc9eced).
 //  ArUco runs on grayscale derived from the same RGB888 buffer.
+//  Binarization threshold computed per-frame via Otsu's method.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -495,14 +551,17 @@ void runDetectionAndPush() {
     for (int i = 0; i < W * H; i++)
       gray[i] = toGray(rgb[i*3], rgb[i*3+1], rgb[i*3+2]);
 
+    // Compute adaptive binarization threshold from this frame's histogram
+    uint8_t arucoThresh = otsuThreshold(gray, W * H);
+
     int bx1, by1, bx2, by2;
-    bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2);
+    bool blobFound = findDarkBlob(gray, W, H, bx1, by1, bx2, by2, arucoThresh);
     Serial.printf("[ARUCO] Dark blob: %s\n", blobFound ? "YES" : "NO");
     if (blobFound) {
       int rw = bx2 - bx1, rh = by2 - by1;
       if (rw >= 6 && rh >= 6) {
         uint16_t bits = 0;
-        bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits);
+        bool gridOk = sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits, arucoThresh);
         if (gridOk) {
           int id = lookupAruco(bits);
           Serial.printf("[ARUCO] Lookup: %d\n", id);
