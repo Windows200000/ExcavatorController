@@ -8,17 +8,13 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <vector>
 
-// Detection struct — defined here with guard so the Arduino preprocessor
-// cannot duplicate it when it auto-includes all .h files in the sketch folder.
-#ifndef DETECTION_STRUCT_DEFINED
-#define DETECTION_STRUCT_DEFINED
 struct Detection {
   String label;
   float  x, y, w, h;   // normalised 0..1 (top-left origin)
   float  confidence;
 };
-#endif
 
 // ─────────────────────────────────────────────
 //  WiFi  (controller is the AP)
@@ -78,14 +74,14 @@ const int         STREAM_DELAY_MS   = 0;
 
 // ─────────────────────────────────────────────
 //  Detection settings
+//  Detection runs every DETECTION_INTERVAL_MS independently of the stream.
+//  One fb_get() per cycle: the same decoded RGB888 buffer feeds both
+//  red-dot (colour threshold) and ArUco (grayscale) detection.
+//  No set_framesize() calls — detection runs at stream resolution (VGA).
 // ─────────────────────────────────────────────
-const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
-const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;  // auto-clear after 1s
-const framesize_t ARUCO_FRAME_SIZE   = FRAMESIZE_QQVGA;  // 160×120 — ArUco detection frame
-const int      ARUCO_W               = 160;
-const int      ARUCO_H               = 120;
+const uint32_t DETECTION_INTERVAL_MS = 500;
+const uint32_t ARUCO_CLEAR_MS        = DETECTION_INTERVAL_MS * 2;
 const uint8_t  ARUCO_BINARIZE_THRESH = 100;
-const int      ARUCO_MIN_CELL_PX     = 2;
 const float    ARUCO_MIN_CONF        = 0.60f;
 
 // ─────────────────────────────────────────────
@@ -104,9 +100,8 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-// ArUco detection state — written by loop(), read by HTTP handler
-int      lastDetectedArucoId = -1;
-volatile uint32_t arucoDetectedAt     = 0;
+int              lastDetectedArucoId = -1;
+volatile uint32_t arucoDetectedAt   = 0;
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -155,7 +150,7 @@ bool initCamera() {
   if (psramFound()) {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 3;
+    config.fb_count     = 2;   // one slot for stream, one for detection
   } else {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY + 4;
@@ -261,9 +256,6 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-// Returns current ArUco detection state for UI polling.
-// aruco_detected: true if a marker was seen within the last ARUCO_CLEAR_MS.
-// aruco_id: the last detected marker ID, or -1 if none active.
 void handleDetectionStatus() {
   bool active = (lastDetectedArucoId >= 0) &&
                 ((millis() - arucoDetectedAt) < ARUCO_CLEAR_MS);
@@ -279,7 +271,6 @@ void handleDetectionStatus() {
 // ════════════════════════════════════════════════════════════
 //  ArUco dictionary + helpers
 // ════════════════════════════════════════════════════════════
-
 static const uint16_t ARUCO_4X4_50[50] = {
   0b0111001001101101, // 0
   0b0111011000001101, // 1
@@ -355,8 +346,6 @@ bool sampleArucoGrid(const uint8_t* gray, int W, int H,
                      int rx, int ry, int rw, int rh, uint16_t& outBits) {
   float cellW = (float)rw / 6.0f;
   float cellH = (float)rh / 6.0f;
-  // Remove min cell size check — QQVGA is small enough
-  const int MIN_CELL_PX = 1;  // was ARUCO_MIN_CELL_PX = 2
   bool cells[6][6];
   for (int row = 0; row < 6; row++) {
     for (int col = 0; col < 6; col++) {
@@ -392,90 +381,43 @@ int lookupAruco(uint16_t bits) {
   return -1;
 }
 
-void runArucoDetection(std::vector<Detection>& detections) {
-  // Switch to QQVGA for smaller detection frame
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, ARUCO_FRAME_SIZE);
-
+// ════════════════════════════════════════════════════════════
+//  Combined detection + overlay push
+//
+//  Single fb_get() per cycle — no set_framesize() calls.
+//  1. Grab one JPEG frame at stream resolution (VGA)
+//  2. fmt2rgb888() once into PSRAM → RGB888 buffer
+//  3. Red dot detection on RGB888 (colour threshold)
+//  4. Convert RGB888 → grayscale in a second PSRAM buffer
+//  5. ArUco detection on grayscale — runs at full VGA resolution
+//  6. fb_return, free buffers, POST all detections
+// ════════════════════════════════════════════════════════════
+void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     if (fb) esp_camera_fb_return(fb);
-    s->set_framesize(s, STREAM_FRAME_SIZE);
     return;
   }
 
-  // Restore stream framesize immediately after grab
-  s->set_framesize(s, STREAM_FRAME_SIZE);
+  const int W = fb->width, H = fb->height;
+  const size_t rgbLen = (size_t)W * H * 3;
 
-  const int srcW = ARUCO_W, srcH = ARUCO_H;
-
-  size_t rgbLen = (size_t)srcW * srcH * 3;
+  // ── Decode JPEG → RGB888 ──────────────────────────────────
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
   bool decoded = rgb && fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
-  esp_camera_fb_return(fb);
+  esp_camera_fb_return(fb);   // return camera buffer immediately after decode
   if (!decoded) { if (rgb) free(rgb); return; }
 
-  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)srcW * srcH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!gray) gray = (uint8_t*)malloc((size_t)srcW * srcH);
-  if (!gray) { free(rgb); return; }
+  std::vector<Detection> detections;
 
-  // Direct grayscale — no downsampling needed at QQVGA
-  for (int y = 0; y < srcH; y++)
-    for (int x = 0; x < srcW; x++) {
-      int idx = (y * srcW + x) * 3;
-      gray[y * srcW + x] = toGray(rgb[idx], rgb[idx+1], rgb[idx+2]);
-    }
-  free(rgb);
-
-  int bx1, by1, bx2, by2;
-  if (findDarkBlob(gray, srcW, srcH, bx1, by1, bx2, by2)) {
-    int rw = bx2 - bx1, rh = by2 - by1;
-    if (rw >= 6 && rh >= 6) {
-      uint16_t bits = 0;
-      if (sampleArucoGrid(gray, srcW, srcH, bx1, by1, rw, rh, bits)) {
-        int id = lookupAruco(bits);
-        if (id >= 0) {
-          lastDetectedArucoId = id;
-          arucoDetectedAt     = millis();
-          Detection d;
-          d.label = "aruco_" + String(id);
-          d.x = (float)bx1/srcW; d.y = (float)by1/srcH;
-          d.w = (float)rw/srcW;  d.h = (float)rh/srcH;
-          d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(srcW*srcH/4));
-          detections.push_back(d);
-          Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
-                        id, d.x, d.y, d.w, d.h, d.confidence);
-        }
-      }
-    }
-  }
-  free(gray);
-}
-
-// ════════════════════════════════════════════════════════════
-//  Red dot detection
-//  Tightened thresholds to prevent false positives on ArUco ink:
-//  r > 180, g < 60, b < 60, red must dominate by 3x, min 200px blob
-// ════════════════════════════════════════════════════════════
-void runRedDotDetection(std::vector<Detection>& detections) {
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
-    if (fb) esp_camera_fb_return(fb);
-    return;
-  }
-  const int W = fb->width, H = fb->height;
-  size_t rgbLen = (size_t)W * H * 3;
-  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
-  bool decoded = rgb && fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
-  esp_camera_fb_return(fb);
-  if (decoded) {
+  // ── Red dot detection (RGB888 colour threshold) ───────────
+  {
     int bx1 = W, by1 = H, bx2 = 0, by2 = 0, blobCount = 0;
     for (int y = 0; y < H; y++)
       for (int x = 0; x < W; x++) {
         uint8_t r = rgb[(y*W+x)*3], g = rgb[(y*W+x)*3+1], b = rgb[(y*W+x)*3+2];
-        if (r > 180 && g < 60 && b < 60 && r > (uint8_t)(g * 3) && r > (uint8_t)(b * 3)) {
+        if (r > 180 && g < 60 && b < 60 && r > (uint8_t)(g*3) && r > (uint8_t)(b*3)) {
           if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
           if (y < by1) by1 = y; if (y > by2) by2 = y;
           blobCount++;
@@ -493,17 +435,42 @@ void runRedDotDetection(std::vector<Detection>& detections) {
                     d.x, d.y, d.w, d.h, d.confidence);
     }
   }
-  if (rgb) free(rgb);
-}
 
-// ════════════════════════════════════════════════════════════
-//  Combined detection + overlay push
-// ════════════════════════════════════════════════════════════
-void runDetectionAndPush() {
-  std::vector<Detection> detections;
-  runRedDotDetection(detections);
-  runArucoDetection(detections);
+  // ── Convert RGB888 → grayscale (reuse PSRAM) ──────────────
+  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
+  if (gray) {
+    for (int i = 0; i < W * H; i++)
+      gray[i] = toGray(rgb[i*3], rgb[i*3+1], rgb[i*3+2]);
 
+    // ── ArUco detection (grayscale, VGA resolution) ───────────
+    int bx1, by1, bx2, by2;
+    if (findDarkBlob(gray, W, H, bx1, by1, bx2, by2)) {
+      int rw = bx2 - bx1, rh = by2 - by1;
+      if (rw >= 6 && rh >= 6) {
+        uint16_t bits = 0;
+        if (sampleArucoGrid(gray, W, H, bx1, by1, rw, rh, bits)) {
+          int id = lookupAruco(bits);
+          if (id >= 0) {
+            lastDetectedArucoId = id;
+            arucoDetectedAt     = millis();
+            Detection d;
+            d.label = "aruco_" + String(id);
+            d.x = (float)bx1/W; d.y = (float)by1/H;
+            d.w = (float)rw/W;  d.h = (float)rh/H;
+            d.confidence = ARUCO_MIN_CONF + 0.4f * min(1.0f, (float)(rw*rh)/(float)(W*H/4));
+            detections.push_back(d);
+            Serial.printf("[ARUCO] ID %d @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
+                          id, d.x, d.y, d.w, d.h, d.confidence);
+          }
+        }
+      }
+    }
+    free(gray);
+  }
+  free(rgb);
+
+  // ── POST detections to controller /overlay ────────────────
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -582,14 +549,16 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  
+
   // Pump heartbeat watchdog
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
     pumpOff();
   }
-  
-  // Detection — runs independently of stream; suppressed only while pump is active
+
+  // Detection — runs every DETECTION_INTERVAL_MS, independent of stream.
+  // Stream task uses its own fb_get on a separate buffer slot (fb_count=2).
+  // Only suppressed while pump is active.
   if (!pumpActive && (millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
     lastDetectionMs = millis();
     runDetectionAndPush();
