@@ -31,7 +31,7 @@ This document describes the full firmware architecture for a two-module wireless
 [ ESP32-CAM – Camera ]           192.168.4.x (DHCP)
 ```
 
-All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser – all relayed commands go through the controller’s `/camcmd` endpoint.
+All three parties communicate over the single `ExcavatorAP` network. The browser connects to the AP and addresses both devices via HTTP. The cam never receives commands directly from the browser – all relayed commands go through the controller's `/camcmd` endpoint.
 
 ---
 
@@ -181,8 +181,8 @@ struct PinDef {
 
 **MOSFET gate (track / turntable / arm / light):**
 - `idle = HIGH` — MOSFET fully on, drain clamped to GND (track off / no button)
-- `actionHiZ` drives the “forward / on” button via the internal analog path (Hi-Z gate)
-- `actionLow` drives the “back / pulse” button by pulling the gate low
+- `actionHiZ` drives the "forward / on" button via the internal analog path (Hi-Z gate)
+- `actionLow` drives the "back / pulse" button by pulling the gate low
 
 **Simple button (active-LOW):**
 - `idle = HiZ` — pin floating, external pull-up holds line idle
@@ -193,15 +193,15 @@ struct PinDef {
 The excavator tracks are driven through a single N-channel MOSFET per track. One ESP32 GPIO controls three logical states:
 
 | ESP32 GPIO state | MOSFET effect | Track action |
-|-----------------|---------------|--------------| 
+|-----------------|---------------|--------------|
 | OUTPUT HIGH | Gate fully on → Drain–Source closed to GND | Track **off** (no button) |
 | INPUT (Hi-Z) | Gate at intermediate voltage via internal paths | Track **forward** |
 | OUTPUT LOW | Gate off → Drain–Source open | Track **back** |
 
 **Wiring (per button pair):**
-- Gate → Excavator remote “S” for shared. It’s a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It’s mostly at ground, but has frequent spikes to HIGH that seem to be random and don’t follow a pattern.
+- Gate → Excavator remote "S" for shared. It's a mistery trace with a connection to the remote mistery chip, shared between half the buttons. (The other buttons connect to ground) It's mostly at ground, but has frequent spikes to HIGH that seem to be random and don't follow a pattern.
 - Drain → ESP32 GPIO  
-- Source → Excavator remote “P” for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
+- Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
 
 ### Pin Table
 
@@ -222,6 +222,12 @@ All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactl
 const uint32_t PULSE_DURATION_MS = 150;   // Duration of light on/off pulse
 const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat stops
 ```
+
+### Control Characteristics
+
+- All controls are **binary** — fully on or fully off; no analog or PWM speed control.
+- All controls have a mechanical response delay of approximately **0.5–2 s** after the GPIO signal changes.
+- With camera-in-the-loop (detection → POST → decision → actuation), the total effective delay is even longer and must be accounted for in all autonomous timing logic.
 
 ### Button Behaviour
 
@@ -300,12 +306,13 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 |--------|------|-------------|
 | `GET` | `/` | Serves the web console HTML |
 | `POST` | `/register` | Cam POSTs `{"ip":"<addr>"}` to register its IP |
-| `GET` | `/camip` | Browser polls to learn the cam’s IP |
+| `GET` | `/camip` | Browser polls to learn the cam's IP |
 | `POST` | `/overlay` | Cam pushes detection JSON |
 | `GET` | `/overlay` | Browser polls detection overlay JSON |
 | `GET` | `/cmd?btn=X&action=Y` | Browser sends button press / hold / release |
 | `GET` | `/camcmd?cmd=X` | Controller relays pump and mode commands to cam |
 | `GET` | `/status` | Returns `{camIP, uptime, heap, light}` |
+| `GET` | `/auto_status` | Returns `{autoEnabled, status}` — status is `"waiting_for_detection"` or `"performing_action"` |
 
 #### `/cmd` Action Values
 
@@ -317,13 +324,14 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 
 The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
-- An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam’s address
+- An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam's address
 - A `<canvas>` overlay rendered on top of the feed for detection bounding boxes
 - A **DEBUG VIEW** toggle button (bottom-right of feed) — switches `feedImg.src` between `/stream` and `/stream/gray` directly on the cam; no controller proxy involved
 - Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
 - A top-down excavator model SVG that glows live for tracks / turntable / arm / pump / test / light
-- Live **SAFE / ARMED** badge polled directly from the cam’s `/status` endpoint
+- Live **SAFE / ARMED** badge polled directly from the cam's `/status` endpoint
+- Live **AUTO** status badge polled from `/auto_status` every 500 ms — shows `OFF`, `WAITING`, or `ACTING`
 - All held actions are released on both `pointerup` and `window blur` (tab loses focus), as a second safety path
 
 #### Debug View Toggle
@@ -359,7 +367,7 @@ The canvas is sized to match the feed container on every resize event.
 
 #### Camera Feed Polling
 
-The browser polls `/camip` every 2000 ms. When the cam’s IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s. The `pollCamIP()` callback skips the `feedImg.src` assignment while `debugView` is `true`.
+The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s. The `pollCamIP()` callback skips the `feedImg.src` assignment while `debugView` is `true`.
 
 ### Main Loop
 
@@ -384,7 +392,7 @@ loop():
 
 ## Camera Module – Joy-IT SBC-ESP32-Cam
 
-The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller’s WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
+The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller's WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
 
 > Select `AI Thinker ESP32-CAM` in Arduino IDE under Tools -> Board -> ESP32 Arduino.
 
@@ -399,7 +407,7 @@ const uint16_t CONTROLLER_PORT   = 80;
 
 ### Registration
 
-After WiFi connect, the cam POSTs its IP to the controller’s `/register` endpoint, retrying up to `REG_MAX_RETRIES` times with `REG_RETRY_DELAY_MS` between attempts:
+After WiFi connect, the cam POSTs its IP to the controller's `/register` endpoint, retrying up to `REG_MAX_RETRIES` times with `REG_RETRY_DELAY_MS` between attempts:
 
 ```
 POST http://192.168.4.1/register
@@ -490,7 +498,7 @@ const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, in
 
 ### Image Processing
 
-Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller’s `/overlay` endpoint:
+Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller's `/overlay` endpoint:
 
 ```cpp
 struct Detection {
@@ -519,7 +527,7 @@ The active colour detector finds a bright red dot using per-pixel RGB888 thresho
 **Thresholds** (tuned for a bright red dot, 8-bit per channel):
 
 | Channel | Threshold | Rationale |
-|---------|-----|-----------| 
+|---------|-----------|-----------|
 | R | > 160 | Saturated red |
 | G | < 80 | Low green |
 | B | < 80 | Low blue |
@@ -547,7 +555,7 @@ AprilTag detection (family `tag16h5`) is used for marker-based target recognitio
 
 **Processing steps:**
 1. Capture JPEG frame and decode to RGB888 via `fmt2rgb888()`
-2. Build grayscale buffer: plain BT.601 luma (`(r*77 + g*150 + b*29) >> 8`) by default. Set `GRAY_ACHROMATIC_FILTER = true` to instead map coloured pixels to 255 before detection (legacy ArUco behaviour; generally not needed — AprilTag’s adaptive binarization handles colour noise internally)
+2. Build grayscale buffer: plain BT.601 luma (`(r*77 + g*150 + b*29) >> 8`) by default. Set `GRAY_ACHROMATIC_FILTER = true` to instead map coloured pixels to 255 before detection (legacy ArUco behaviour; generally not needed — AprilTag's adaptive binarization handles colour noise internally)
 3. Wrap in `image_u8_t` and call `apriltag_detector_detect()`
 4. For each result: extract bounding box from the four corner points (`det->p[0..3]`), populate a `Detection` with label `"qr_<id>"`, normalised coords, and `decision_margin / 100.0` as confidence
 5. Call `apriltag_detections_destroy()` to free library-allocated results
@@ -571,7 +579,7 @@ const uint8_t GRAY_SAT_MAX           = 30;     // saturation threshold (used onl
 **Performance notes:**
 - `quad_decimate = 2.0` halves the resolution before quad detection — the primary speed lever. Increase to `4.0` if heap/CPU is tight.
 - `refine_edges = 1` recovers sub-pixel accuracy after decimation; recommended at VGA.
-- AprilTag’s internal adaptive thresholding handles most lighting conditions without a pre-filter.
+- AprilTag's internal adaptive thresholding handles most lighting conditions without a pre-filter.
 
 **Known limitations:**
 - Designed for one or a few markers in frame at moderate distance
@@ -607,7 +615,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 - **Boots in SAFE mode** by default.
 - In **SAFE mode**: pump is blocked; entering SAFE mode immediately turns the pump off.
 - In **ARMED mode**: pump operation is permitted.
-- The controller web UI reads the mode from the cam’s `/status` endpoint and displays a live **SAFE / ARMED** badge.
+- The controller web UI reads the mode from the cam's `/status` endpoint and displays a live **SAFE / ARMED** badge.
 
 ### HTTP Endpoints
 
@@ -656,6 +664,10 @@ The detection overlay pipeline is designed to support future autonomous operatio
 - The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
 - The controller is the single decision-maker: the cam detects and reports, the controller acts. This keeps all actuation logic in one place.
 
+### Auto-Drive Status
+
+The controller exposes `/auto_status` — polled by the browser every 500 ms. When `autoEnabled` is false the status reads `"waiting_for_detection"` as a neutral idle state. When a detection triggers autonomous actuation, status switches to `"performing_action"` for the duration of the blocking action sequence, then returns to `"waiting_for_detection"`. The dashboard displays this live so the operator always knows whether the controller is idle or actively executing a move.
+
 A practical first autonomous mode for this project is **marker-guided seek-and-shoot**:
 
 1. Camera detects an AprilTag marker and reports `qr_N` with normalised bounding box
@@ -674,7 +686,7 @@ Suggested detection algorithms now implemented:
 ## Tester – ESP32 ADC/DAC Oscilloscope
 
 A separate `tester/tester.ino` sketch turns the NodeMCU-ESP32 into a high-speed
-single-channel oscilloscope and DAC playground for debugging the excavator’s
+single-channel oscilloscope and DAC playground for debugging the excavator's
 hydraulic and electrical signals.
 
 - WiFi: runs its own AP `ExcavatorAP` on 192.168.4.1, matching the controller.
@@ -690,7 +702,7 @@ hydraulic and electrical signals.
 
 The browser decompresses the delta-encoded stream back into a staircase
 waveform before drawing and CSV export. For every compressed sample after
-the first it injects an extra “hold” point one sampling interval before the
+the first it injects an extra "hold" point one sampling interval before the
 new sample at the previous voltage level, so each plateau is represented
 by exactly two points: a start and an end. The in-browser buffers retain
 the full decompressed timeline since page load or last Clear and the
