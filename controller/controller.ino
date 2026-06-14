@@ -134,6 +134,25 @@ String overlayJson = "{\"detections\":[]}";
 // ─────────────────────────────────────────────
 bool lightOn = false;
 
+// ─────────────────────────────────────────────
+//  Autonomous driving
+// ─────────────────────────────────────────────
+
+// Frame dimensions used for offset calculations.
+// Must match STREAM_FRAME_SIZE on the camera module (currently FRAMESIZE_VGA = 640x480).
+const float AUTO_FRAME_W = 640.0f;
+const float AUTO_FRAME_H = 480.0f;
+
+bool autoEnabled = false;  // toggled via /auto?set=on|off; off by default on startup
+
+enum AutoStatus_t { AUTO_WAITING, AUTO_BUSY };
+AutoStatus_t autoStatus = AUTO_WAITING;
+
+struct AutoAction {
+  const char* button;      // button name from PIN_TABLE / buttonToHeldPins()
+  uint32_t    durationMs;  // how long to hold this action (independent per action)
+};
+
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
 // ════════════════════════════════════════════════════════════
@@ -265,6 +284,96 @@ void relayCamCmd(const String& path) {
 }
 
 // ════════════════════════════════════════════════════════════
+//  Autonomous detection handler
+// ════════════════════════════════════════════════════════════
+void processDetection(const String& json) {
+  autoStatus = AUTO_BUSY;
+
+  // ── 1. Parse JSON ──────────────────────────────────────────────────────
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, json)) { autoStatus = AUTO_WAITING; return; }
+  JsonArray detections = doc["detections"].as<JsonArray>();
+
+  // ── 2. Choose which detection label to follow ──────────────────────────
+  const char* TARGET_LABEL = "qr_0";
+
+  float bx = -1, by = -1, bw = -1, bh = -1;
+  for (JsonObject det : detections) {
+    if (strcmp(det["label"].as<const char*>(), TARGET_LABEL) == 0) {
+      bx = det["x"]; by = det["y"]; bw = det["w"]; bh = det["h"];
+      break;
+    }
+  }
+  if (bx < 0) { autoStatus = AUTO_WAITING; return; }  // target not in frame
+
+  // ── 3. Calculate bounding box centre (normalised 0..1) ─────────────────
+  float cx = bx + bw / 2.0f;   // 0 = left edge,  1 = right edge
+  float cy = by + bh / 2.0f;   // 0 = top edge,   1 = bottom edge
+
+  // ── 4. Calculate offset from camera frame centre ───────────────────────
+  // Horizontal range is aspect-ratio-scaled using AUTO_FRAME_W / AUTO_FRAME_H.
+  // For 640x480 (4:3): offsetX range ≈ ±133, offsetY range = ±100.
+  //   offsetX: 0=centre, positive=right, negative=left
+  //   offsetY: 0=centre, positive=below centre, negative=above centre
+  int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
+  int offsetY = (int)((cy - 0.5f) * 2.0f * 100.0f);
+
+  // ── 5. DECISION POINT ──────────────────────────────────────────────────
+  // offsetX and offsetY hold the target's position relative to frame centre.
+  // Define actions[] — all actions start simultaneously; each stops after
+  // its own durationMs independently.
+  //
+  // Available button names:
+  //   "spin_left", "spin_right", "fwd", "back",
+  //   "turn_left", "turn_right", "arm_fwd", "arm_back"
+  //
+  // Controls are binary with ~0.5–2 s mechanical delay — keep durations short.
+  //
+  // Example:
+  //   AutoAction actions[] = {
+  //     { "spin_right", 300 },
+  //     { "arm_fwd",    500 },
+  //   };
+  //   int actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  AutoAction actions[] = {};   // <── fill in decision logic here
+  int actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  // ── 6. Perform all actions simultaneously, each stops after its own duration ──
+  HeldPin tmpPins[4];
+  for (int i = 0; i < actionCount; i++) {
+    int c = buttonToHeldPins(String(actions[i].button), tmpPins);
+    startAction(String(actions[i].button), tmpPins, c);
+  }
+
+  uint32_t maxDuration = 0;
+  for (int i = 0; i < actionCount; i++)
+    if (actions[i].durationMs > maxDuration) maxDuration = actions[i].durationMs;
+
+  if (maxDuration > 0) {
+    uint32_t actionStart = millis();
+    bool stopped[MAX_HELD] = {};
+
+    while (millis() - actionStart < maxDuration) {
+      uint32_t elapsed = millis() - actionStart;
+      for (int i = 0; i < actionCount; i++) {
+        if (!stopped[i] && elapsed >= actions[i].durationMs) {
+          stopAction(String(actions[i].button));
+          stopped[i] = true;
+        }
+      }
+      server.handleClient();
+      delay(10);
+    }
+    // stop any that reached maxDuration exactly
+    for (int i = 0; i < actionCount; i++)
+      if (!stopped[i]) stopAction(String(actions[i].button));
+  }
+
+  autoStatus = AUTO_WAITING;
+}
+
+// ════════════════════════════════════════════════════════════
 //  HTTP handlers
 // ════════════════════════════════════════════════════════════
 void handleRoot() {
@@ -288,7 +397,11 @@ void handleCamIP() {
 }
 
 void handleOverlayPost() {
-  if (server.hasArg("plain")) overlayJson = server.arg("plain");
+  if (server.hasArg("plain")) {
+    overlayJson = server.arg("plain");
+    if (autoEnabled && autoStatus == AUTO_WAITING)
+      processDetection(overlayJson);
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -362,6 +475,31 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
+void handleAutoStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String s = (autoStatus == AUTO_BUSY) ? "performing_action" : "waiting_for_detection";
+  server.send(200, "application/json",
+    "{\"autoEnabled\":" + String(autoEnabled ? "true" : "false") +
+    ",\"status\":\"" + s + "\"}");
+}
+
+void handleAutoSet() {
+  if (server.hasArg("set")) {
+    String val = server.arg("set");
+    if (val == "on") {
+      autoEnabled = true;
+      Serial.println("[AUTO] Enabled");
+    }
+    if (val == "off") {
+      autoEnabled = false;
+      if (autoStatus == AUTO_BUSY) releaseAllPins();
+      autoStatus = AUTO_WAITING;
+      Serial.println("[AUTO] Disabled");
+    }
+  }
+  server.send(200, "text/plain", autoEnabled ? "on" : "off");
+}
+
 extern const char INDEX_HTML[] PROGMEM;
 
 // ════════════════════════════════════════════════════════════
@@ -377,14 +515,16 @@ void setup() {
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   Serial.printf("[WIFI] AP started  SSID: %s  IP: %s\n", AP_SSID, AP_IP.toString().c_str());
 
-  server.on("/",         HTTP_GET,  handleRoot);
-  server.on("/register", HTTP_POST, handleRegister);
-  server.on("/camip",    HTTP_GET,  handleCamIP);
-  server.on("/overlay",  HTTP_GET,  handleOverlayGet);
-  server.on("/overlay",  HTTP_POST, handleOverlayPost);
-  server.on("/cmd",      HTTP_GET,  handleCmd);
-  server.on("/camcmd",   HTTP_GET,  handleCamCmd);
-  server.on("/status",   HTTP_GET,  handleStatus);
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/register",   HTTP_POST, handleRegister);
+  server.on("/camip",      HTTP_GET,  handleCamIP);
+  server.on("/overlay",    HTTP_GET,  handleOverlayGet);
+  server.on("/overlay",    HTTP_POST, handleOverlayPost);
+  server.on("/cmd",        HTTP_GET,  handleCmd);
+  server.on("/camcmd",     HTTP_GET,  handleCamCmd);
+  server.on("/status",     HTTP_GET,  handleStatus);
+  server.on("/auto_status",HTTP_GET,  handleAutoStatus);
+  server.on("/auto",       HTTP_GET,  handleAutoSet);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
   Serial.println("[BOOT] HTTP server started");
@@ -445,6 +585,12 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     font-family:'Share Tech Mono',monospace;font-size:.62rem;color:var(--dim);
     background:#0d1520;border:1px solid var(--border);border-radius:20px;
     padding:2px 8px;white-space:nowrap;
+  }
+  #auto-status{
+    font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--dim);
+    background:#0d1520;border:1px solid var(--border);border-radius:20px;
+    padding:2px 8px;cursor:pointer;user-select:none;
+    transition:color .2s,border-color .2s;
   }
 
   /* ── Main layout: feed left, model right ── */
@@ -545,6 +691,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   <div id="header-right">
     <span id="kbd-hint">WASD=drive &nbsp; &#8592;&#8594;=turret &nbsp; &#8593;&#8595;=arm &nbsp; L=light &nbsp; T=test &nbsp; Space=pump</span>
     <span id="cam-status">CAM: searching&hellip;</span>
+    <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
   </div>
 </header>
 
@@ -721,6 +868,7 @@ const HEARTBEAT_MS   = 150;
 const OVERLAY_POLL   = 500;
 const CAM_POLL       = 2000;
 const MODE_POLL      = 300;  // poll cam /status for armed/safe
+const AUTO_POLL      = 500;  // poll /auto_status
 
 // ── State ──────────────────────────────────────────────────
 let camIP = null;
@@ -729,7 +877,6 @@ let debugView = false;
 const activeHolds = {};
 
 // ── Visual model parts map ──────────────────────────────────
-// Keys must match the action names sent to /cmd and used in PIN_TABLE.
 const ACTION_SVG = {
   fwd:        ['lt-fill','rt-fill','lt-arrow-fwd','rt-arrow-fwd'],
   back:       ['lt-fill','rt-fill','lt-arrow-back','rt-arrow-back'],
@@ -889,7 +1036,6 @@ safetyBadge.addEventListener('click', () => {
 });
 
 // ── Keyboard shortcuts ──────────────────────────────────────
-// ArrowUp/Down map to arm_fwd/arm_back to match PIN_TABLE action names.
 const KEY_MAP = {
   'w':'fwd','s':'back','a':'spin_left','d':'spin_right',
   'ArrowLeft':'turn_left','ArrowRight':'turn_right',
@@ -933,8 +1079,6 @@ const canvas      = document.getElementById('overlay-canvas');
 const ctx         = canvas.getContext('2d');
 const camStatus   = document.getElementById('cam-status');
 
-// Always measure the parent container, not the canvas itself.
-// canvas.offsetWidth is circular once a width attribute has been set.
 function resizeCanvas() {
   canvas.width  = feedWrap.clientWidth;
   canvas.height = feedWrap.clientHeight;
@@ -969,10 +1113,6 @@ function pollCamIP() {
 setInterval(pollCamIP, CAM_POLL); pollCamIP();
 
 // ── Debug view toggle ────────────────────────────────────────
-// Switches feedImg.src to cam /stream/gray (AprilTag detection grayscale).
-// Zero impact on the live pipeline — the cam stashes a pre-encoded JPEG
-// every DETECTION_INTERVAL_MS and serves it from dbgFrameBuf without
-// calling esp_camera_fb_get().
 const btnDebug = document.getElementById('btn-debug-view');
 btnDebug.addEventListener('click', () => {
   if (!camIP) return;
@@ -995,13 +1135,34 @@ function pollCamStatus() {
 }
 setInterval(pollCamStatus, MODE_POLL);
 
+// ── Auto status poll & toggle ────────────────────────────────
+const autoStatusEl = document.getElementById('auto-status');
+
+function pollAutoStatus() {
+  fetch('/auto_status').then(r => r.json()).then(d => {
+    if (!d.autoEnabled) {
+      autoStatusEl.textContent = 'AUTO: OFF';
+      autoStatusEl.style.color = '#4a5a6a';
+      autoStatusEl.style.borderColor = '#1e2d3d';
+      return;
+    }
+    const acting = d.status === 'performing_action';
+    autoStatusEl.style.color = acting ? '#f0a500' : '#00c97a';
+    autoStatusEl.style.borderColor = acting ? '#f0a500' : '#00c97a';
+    autoStatusEl.textContent = 'AUTO: ' + (acting ? 'ACTING' : 'WAITING');
+  }).catch(() => {});
+}
+setInterval(pollAutoStatus, AUTO_POLL); pollAutoStatus();
+
+autoStatusEl.addEventListener('click', () => {
+  fetch('/auto_status').then(r => r.json()).then(d => {
+    fetch('/auto?set=' + (d.autoEnabled ? 'off' : 'on')).then(() => pollAutoStatus());
+  });
+});
+
 // ── Canvas overlay — detection bounding boxes ────────────────
-// red_dot detections are drawn with a red box; marker_* (AprilTag) use cyan;
-// everything else uses amber. Green dashed border is always drawn as a
-// canvas-alignment indicator.
 function drawOverlay(detections) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  // Green dashed border — confirms canvas covers full feed area
   ctx.save();
   ctx.strokeStyle = '#00ff00';
   ctx.lineWidth = 2;
@@ -1012,9 +1173,8 @@ function drawOverlay(detections) {
   const W = canvas.width, H = canvas.height;
   detections.forEach(d => {
     const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
-    // red_dot: red, marker_*: cyan, everything else: amber
     const isRedDot = d.label === 'red_dot';
-    const isMarker = d.label.startsWith('marker_');
+    const isMarker = d.label.startsWith('qr_');
     const color = isRedDot ? '#ff3030' : (isMarker ? '#00e5ff' : '#f0a500');
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
