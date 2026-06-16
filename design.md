@@ -43,14 +43,6 @@ All three parties communicate over the single `ExcavatorAP` network. The browser
 ESP32-CAM  ->  /stream (MJPEG)  ->  Browser <img> tag
 ```
 
-### Gray Debug Stream
-
-```
-ESP32-CAM  ->  /stream/gray (MJPEG, low FPS)  ->  Browser <img> tag (debug view only)
-```
-
-The browser switches `feedImg.src` directly to `http://<camIP>/stream/gray` when the **DEBUG VIEW** toggle is active. No controller proxy is involved — same direct pattern as the live stream. The `pollCamIP()` loop is guarded by a `debugView` flag and will not overwrite `feedImg.src` while debug view is on.
-
 ### Detection Overlay
 
 ```
@@ -326,19 +318,12 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
 - An **MJPEG feed** `<img>` whose `src` is set dynamically after `/camip` returns the cam's address
 - A `<canvas>` overlay rendered on top of the feed for detection bounding boxes
-- A **DEBUG VIEW** toggle button (bottom-right of feed) — switches `feedImg.src` between `/stream` and `/stream/gray` directly on the cam; no controller proxy involved
 - Four control groups: **Drive**, **Turret**, **Arm**, **Aux**
 - Each button shows an icon, a label, and a keyboard shortcut badge
 - A top-down excavator model SVG that glows live for tracks / turntable / arm / pump / test / light
 - Live **SAFE / ARMED** badge polled directly from the cam's `/status` endpoint
 - Live **AUTO** status badge polled from `/auto_status` every 500 ms — shows `OFF`, `WAITING`, or `ACTING`
 - All held actions are released on both `pointerup` and `window blur` (tab loses focus), as a second safety path
-
-#### Debug View Toggle
-
-The **🔬 DEBUG VIEW** button overlays the camera feed (bottom-right corner). Clicking it toggles `debugView` and switches `feedImg.src` directly to `http://<camIP>/stream/gray`. The `pollCamIP()` interval is guarded by the `debugView` flag and will not reset `feedImg.src` while debug view is active. Clicking again returns to the live `/stream`. Button turns amber when active.
-
-The gray stream serves the same grayscale buffer (`dbgFrameBuf`) that `runDetectionAndPush()` stashes every `DETECTION_INTERVAL_MS` before AprilTag processing — exactly what the detector sees, without any additional `esp_camera_fb_get()` calls on the cam.
 
 #### Keyboard Shortcuts
 
@@ -367,7 +352,7 @@ The canvas is sized to match the feed container on every resize event.
 
 #### Camera Feed Polling
 
-The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s. The `pollCamIP()` callback skips the `feedImg.src` assignment while `debugView` is `true`.
+The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedImg.src` is set to `http://<camIP>/stream`. On stream error the feed retries after 3 s.
 
 ### Main Loop
 
@@ -559,7 +544,6 @@ AprilTag detection (family `tag16h5`) is used for marker-based target recognitio
 3. Wrap in `image_u8_t` and call `apriltag_detector_detect()`
 4. For each result: extract bounding box from the four corner points (`det->p[0..3]`), populate a `Detection` with label `"qr_<id>"`, normalised coords, and `decision_margin / 100.0` as confidence
 5. Call `apriltag_detections_destroy()` to free library-allocated results
-6. Stash the grayscale buffer as a JPEG into `dbgFrameBuf` for `/stream/gray`
 
 **Grayscale filter constants:**
 
@@ -622,16 +606,11 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/stream` | MJPEG multipart stream (live, full FPS) |
-| `GET` | `/stream/gray` | MJPEG debug stream — grayscale frames from `dbgFrameBuf`, updated every `DETECTION_INTERVAL_MS`; zero extra `esp_camera_fb_get()` calls; low FPS by design |
 | `GET` | `/snapshot` | Single JPEG at `SNAP_FRAME_SIZE` |
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
 | `GET` | `/detection_status` | JSON: `{ marker_detected, marker_id, ts }` — latched for `MARKER_CLEAR_MS` |
-
-#### Gray Debug Stream Detail
-
-`handleGrayStream()` serves `dbgFrameBuf` — a mutex-guarded JPEG buffer (`dbgMux`) stashed by `runDetectionAndPush()` immediately after grayscale conversion, before AprilTag processing. This means the debug view shows exactly what the AprilTag detector operates on: the same BT.601-weighted grayscale image (with optional achromatic filter if `GRAY_ACHROMATIC_FILTER = true`), re-encoded as JPEG. The live MJPEG stream task is not involved and `esp_camera_fb_get()` is never called from the gray stream handler.
 
 ### Main Loop
 
@@ -641,7 +620,7 @@ setup():
   initAprilTag()        <- tag16h5 family, quad_decimate=2.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
-  register HTTP routes  <- includes /stream/gray
+  register HTTP routes
   server.begin()
 
 loop():
@@ -650,7 +629,7 @@ loop():
   if pumpActive and timeout: pumpOff()
   // detection — runs independently of stream; suppressed only while pump is active
   if (!pumpActive && millis() - lastDetectionMs >= DETECTION_INTERVAL_MS):
-    runDetectionAndPush()   // stashes gray JPEG into dbgFrameBuf under dbgMux
+    runDetectionAndPush()   // posts detection JSON to controller /overlay
 ```
 
 ---

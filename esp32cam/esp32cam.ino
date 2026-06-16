@@ -91,11 +91,6 @@ uint32_t pumpLastSeen = 0;
 int               lastDetectedMarkerId = -1;
 volatile uint32_t markerDetectedAt     = 0;
 
-// ── Debug gray frame (stashed by detection, served via /stream/gray) ──
-static uint8_t*     dbgFrameBuf = nullptr;
-static size_t       dbgFrameLen = 0;
-static portMUX_TYPE dbgMux      = portMUX_INITIALIZER_UNLOCKED;
-
 // ── Detection task handle — det_task runs on Core 0 ──
 TaskHandle_t detectionTaskHandle = NULL;
 
@@ -223,50 +218,6 @@ void handleStream() {
   );
 }
 
-// ── Gray debug stream — sources frames from dbgFrameBuf at ~2fps.
-//  Zero impact on /stream — does not call esp_camera_fb_get().
-//  Frame updated every DETECTION_INTERVAL_MS by runDetectionAndPush().
-void handleGrayStream() {
-  WiFiClient client = server.client();
-  String header =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-    "Access-Control-Allow-Origin: *\r\n"
-    "Connection: close\r\n\r\n";
-  client.print(header);
-
-  WiFiClient* clientPtr = new WiFiClient(client);
-  xTaskCreatePinnedToCore(
-    [](void* arg) {
-      WiFiClient* c = (WiFiClient*)arg;
-      while (c->connected()) {
-        portENTER_CRITICAL(&dbgMux);
-        size_t   len = dbgFrameLen;
-        uint8_t* buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
-        if (buf) memcpy(buf, dbgFrameBuf, len);
-        portEXIT_CRITICAL(&dbgMux);
-
-        if (buf && len > 0) {
-          String partHeader =
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-            + String(len) + "\r\n\r\n";
-          c->print(partHeader);
-          c->write(buf, len);
-          c->print("\r\n");
-          free(buf);
-        }
-        delay(500);
-      }
-      Serial.println("[CAM] Gray stream client disconnected");
-      delete c;
-      vTaskDelete(NULL);
-    },
-    "gray_stream", 4096, clientPtr,
-    2,    // priority 2: below stream (10), above loop/handleClient (1)
-    NULL, 1
-  );
-}
-
 void handleSnapshot() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
@@ -352,11 +303,6 @@ inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
 //  AprilTag (tag16h5) runs on grayscale derived from the same RGB888 buffer.
 //  GRAY_ACHROMATIC_FILTER selects plain luma (recommended, false) vs
 //  achromatic-filtered gray. AprilTag handles its own adaptive binarization.
-//
-//  After detection, gray[] is JPEG-encoded and stashed in dbgFrameBuf for
-//  /stream/gray. Uses a fake camera_fb_t with PIXFORMAT_GRAYSCALE.
-//  Critical section (dbgMux) guards the swap — safe against concurrent
-//  handleGrayStream() reads on the same core.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -382,7 +328,6 @@ void runDetectionAndPush() {
 
   bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
   esp_camera_fb_return(fb);
-  //Serial.printf("[DET] fmt2rgb888: %s\n", decoded ? "OK" : "FAILED");
   if (!decoded) { free(rgb); return; }
 
   std::vector<Detection> detections;
@@ -401,7 +346,6 @@ void runDetectionAndPush() {
           blobCount++;
         }
       }
-    // Serial.printf("[RED] blob count=%d (min=%d)\n", blobCount, RED_BLOB_MIN);
     if (blobCount >= RED_BLOB_MIN) {
       Detection d;
       d.label = "red_dot";
@@ -427,7 +371,6 @@ void runDetectionAndPush() {
     // ── AprilTag detection ──
     image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = gray };
     zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
-    // Serial.printf("[AT] Detections: %d\n", zarray_size(results));
     for (int i = 0; i < zarray_size(results); i++) {
       apriltag_detection_t* det;
       zarray_get(results, i, &det);
@@ -451,7 +394,6 @@ void runDetectionAndPush() {
       if (MARKER_CONFIDENCE_CUTOFF > confidence) {
         Serial.printf("[AT] SKIPPING ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f%% while CUTOFF=%d\n",
                       det->id, d.x, d.y, d.w, d.h, confidence, MARKER_CONFIDENCE_CUTOFF);
-
       } else {
         detections.push_back(d);
         Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f\% (CUTOFF=%d)\n",
@@ -460,35 +402,11 @@ void runDetectionAndPush() {
     }
     apriltag_detections_destroy(results);
 
-    // ── Stash gray frame for /stream/gray debug view ──────────────────
-    // Encodes gray[] buffer as JPEG using a fake camera_fb_t with
-    // PIXFORMAT_GRAYSCALE. Swapped into dbgFrameBuf under dbgMux so
-    // handleGrayStream() always sees a consistent pointer+length.
-    {
-      camera_fb_t fake;
-      memset(&fake, 0, sizeof(fake));
-      fake.buf    = gray;
-      fake.len    = (size_t)W * H;
-      fake.width  = W;
-      fake.height = H;
-      fake.format = PIXFORMAT_GRAYSCALE;
-      uint8_t* jBuf = nullptr; size_t jLen = 0;
-      if (frame2jpg(&fake, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
-        portENTER_CRITICAL(&dbgMux);
-        free(dbgFrameBuf);
-        dbgFrameBuf = jBuf;
-        dbgFrameLen = jLen;
-        portEXIT_CRITICAL(&dbgMux);
-        // Serial.printf("[DBG] Gray frame stashed: %d bytes\n", (int)jLen);
-      }
-    }
-
     free(gray);
   }
   free(rgb);
 
   // ── POST to controller /overlay ──
-  // Serial.printf("[DET] Posting %d detection(s)\n", (int)detections.size());
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -503,7 +421,6 @@ void runDetectionAndPush() {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   if (code < 0) Serial.printf("[DET] POST failed: %s\n", http.errorToString(code).c_str());
-  // else Serial.printf("[DET] POST /overlay -> HTTP %d\n", code);
   http.end();
 }
 
@@ -566,7 +483,6 @@ void setup() {
   );
 
   server.on("/stream",           HTTP_GET, handleStream);
-  server.on("/stream/gray",      HTTP_GET, handleGrayStream);
   server.on("/snapshot",         HTTP_GET, handleSnapshot);
   server.on("/pump",             HTTP_GET, handlePump);
   server.on("/mode",             HTTP_GET, handleMode);
@@ -577,7 +493,6 @@ void setup() {
 
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Gray stream     : http://%s/stream/gray\n",      WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Snapshot        : http://%s/snapshot\n",         WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Detection status: http://%s/detection_status\n", WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode            : SAFE (boots safe, pump blocked)\n");
