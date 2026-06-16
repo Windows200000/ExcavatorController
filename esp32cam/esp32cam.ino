@@ -2,6 +2,10 @@
  * EXCAVATOR CAM — ESP32-CAM sketch
  * See design.md for full architecture and endpoint reference.
  * AprilTag detection: raspiduino/apriltag-esp32 (ZIP install), family tag16h5.
+ *
+ * Pixel format: PIXFORMAT_GRAYSCALE — no JPEG decode needed for detection.
+ * Stream: snapshot-based MJPEG. Snapshots taken at DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR.
+ * Detection runs every DETECTION_INTERVAL_MS on the latest grayscale frame.
  */
 
 #include "esp_camera.h"
@@ -19,12 +23,12 @@ struct Detection {
   float  confidence;
 };
 
-const char* WIFI_SSID     = "ExcavatorAP";
-const char* WIFI_PASSWORD = "exc@vator123";
-const char*    CONTROLLER_IP   = "192.168.4.1";
-const uint16_t CONTROLLER_PORT = 80;
-const int      REG_MAX_RETRIES    = 5;
-const uint32_t REG_RETRY_DELAY_MS = 1000;
+const char*    WIFI_SSID            = "ExcavatorAP";
+const char*    WIFI_PASSWORD        = "exc@vator123";
+const char*    CONTROLLER_IP        = "192.168.4.1";
+const uint16_t CONTROLLER_PORT      = 80;
+const int      REG_MAX_RETRIES      = 5;
+const uint32_t REG_RETRY_DELAY_MS   = 1000;
 const uint32_t MARKER_CONFIDENCE_CUTOFF = 50;
 
 #define CAM_PIN_PWDN    32
@@ -44,39 +48,17 @@ const uint32_t MARKER_CONFIDENCE_CUTOFF = 50;
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-const int PIN_PUMP = 4;
+const int      PIN_PUMP             = 4;
 const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;
-const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;
-const uint8_t     JPEG_QUALITY      = 12;
-const int         STREAM_DELAY_MS   = 0;
+const framesize_t FRAME_SIZE           = FRAMESIZE_VGA;  // 640x480
+const uint8_t     JPEG_QUALITY         = 12;
+const uint32_t    DETECTION_INTERVAL_MS = 500;
+const uint32_t    SNAPSHOT_FACTOR       = 4;  // snapshots per detection cycle
+// Snapshot fires every DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR ms
+const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
 
-static void getFrameDims(framesize_t fs, int& w, int& h) {
-  switch (fs) {
-    case FRAMESIZE_QQVGA: w = 160;  h = 120;  break;
-    case FRAMESIZE_QVGA:  w = 320;  h = 240;  break;
-    case FRAMESIZE_VGA:   w = 640;  h = 480;  break;
-    case FRAMESIZE_SVGA:  w = 800;  h = 600;  break;
-    case FRAMESIZE_XGA:   w = 1024; h = 768;  break;
-    case FRAMESIZE_SXGA:  w = 1280; h = 1024; break;
-    case FRAMESIZE_UXGA:  w = 1600; h = 1200; break;
-    default:              w = 640;  h = 480;  break;
-  }
-}
-
-const uint32_t DETECTION_INTERVAL_MS = 500;
-const uint32_t MARKER_CLEAR_MS       = DETECTION_INTERVAL_MS * 2;
-const uint8_t  RED_R_MIN             = 160;
-const uint8_t  RED_G_MAX             = 80;
-const uint8_t  RED_B_MAX             = 80;
-const int      RED_BLOB_MIN          = 30;
-
-// Set true  = achromatic pre-filter (colored pixels → 255 before AprilTag).
-// Set false = plain luminance only — recommended: AprilTag's internal adaptive
-//             thresholding handles color noise better than pre-filtering did for ArUco.
-const bool    GRAY_ACHROMATIC_FILTER = false;
-const uint8_t GRAY_SAT_MAX           = 30;   // used only when GRAY_ACHROMATIC_FILTER=true
+const uint32_t MARKER_CLEAR_MS = DETECTION_INTERVAL_MS * 2;
 
 WebServer server(80);
 
@@ -84,15 +66,25 @@ apriltag_detector_t* atDetector = nullptr;
 apriltag_family_t*   atFamily   = nullptr;
 
 uint32_t lastDetectionMs = 0;
+uint32_t lastSnapshotMs  = 0;
+
 enum CamMode { MODE_SAFE, MODE_ARMED };
 CamMode camMode = MODE_SAFE;
+
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
+
 int               lastDetectedMarkerId = -1;
 volatile uint32_t markerDetectedAt     = 0;
 
-// ── Detection task handle — det_task runs on Core 0 ──
+// ── Stashed JPEG for /stream — written by snapshot task, read by stream task ──
+static uint8_t*     streamFrameBuf = nullptr;
+static size_t       streamFrameLen = 0;
+static portMUX_TYPE streamMux      = portMUX_INITIALIZER_UNLOCKED;
+
+// ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
+TaskHandle_t snapshotTaskHandle  = NULL;
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -136,30 +128,20 @@ bool initCamera() {
   config.pin_pwdn     = CAM_PIN_PWDN;
   config.pin_reset    = CAM_PIN_RESET;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  if (psramFound()) {
-    config.frame_size   = STREAM_FRAME_SIZE;
-    config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 3;  // 3 slots: stream always gets a free slot even if det holds one
-  } else {
-    config.frame_size   = STREAM_FRAME_SIZE;
-    config.jpeg_quality = JPEG_QUALITY + 4;
-    config.fb_count     = 1;
-  }
+  config.pixel_format = PIXFORMAT_GRAYSCALE;  // raw gray pixels — no decode needed
+  config.frame_size   = FRAME_SIZE;
+  config.jpeg_quality = JPEG_QUALITY;
+  config.fb_count     = psramFound() ? 2 : 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("[CAM] Init failed: 0x%x\n", err); return false; }
 
   sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, STREAM_FRAME_SIZE);
-  s->set_quality(s, JPEG_QUALITY);
+  s->set_framesize(s, FRAME_SIZE);
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
 
-  int w, h;
-  getFrameDims(STREAM_FRAME_SIZE, w, h);
-  Serial.printf("[CAM] Camera ready — %dx%d JPEG, fb_count=%d\n", w, h, psramFound() ? 3 : 1);
+  Serial.printf("[CAM] Camera ready — 640x480 GRAYSCALE, fb_count=%d\n", config.fb_count);
   return true;
 }
 
@@ -170,17 +152,51 @@ void initAprilTag() {
   atFamily   = tag16h5_create();
   atDetector = apriltag_detector_create();
   apriltag_detector_add_family(atDetector, atFamily);
-  atDetector->quad_decimate = 2.0f;  // downsample 2x before quad detection — faster, fine at VGA
-  atDetector->quad_sigma    = 0.0f;  // no blur — camera already soft enough
-  atDetector->nthreads      = 1;     // ESP32 single-core detection task
+  atDetector->quad_decimate = 4.0f;  // downsample 4x — processes 160x120, significantly faster
+  atDetector->quad_sigma    = 0.0f;  // no blur
+  atDetector->nthreads      = 1;
   atDetector->debug         = 0;
-  atDetector->refine_edges  = 1;     // sub-pixel edge refinement — worth it for bad image quality
-  Serial.println("[AT] AprilTag detector ready — tag16h5");
+  atDetector->refine_edges  = 1;     // sub-pixel edge refinement
+  Serial.println("[AT] AprilTag detector ready — tag16h5, quad_decimate=4.0");
+}
+
+// ════════════════════════════════════════════════════════════
+//  Snapshot task — Core 0, priority 1
+//  Captures grayscale frame, JPEG-encodes it, stashes in streamFrameBuf.
+//  Fires every SNAPSHOT_INTERVAL_MS via xTaskNotifyGive() from loop().
+// ════════════════════════════════════════════════════════════
+void snapshotTask(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { Serial.println("[SNAP] fb_get failed"); continue; }
+    if (fb->format != PIXFORMAT_GRAYSCALE || fb->len == 0) {
+      Serial.printf("[SNAP] Bad frame: format=%d len=%d\n", fb->format, fb->len);
+      esp_camera_fb_return(fb);
+      continue;
+    }
+
+    uint8_t* jBuf = nullptr;
+    size_t   jLen = 0;
+    if (frame2jpg(fb, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
+      portENTER_CRITICAL(&streamMux);
+      free(streamFrameBuf);
+      streamFrameBuf = jBuf;
+      streamFrameLen = jLen;
+      portEXIT_CRITICAL(&streamMux);
+    }
+    esp_camera_fb_return(fb);
+  }
 }
 
 // ════════════════════════════════════════════════════════════
 //  HTTP handlers
 // ════════════════════════════════════════════════════════════
+
+// /stream — MJPEG multipart, serves latest stashed snapshot frame.
+// Stream task runs on Core 1 at priority 1 — below det_task (2), above handleClient (0).
+// No esp_camera_fb_get() calls here — reads only from streamFrameBuf under mutex.
 void handleStream() {
   WiFiClient client = server.client();
   String header =
@@ -195,45 +211,32 @@ void handleStream() {
     [](void* arg) {
       WiFiClient* c = (WiFiClient*)arg;
       while (c->connected()) {
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (!fb) break;
-        if (fb->format == PIXFORMAT_JPEG) {
+        portENTER_CRITICAL(&streamMux);
+        size_t   len = streamFrameLen;
+        uint8_t* buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
+        if (buf) memcpy(buf, streamFrameBuf, len);
+        portEXIT_CRITICAL(&streamMux);
+
+        if (buf && len > 0) {
           String partHeader =
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-            + String(fb->len) + "\r\n\r\n";
+            + String(len) + "\r\n\r\n";
           c->print(partHeader);
-          c->write(fb->buf, fb->len);
+          c->write(buf, len);
           c->print("\r\n");
+          free(buf);
+        } else {
+          delay(10);  // no frame yet — wait briefly
         }
-        esp_camera_fb_return(fb);
-        if (STREAM_DELAY_MS > 0) delay(STREAM_DELAY_MS);
       }
       Serial.println("[CAM] Stream client disconnected");
       delete c;
       vTaskDelete(NULL);
     },
-    "stream_task", 8192, clientPtr,
-    10,   // priority 10: preempts handleClient() and all other tasks on core 1
+    "stream_task", 4096, clientPtr,
+    1,    // priority 1: below det_task (2), above loop/handleClient (0)
     NULL, 1
   );
-}
-
-void handleSnapshot() {
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { server.send(500, "text/plain", "Capture failed"); return; }
-  if (fb->format == PIXFORMAT_JPEG) {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-  } else {
-    uint8_t* jpgBuf = nullptr; size_t jpgLen = 0;
-    bool ok = frame2jpg(fb, JPEG_QUALITY, &jpgBuf, &jpgLen);
-    esp_camera_fb_return(fb);
-    if (!ok || jpgLen == 0) { server.send(500, "text/plain", "JPEG conversion failed"); return; }
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send_P(200, "image/jpeg", (const char*)jpgBuf, jpgLen);
-    free(jpgBuf);
-  }
 }
 
 void handlePump() {
@@ -279,134 +282,62 @@ void handleDetectionStatus() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Gray helpers
-// ════════════════════════════════════════════════════════════
-inline uint8_t toGray(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
-}
-
-inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
-  uint8_t hi = max(r, max(g, b));
-  uint8_t lo = min(r, min(g, b));
-  return (hi - lo) < GRAY_SAT_MAX;
-}
-
-// ════════════════════════════════════════════════════════════
-//  Combined detection + overlay push
+//  Detection + overlay push
 //
-//  Runs on Core 0 via det_task — never blocks Core 1 (stream/server).
-//  Single fb_get() per cycle — no set_framesize() calls.
-//  W/H read from fb directly (works in JPEG mode on this board);
-//  getFrameDims() used as fallback if either is 0.
-//
-//  Red dot thresholds: r>160, g<80, b<80, blob>=30 (from bc9eced).
-//  AprilTag (tag16h5) runs on grayscale derived from the same RGB888 buffer.
-//  GRAY_ACHROMATIC_FILTER selects plain luma (recommended, false) vs
-//  achromatic-filtered gray. AprilTag handles its own adaptive binarization.
+//  Runs on Core 0 via det_task at priority 2 (highest).
+//  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
+//  PIXFORMAT_GRAYSCALE: fb->buf is raw grayscale bytes — passed directly to
+//  image_u8_t. No fmt2rgb888 decode. No red dot detection.
+//  quad_decimate=4.0: AprilTag processes 160x120 internally.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { Serial.println("[DET] fb_get failed"); return; }
-  if (fb->format != PIXFORMAT_JPEG || fb->len == 0) {
+  if (fb->format != PIXFORMAT_GRAYSCALE || fb->len == 0) {
     Serial.printf("[DET] Bad frame: format=%d len=%d\n", fb->format, fb->len);
     esp_camera_fb_return(fb);
     return;
   }
 
   int W = fb->width, H = fb->height;
-  if (W == 0 || H == 0) getFrameDims(STREAM_FRAME_SIZE, W, H);
-  // Serial.printf("[DET] Frame %dx%d len=%d\n", W, H, fb->len);
 
-  const size_t rgbLen = (size_t)W * H * 3;
-  uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!rgb) rgb = (uint8_t*)malloc(rgbLen);
-  if (!rgb) {
-    Serial.println("[DET] RGB alloc failed");
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
-  esp_camera_fb_return(fb);
-  if (!decoded) { free(rgb); return; }
+  // Direct grayscale buffer — no decode, no conversion
+  image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = fb->buf };
+  zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
 
   std::vector<Detection> detections;
-
-  // ── Red dot detection — thresholds from bc9eced (confirmed working) ──
-  {
-    int bx1 = W, by1 = H, bx2 = 0, by2 = 0, blobCount = 0;
-    for (int y = 0; y < H; y++)
-      for (int x = 0; x < W; x++) {
-        uint8_t r = rgb[(y*W+x)*3+0];
-        uint8_t g = rgb[(y*W+x)*3+1];
-        uint8_t b = rgb[(y*W+x)*3+2];
-        if (r > RED_R_MIN && g < RED_G_MAX && b < RED_B_MAX) {
-          if (x < bx1) bx1 = x; if (x > bx2) bx2 = x;
-          if (y < by1) by1 = y; if (y > by2) by2 = y;
-          blobCount++;
-        }
-      }
-    if (blobCount >= RED_BLOB_MIN) {
-      Detection d;
-      d.label = "red_dot";
-      float cx = (bx1+bx2)/2.0f, cy = (by1+by2)/2.0f;
-      float hw = (bx2-bx1)/2.0f*0.8f, hh = (by2-by1)/2.0f*0.8f;
-      d.x=(cx-hw)/W; d.y=(cy-hh)/H; d.w=hw*2/W; d.h=hh*2/H;
-      d.confidence = min(1.0f, (float)blobCount/500.0f);
-      detections.push_back(d);
-      Serial.printf("[RED] Detected @ (%.2f,%.2f) size %.2fx%.2f conf=%.2f\n",
-                    d.x, d.y, d.w, d.h, d.confidence);
+  for (int i = 0; i < zarray_size(results); i++) {
+    apriltag_detection_t* det;
+    zarray_get(results, i, &det);
+    float x0 = det->p[0][0], x1 = det->p[0][0];
+    float y0 = det->p[0][1], y1 = det->p[0][1];
+    for (int k = 1; k < 4; k++) {
+      if (det->p[k][0] < x0) x0 = det->p[k][0];
+      if (det->p[k][0] > x1) x1 = det->p[k][0];
+      if (det->p[k][1] < y0) y0 = det->p[k][1];
+      if (det->p[k][1] > y1) y1 = det->p[k][1];
     }
-  }
-
-  // ── Build grayscale buffer ──
-  uint8_t* gray = (uint8_t*)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!gray) gray = (uint8_t*)malloc((size_t)W * H);
-  if (gray) {
-    for (int i = 0; i < W * H; i++) {
-      uint8_t r = rgb[i*3+0], g = rgb[i*3+1], b = rgb[i*3+2];
-      gray[i] = (GRAY_ACHROMATIC_FILTER && !isAchromatic(r, g, b)) ? 255 : toGray(r, g, b);
-    }
-
-    // ── AprilTag detection ──
-    image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = gray };
-    zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
-    for (int i = 0; i < zarray_size(results); i++) {
-      apriltag_detection_t* det;
-      zarray_get(results, i, &det);
-      // Bounding box from corner points
-      float x0 = det->p[0][0], x1 = det->p[0][0];
-      float y0 = det->p[0][1], y1 = det->p[0][1];
-      for (int k = 1; k < 4; k++) {
-        if (det->p[k][0] < x0) x0 = det->p[k][0];
-        if (det->p[k][0] > x1) x1 = det->p[k][0];
-        if (det->p[k][1] < y0) y0 = det->p[k][1];
-        if (det->p[k][1] > y1) y1 = det->p[k][1];
-      }
-      lastDetectedMarkerId = det->id;
-      markerDetectedAt     = millis();
+    lastDetectedMarkerId = det->id;
+    markerDetectedAt     = millis();
+    float confidence = det->decision_margin;
+    if (confidence < MARKER_CONFIDENCE_CUTOFF) {
+      Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%d\n",
+                    det->id, confidence, MARKER_CONFIDENCE_CUTOFF);
+    } else {
       Detection d;
       d.label      = "marker_" + String(det->id);
       d.x          = x0 / W;  d.y = y0 / H;
       d.w          = (x1 - x0) / W;  d.h = (y1 - y0) / H;
-      float confidence = det->decision_margin;
-      d.confidence = confidence / 100.0f;  // library returns 0–100 float
-      if (MARKER_CONFIDENCE_CUTOFF > confidence) {
-        Serial.printf("[AT] SKIPPING ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f%% while CUTOFF=%d\n",
-                      det->id, d.x, d.y, d.w, d.h, confidence, MARKER_CONFIDENCE_CUTOFF);
-      } else {
-        detections.push_back(d);
-        Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f\% (CUTOFF=%d)\n",
-                      det->id, d.x, d.y, d.w, d.h, confidence, MARKER_CONFIDENCE_CUTOFF);
-      }
+      d.confidence = confidence / 100.0f;
+      detections.push_back(d);
+      Serial.printf("[AT] ID %d @ (%.2f,%.2f) size %.2fx%.2f confidence=%.1f%%\n",
+                    det->id, d.x, d.y, d.w, d.h, confidence);
     }
-    apriltag_detections_destroy(results);
-
-    free(gray);
   }
-  free(rgb);
+  apriltag_detections_destroy(results);
+  esp_camera_fb_return(fb);
 
-  // ── POST to controller /overlay ──
+  // POST to controller /overlay
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -469,21 +400,32 @@ void setup() {
   connectWiFi();
   registerWithController();
 
-  // Detection task pinned to Core 0 — keeps Core 1 free for stream + server.
+  // det_task — Core 0, priority 2 (highest).
   // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-  // Stack 16384: headroom for fmt2rgb888 decode + AprilTag intermediate buffers.
+  // Reads grayscale fb directly into AprilTag — no decode step.
   xTaskCreatePinnedToCore(
     [](void* arg) {
       for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (!pumpActive) runDetectionAndPush();
+        runDetectionAndPush();
       }
     },
-    "det_task", 16384, NULL, 1, &detectionTaskHandle, 0
+    "det_task", 8192, NULL,
+    2,    // highest priority
+    &detectionTaskHandle, 0
+  );
+
+  // snapshot_task — Core 0, priority 1.
+  // Triggered via xTaskNotifyGive() from loop() every SNAPSHOT_INTERVAL_MS.
+  // Encodes grayscale frame as JPEG, stashes in streamFrameBuf for /stream.
+  xTaskCreatePinnedToCore(
+    snapshotTask,
+    "snap_task", 4096, NULL,
+    1,    // below det_task
+    &snapshotTaskHandle, 0
   );
 
   server.on("/stream",           HTTP_GET, handleStream);
-  server.on("/snapshot",         HTTP_GET, handleSnapshot);
   server.on("/pump",             HTTP_GET, handlePump);
   server.on("/mode",             HTTP_GET, handleMode);
   server.on("/status",           HTTP_GET, handleStatus);
@@ -493,9 +435,10 @@ void setup() {
 
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Snapshot        : http://%s/snapshot\n",         WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Detection status: http://%s/detection_status\n", WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode            : SAFE (boots safe, pump blocked)\n");
+  Serial.printf("[BOOT] Snapshot interval: %dms  Detection interval: %dms\n",
+                SNAPSHOT_INTERVAL_MS, DETECTION_INTERVAL_MS);
 }
 
 void loop() {
@@ -506,9 +449,15 @@ void loop() {
     pumpOff();
   }
 
-  if ((millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
-    lastDetectionMs = millis();
-    if (!pumpActive && detectionTaskHandle)
-      xTaskNotifyGive(detectionTaskHandle);
+  uint32_t now = millis();
+
+  if ((now - lastSnapshotMs) >= SNAPSHOT_INTERVAL_MS) {
+    lastSnapshotMs = now;
+    if (snapshotTaskHandle) xTaskNotifyGive(snapshotTaskHandle);
+  }
+
+  if ((now - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
+    lastDetectionMs = now;
+    if (detectionTaskHandle) xTaskNotifyGive(detectionTaskHandle);
   }
 }
