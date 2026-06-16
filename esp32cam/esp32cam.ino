@@ -146,7 +146,7 @@ bool initCamera() {
   if (psramFound()) {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY;
-    config.fb_count     = 2;
+    config.fb_count     = 3;  // 3 slots: stream always gets a free slot even if det holds one
   } else {
     config.frame_size   = STREAM_FRAME_SIZE;
     config.jpeg_quality = JPEG_QUALITY + 4;
@@ -164,7 +164,7 @@ bool initCamera() {
 
   int w, h;
   getFrameDims(STREAM_FRAME_SIZE, w, h);
-  Serial.printf("[CAM] Camera ready — %dx%d JPEG, fb_count=%d\n", w, h, psramFound() ? 2 : 1);
+  Serial.printf("[CAM] Camera ready — %dx%d JPEG, fb_count=%d\n", w, h, psramFound() ? 3 : 1);
   return true;
 }
 
@@ -217,7 +217,9 @@ void handleStream() {
       delete c;
       vTaskDelete(NULL);
     },
-    "stream_task", 8192, clientPtr, 1, NULL, 1
+    "stream_task", 8192, clientPtr,
+    10,   // priority 10: preempts handleClient() and all other tasks on core 1
+    NULL, 1
   );
 }
 
@@ -259,7 +261,9 @@ void handleGrayStream() {
       delete c;
       vTaskDelete(NULL);
     },
-    "gray_stream", 4096, clientPtr, 1, NULL, 1
+    "gray_stream", 4096, clientPtr,
+    2,    // priority 2: below stream (10), above loop/handleClient (1)
+    NULL, 1
   );
 }
 
