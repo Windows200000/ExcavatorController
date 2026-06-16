@@ -328,9 +328,22 @@ void processDetection(const String& json) {
   if (bx < 0) {
     //Serial.println("[AUTO] Target marker_0' not found — returning");
     autoStatus = AUTO_WAITING;
-    if (autoState.armPos > 1000 && autoState.last_det > 20) {
-      int wkjenfwioerf = 0;
-    };
+    if (autoState.armPos > 0 && autoState.last_det > 20) {
+    //Serial.println("[AUTO] Moving back to default height");
+      const PinDef* findPinByActionLow(const char* actionName) {
+        for (const PinDef& p : PIN_TABLE) {
+          if (p.actionLow && strcmp(p.actionLow, actionName) == 0) return &p;
+        }
+        return nullptr;
+      }
+
+      const PinDef* p = findPinByActionLow("arm_back");
+      if (!p) return;  // defensive: action not found in table
+      setPinActive(*p, LOW_STATE);
+      delay(autoState.armPos);
+      setPinIdle(*p);
+      autoState.armPos = 0;
+    }
     autoState.last_det += 1;
     return;
   }
