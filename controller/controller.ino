@@ -297,6 +297,13 @@ void relayCamCmd(const String& path) {
 // ════════════════════════════════════════════════════════════
 //  Autonomous detection handler
 // ════════════════════════════════════════════════════════════
+
+const PinDef* findPinByActionLow(const char* actionName) {
+  for (const PinDef& p : PIN_TABLE) {
+    if (p.actionLow && strcmp(p.actionLow, actionName) == 0) return &p;
+  }
+  return nullptr;
+}
 void processDetection(const String& json) {
   int TURRET_MAX = 3000; // both directions
   int ARM_MAX = 2000; // starts down, arm fwd = arm up
@@ -330,12 +337,6 @@ void processDetection(const String& json) {
     autoStatus = AUTO_WAITING;
     if (autoState.armPos > 0 && autoState.last_det > 20) {
     //Serial.println("[AUTO] Moving back to default height");
-      const PinDef* findPinByActionLow(const char* actionName) {
-        for (const PinDef& p : PIN_TABLE) {
-          if (p.actionLow && strcmp(p.actionLow, actionName) == 0) return &p;
-        }
-        return nullptr;
-      }
 
       const PinDef* p = findPinByActionLow("arm_back");
       if (!p) return;  // defensive: action not found in table
