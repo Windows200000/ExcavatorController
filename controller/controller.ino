@@ -146,7 +146,15 @@ const float AUTO_FRAME_H = 480.0f;
 bool autoEnabled = false;  // toggled via /auto?set=on|off; off by default on startup
 
 enum AutoStatus_t { AUTO_WAITING, AUTO_BUSY };
-AutoStatus_t autoStatus = AUTO_WAITING;
+AutoStatus_t autoStatus = AUTO_WAITING; 
+// ─────────────────────────────────────────────
+//  Persistent state for processDetection() — survives between calls.
+//  Add more fields here for additional state (e.g. int phase, uint32_t lastActionMs).
+// ─────────────────────────────────────────────
+struct AutoState {
+  int32_t turretPos = 0;   // estimated turntable position; increment/decrement as turn_left/right are issued
+  // int phase = 0;    // example: add a phase/step counter like this
+} autoState;
 
 struct AutoAction {
   const char* button;      // button name from PIN_TABLE / buttonToHeldPins()
@@ -312,12 +320,19 @@ void processDetection(const String& json) {
 
   // ── 4. Calculate offset from camera frame centre ───────────────────────
   //   offsetX: 0=centre, positive=right, negative=left
-  //   offsetY: 0=centre, positive=below centre, negative=above centre
+  //   offsetY: 0=centre, positive=above centre, negative=below centre
   int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
-  int offsetY = (int)((cy - 0.5f) * 2.0f * 100.0f);
-  //   "spin_left", "spin_right", "fwd", "back",
-  //   "turn_left", "turn_right", "arm_fwd", "arm_back"
-
+  int offsetY = (int)((0.5f - cy) * 2.0f * 100.0f);
+  // Available buttons (use in actions[] or startAction/stopAction directly):
+  //   Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
+  //   Composite: "fwd"  "back"  "spin_left"  "spin_right"
+  //   Turntable: "turn_left"  "turn_right"
+  //   Arm:       "arm_fwd"  "arm_back"
+  //   Aux:       "light"  "test"
+  // Access persistent state via autoState.turretPos (etc.)
+  int turret_max = 3000
+  int deadzone = 0.3
+  
 
   AutoAction actions[] = {
     { "spin_right", 1 },
