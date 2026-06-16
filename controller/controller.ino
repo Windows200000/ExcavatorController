@@ -342,18 +342,18 @@ void processDetection(const String& json) {
   std::vector<AutoAction> actions;
   int DEADZONE = 30;
   // Vertical
-  if (abs(offsetX) > DEADZONE) {
-    if (offsetX > 0 && autoState.armPos > 0) {
-      actions.push_back({ "arm_down", 300 });
+  if (abs(offsetY) > DEADZONE) {
+    if (offsetY > 0 && autoState.armPos > 0) {
+      actions.push_back({ "arm_back", 300 });
       autoState.armPos -= 300;
     } else if (autoState.armPos < ARM_MAX){
-      actions.push_back({ "arm_up", 300 });
+      actions.push_back({ "arm_fwd", 300 });
       autoState.armPos += 300;
     }
   }
   // Horizontal
-  if (abs(offsetY) > DEADZONE) {
-    if (offsetY > 0 && autoState.turretPos > -TURRET_MAX) {
+  if (abs(offsetX) > DEADZONE) {
+    if (offsetX > 0 && autoState.turretPos > -TURRET_MAX) {
       actions.push_back({ "right_fwd", 300 });
       autoState.turretPos -= 300;
     } else if (autoState.turretPos < TURRET_MAX) {
