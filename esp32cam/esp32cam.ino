@@ -96,6 +96,9 @@ static uint8_t*     dbgFrameBuf = nullptr;
 static size_t       dbgFrameLen = 0;
 static portMUX_TYPE dbgMux      = portMUX_INITIALIZER_UNLOCKED;
 
+// ── Detection task handle — det_task runs on Core 0 ──
+TaskHandle_t detectionTaskHandle = NULL;
+
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
 // ════════════════════════════════════════════════════════════
@@ -336,6 +339,7 @@ inline bool isAchromatic(uint8_t r, uint8_t g, uint8_t b) {
 // ════════════════════════════════════════════════════════════
 //  Combined detection + overlay push
 //
+//  Runs on Core 0 via det_task — never blocks Core 1 (stream/server).
 //  Single fb_get() per cycle — no set_framesize() calls.
 //  W/H read from fb directly (works in JPEG mode on this board);
 //  getFrameDims() used as fallback if either is 0.
@@ -543,6 +547,20 @@ void setup() {
   initAprilTag();
   connectWiFi();
   registerWithController();
+
+  // Detection task pinned to Core 0 — keeps Core 1 free for stream + server.
+  // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
+  // Stack 16384: headroom for fmt2rgb888 decode + AprilTag intermediate buffers.
+  xTaskCreatePinnedToCore(
+    [](void* arg) {
+      for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!pumpActive) runDetectionAndPush();
+      }
+    },
+    "det_task", 16384, NULL, 1, &detectionTaskHandle, 0
+  );
+
   server.on("/stream",           HTTP_GET, handleStream);
   server.on("/stream/gray",      HTTP_GET, handleGrayStream);
   server.on("/snapshot",         HTTP_GET, handleSnapshot);
@@ -569,8 +587,9 @@ void loop() {
     pumpOff();
   }
 
-  if (!pumpActive && (millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
+  if ((millis() - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
     lastDetectionMs = millis();
-    runDetectionAndPush();
+    if (!pumpActive && detectionTaskHandle)
+      xTaskNotifyGive(detectionTaskHandle);
   }
 }
