@@ -29,7 +29,7 @@ const char*    CONTROLLER_IP        = "192.168.4.1";
 const uint16_t CONTROLLER_PORT      = 80;
 const int      REG_MAX_RETRIES      = 5;
 const uint32_t REG_RETRY_DELAY_MS   = 1000;
-const uint32_t MARKER_CONFIDENCE_CUTOFF = 50;
+const float    MARKER_CONFIDENCE_CUTOFF = 50.0f;
 
 #define CAM_PIN_PWDN    32
 #define CAM_PIN_RESET   -1
@@ -58,8 +58,6 @@ const uint32_t    SNAPSHOT_FACTOR       = 4;  // snapshots per detection cycle
 // Snapshot fires every DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR ms
 const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
 
-const uint32_t MARKER_CLEAR_MS = DETECTION_INTERVAL_MS * 2;
-
 WebServer server(80);
 
 apriltag_detector_t* atDetector = nullptr;
@@ -73,9 +71,6 @@ CamMode camMode = MODE_SAFE;
 
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
-
-int               lastDetectedMarkerId = -1;
-volatile uint32_t markerDetectedAt     = 0;
 
 // ── Stashed JPEG for /stream — written by snapshot task, read by stream task ──
 static uint8_t*     streamFrameBuf = nullptr;
@@ -130,7 +125,6 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_GRAYSCALE;  // raw gray pixels — no decode needed
   config.frame_size   = FRAME_SIZE;
-  config.jpeg_quality = JPEG_QUALITY;
   config.fb_count     = psramFound() ? 2 : 1;
 
   esp_err_t err = esp_camera_init(&config);
@@ -269,18 +263,6 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-void handleDetectionStatus() {
-  bool active = (lastDetectedMarkerId >= 0) &&
-                ((millis() - markerDetectedAt) < MARKER_CLEAR_MS);
-  StaticJsonDocument<128> doc;
-  doc["marker_detected"] = active;
-  doc["marker_id"]       = active ? lastDetectedMarkerId : -1;
-  doc["ts"]              = millis();
-  String out; serializeJson(doc, out);
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", out);
-}
-
 // ════════════════════════════════════════════════════════════
 //  Detection + overlay push
 //
@@ -317,11 +299,9 @@ void runDetectionAndPush() {
       if (det->p[k][1] < y0) y0 = det->p[k][1];
       if (det->p[k][1] > y1) y1 = det->p[k][1];
     }
-    lastDetectedMarkerId = det->id;
-    markerDetectedAt     = millis();
     float confidence = det->decision_margin;
     if (confidence < MARKER_CONFIDENCE_CUTOFF) {
-      Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%d\n",
+      Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%.1f\n",
                     det->id, confidence, MARKER_CONFIDENCE_CUTOFF);
     } else {
       Detection d;
@@ -344,7 +324,6 @@ void runDetectionAndPush() {
     JsonObject o = arr.createNestedObject();
     o["label"]=d.label; o["x"]=d.x; o["y"]=d.y; o["w"]=d.w; o["h"]=d.h; o["confidence"]=d.confidence;
   }
-  doc["ts"] = millis();
   String body; serializeJson(doc, body);
 
   HTTPClient http;
@@ -425,18 +404,16 @@ void setup() {
     &snapshotTaskHandle, 0
   );
 
-  server.on("/stream",           HTTP_GET, handleStream);
-  server.on("/pump",             HTTP_GET, handlePump);
-  server.on("/mode",             HTTP_GET, handleMode);
-  server.on("/status",           HTTP_GET, handleStatus);
-  server.on("/detection_status", HTTP_GET, handleDetectionStatus);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/pump",   HTTP_GET, handlePump);
+  server.on("/mode",   HTTP_GET, handleMode);
+  server.on("/status", HTTP_GET, handleStatus);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
   Serial.println("[BOOT] HTTP server started");
-  Serial.printf("[BOOT] Stream          : http://%s/stream\n",           WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Detection status: http://%s/detection_status\n", WiFi.localIP().toString().c_str());
-  Serial.printf("[BOOT] Mode            : SAFE (boots safe, pump blocked)\n");
+  Serial.printf("[BOOT] Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
+  Serial.printf("[BOOT] Mode    : SAFE (boots safe, pump blocked)\n");
   Serial.printf("[BOOT] Snapshot interval: %dms  Detection interval: %dms\n",
                 SNAPSHOT_INTERVAL_MS, DETECTION_INTERVAL_MS);
 }
