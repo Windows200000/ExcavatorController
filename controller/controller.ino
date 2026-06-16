@@ -158,7 +158,8 @@ const float AUTO_FRAME_H = 480.0f;
 bool autoEnabled = false;  // toggled via /auto?set=on|off; off by default on startup
 
 enum AutoStatus_t { AUTO_WAITING, AUTO_BUSY };
-AutoStatus_t autoStatus = AUTO_WAITING; 
+AutoStatus_t autoStatus = AUTO_WAITING;
+
 // ─────────────────────────────────────────────
 //  Persistent state for processDetection() — survives between calls.
 //  Add more fields here for additional state (e.g. int phase, uint32_t lastActionMs).
@@ -174,6 +175,14 @@ struct AutoAction {
   const char* button;      // button name from PIN_TABLE / buttonToHeldPins()
   uint32_t    durationMs;  // how long to hold this action (independent per action)
 };
+
+// ─────────────────────────────────────────────
+//  Auto tuning constants — visible in all three auto sub-functions
+// ─────────────────────────────────────────────
+const int AUTO_TURRET_MAX = 3000; // both directions
+const int AUTO_ARM_MAX    = 2000; // starts down, arm fwd = arm up
+const int AUTO_ARM_RESET  = 1000; // target armPos after 20x no detection
+const int AUTO_DEADZONE   = 15;
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
@@ -306,7 +315,7 @@ void relayCamCmd(const String& path) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Autonomous detection handler
+//  Autonomous mode helpers
 // ════════════════════════════════════════════════════════════
 
 const PinDef* findPinByActionLow(const char* actionName) {
@@ -315,63 +324,78 @@ const PinDef* findPinByActionLow(const char* actionName) {
   }
   return nullptr;
 }
-void processDetection(const String& json) {
-  int TURRET_MAX = 3000; // both directions
-  int ARM_MAX = 2000; // starts down, arm fwd = arm up
-  autoStatus = AUTO_BUSY;
 
-  // ── 1. Parse JSON ──────────────────────────────────────────────────────
-  StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, json)) {
-    Serial.println("[AUTO] JSON parse FAILED");
-    autoStatus = AUTO_WAITING; return;
+// ─────────────────────────────────────────────
+//  runActionSync — drive one button for durationMs, then stop.
+//  Blocks the calling function but keeps ESP responsive via server.handleClient().
+//  Available buttons:
+//    Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
+//    Composite: "fwd"  "back"  "spin_left"  "spin_right"
+//    Turntable: "turn_left"  "turn_right"
+//    Arm:       "arm_fwd"(up)  "arm_back"(down)
+//    Aux:       "light"  "test"
+// ─────────────────────────────────────────────
+void runActionSync(const char* button, uint32_t durationMs) {
+  HeldPin pins[4];
+  int count = buttonToHeldPins(String(button), pins);
+  if (count == 0 || durationMs == 0) return;
+  startAction(String(button), pins, count);
+  uint32_t start = millis();
+  while (millis() - start < durationMs) {
+    server.handleClient();
+    delay(10);
   }
-  JsonArray detections = doc["detections"].as<JsonArray>();
-  Serial.printf("[AUTO] Detection count: %d\n", detections.size());
+  stopAction(String(button));
+}
 
-  // ── 2. Choose which detection label to follow ──────────────────────────
-  const char* TARGET_LABEL = "marker_0";
+// ─────────────────────────────────────────────
+//  autoAlways — runs every processDetection() call, before detection check.
+//  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
+//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+// ─────────────────────────────────────────────
+void autoAlways(int offsetX, int offsetY) {
+  // ── USER CODE AREA 1 — runs every frame ──────────────────
 
-  float bx = -1, by = -1, bw = -1, bh = -1;
-  for (JsonObject det : detections) {
-    const char* lbl = det["label"].as<const char*>();
-    // Serial.printf("[AUTO]   label='%s' x=%.3f y=%.3f w=%.3f h=%.3f conf=%.2f\n",
-    //  lbl, det["x"].as<float>(), det["y"].as<float>(),
-    //  det["w"].as<float>(), det["h"].as<float>(), det["confidence"].as<float>());
-    if (strcmp(lbl, TARGET_LABEL) == 0) {
-      bx = det["x"]; by = det["y"]; bw = det["w"]; bh = det["h"];
-    }
-  }
+  // ─────────────────────────────────────────────────────────
+}
 
-  if (bx < 0) {
-    //Serial.println("[AUTO] Target marker_0' not found — returning");
-    autoStatus = AUTO_WAITING;
-    if (autoState.armPos > 0 && autoState.last_det > 20) {
+// ─────────────────────────────────────────────
+//  autoNoDetection — runs when target label is not found in frame.
+//  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
+//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+// ─────────────────────────────────────────────
+void autoNoDetection() {
+  autoState.last_det += 1;
+
+  // ── USER CODE AREA 2 — runs on no detection ──────────────
+
+  // ─────────────────────────────────────────────────────────
+
+  // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
+  if (autoState.armPos > AUTO_ARM_RESET && autoState.last_det >= 20) {
     //Serial.println("[AUTO] Moving back to default height");
-
-      const PinDef* p = findPinByActionLow("arm_back");
-      if (!p) return;  // defensive: action not found in table
-      setPinActive(*p, LOW_STATE);
-      delay(autoState.armPos);
-      setPinIdle(*p);
-      autoState.armPos = 0;
-    }
-    autoState.last_det += 1;
-    return;
+    int resetDuration = autoState.armPos - AUTO_ARM_RESET;
+    runActionSync("arm_back", resetDuration);
+    autoState.armPos = AUTO_ARM_RESET;
   }
-autoState.last_det = 0;
+}
 
-  // ── 3. Calculate bounding box centre (normalised 0..1) ─────────────────
-  float cx = bx + bw / 2.0f;
-  float cy = by + bh / 2.0f;
+// ─────────────────────────────────────────────
+//  autoOnDetection — runs when target label is found in frame.
+//  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
+//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+//
+//  offsetX: 0=centre, positive=right, negative=left
+//  offsetY: 0=centre, positive=above centre, negative=below centre
+// ─────────────────────────────────────────────
+void autoOnDetection(int offsetX, int offsetY) {
+  autoState.last_det = 0;
 
-  // ── 4. Calculate offset from camera frame centre ───────────────────────
-  //   offsetX: 0=centre, positive=right, negative=left
-  //   offsetY: 0=centre, positive=above centre, negative=below centre
-  int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
-  int offsetY = (int)((0.5f - cy) * 2.0f * 100.0f);
-  // Serial.printf("[AUTO] cx=%.3f cy=%.3f offsetX=%d offsetY=%d armPos=%d turretPos=%d\n",
-  //  cx, cy, offsetX, offsetY, autoState.armPos, autoState.turretPos);
+  // ── USER CODE AREA 3 — runs on detection ─────────────────
+  // Call runActionSync("button", ms) here for any synchronous blocking action.
+  // Code below this area only runs after runActionSync() returns.
+
+  // ─────────────────────────────────────────────────────────
 
   // Available buttons (use in actions[] or startAction/stopAction directly):
   //   Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
@@ -379,18 +403,17 @@ autoState.last_det = 0;
   //   Turntable: "turn_left"  "turn_right"
   //   Arm:       "arm_fwd"(up)  "arm_back"(down)
   //   Aux:       "light"  "test"
-  // TURRET_MAX = 3000, ARM_MAX = 2000
+  // AUTO_TURRET_MAX = 3000, AUTO_ARM_MAX = 2000
   // turretPos = 0, armPos 2000
   std::vector<AutoAction> actions;
-  int DEADZONE = 15;
 
   // Vertical — offsetY drives arm
-  if (abs(offsetY) > DEADZONE) {
+  if (abs(offsetY) > AUTO_DEADZONE) {
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_back (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
       actions.push_back({ "arm_back", 300 });
       autoState.armPos -= 300;
-    } else if (autoState.armPos < ARM_MAX) {
+    } else if (autoState.armPos < AUTO_ARM_MAX) {
       Serial.printf("[AUTO] offsetY=%d → arm_fwd (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
       actions.push_back({ "arm_fwd", 300 });
       autoState.armPos += 300;
@@ -402,12 +425,12 @@ autoState.last_det = 0;
   }
 
   // Horizontal — offsetX drives turret/track
-  if (abs(offsetX) > DEADZONE) {
-    if (offsetX < 0 && autoState.turretPos > -TURRET_MAX) {
+  if (abs(offsetX) > AUTO_DEADZONE) {
+    if (offsetX < 0 && autoState.turretPos > -AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
       actions.push_back({ "right_fwd", 400 });
       //autoState.turretPos -= 300;
-    } else if (autoState.turretPos < TURRET_MAX) {
+    } else if (autoState.turretPos < AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
       actions.push_back({ "right_back", 300 });
       //autoState.turretPos += 300;
@@ -451,6 +474,60 @@ autoState.last_det = 0;
     // stop any that reached maxDuration exactly
     for (int i = 0; i < actionCount; i++)
       if (!stopped[i]) stopAction(String(actions[i].button));
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  processDetection — main autonomous entry point, called per overlay frame.
+// ════════════════════════════════════════════════════════════
+void processDetection(const String& json) {
+  autoStatus = AUTO_BUSY;
+
+  // ── 1. Parse JSON ──────────────────────────────────────────────────────
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, json)) {
+    Serial.println("[AUTO] JSON parse FAILED");
+    autoStatus = AUTO_WAITING; return;
+  }
+  JsonArray detections = doc["detections"].as<JsonArray>();
+  Serial.printf("[AUTO] Detection count: %d\n", detections.size());
+
+  // ── 2. Choose which detection label to follow ──────────────────────────
+  const char* TARGET_LABEL = "marker_0";
+
+  float bx = -1, by = -1, bw = -1, bh = -1;
+  for (JsonObject det : detections) {
+    const char* lbl = det["label"].as<const char*>();
+    // Serial.printf("[AUTO]   label='%s' x=%.3f y=%.3f w=%.3f h=%.3f conf=%.2f\n",
+    //  lbl, det["x"].as<float>(), det["y"].as<float>(),
+    //  det["w"].as<float>(), det["h"].as<float>(), det["confidence"].as<float>());
+    if (strcmp(lbl, TARGET_LABEL) == 0) {
+      bx = det["x"]; by = det["y"]; bw = det["w"]; bh = det["h"];
+    }
+  }
+
+  // ── 3. Calculate bounding box centre and offsets (used by all sub-functions) ──
+  //   offsetX: 0=centre, positive=right, negative=left
+  //   offsetY: 0=centre, positive=above centre, negative=below centre
+  int offsetX = 0, offsetY = 0;
+  if (bx >= 0) {
+    float cx = bx + bw / 2.0f;
+    float cy = by + bh / 2.0f;
+    offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
+    offsetY = (int)((0.5f - cy) * 2.0f * 100.0f);
+    // Serial.printf("[AUTO] cx=%.3f cy=%.3f offsetX=%d offsetY=%d armPos=%d turretPos=%d\n",
+    //  cx, cy, offsetX, offsetY, autoState.armPos, autoState.turretPos);
+  }
+
+  // ── 4. Always runs ─────────────────────────────────────────────────────
+  autoAlways(offsetX, offsetY);
+
+  // ── 5. Branch on detection ─────────────────────────────────────────────
+  if (bx < 0) {
+    //Serial.println("[AUTO] Target 'marker_0' not found — returning");
+    autoNoDetection();
+  } else {
+    autoOnDetection(offsetX, offsetY);
   }
 
   autoStatus = AUTO_WAITING;
