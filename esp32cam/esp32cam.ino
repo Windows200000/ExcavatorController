@@ -361,7 +361,7 @@ void runDetectionAndPush() {
 
   int W = fb->width, H = fb->height;
   if (W == 0 || H == 0) getFrameDims(STREAM_FRAME_SIZE, W, H);
-  Serial.printf("[DET] Frame %dx%d len=%d\n", W, H, fb->len);
+  // Serial.printf("[DET] Frame %dx%d len=%d\n", W, H, fb->len);
 
   const size_t rgbLen = (size_t)W * H * 3;
   uint8_t* rgb = (uint8_t*)heap_caps_malloc(rgbLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -374,7 +374,7 @@ void runDetectionAndPush() {
 
   bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
   esp_camera_fb_return(fb);
-  Serial.printf("[DET] fmt2rgb888: %s\n", decoded ? "OK" : "FAILED");
+  //Serial.printf("[DET] fmt2rgb888: %s\n", decoded ? "OK" : "FAILED");
   if (!decoded) { free(rgb); return; }
 
   std::vector<Detection> detections;
@@ -393,7 +393,7 @@ void runDetectionAndPush() {
           blobCount++;
         }
       }
-    Serial.printf("[RED] blob count=%d (min=%d)\n", blobCount, RED_BLOB_MIN);
+    // Serial.printf("[RED] blob count=%d (min=%d)\n", blobCount, RED_BLOB_MIN);
     if (blobCount >= RED_BLOB_MIN) {
       Detection d;
       d.label = "red_dot";
@@ -419,7 +419,7 @@ void runDetectionAndPush() {
     // ── AprilTag detection ──
     image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = gray };
     zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
-    Serial.printf("[AT] Detections: %d\n", zarray_size(results));
+    // Serial.printf("[AT] Detections: %d\n", zarray_size(results));
     for (int i = 0; i < zarray_size(results); i++) {
       apriltag_detection_t* det;
       zarray_get(results, i, &det);
@@ -471,7 +471,7 @@ void runDetectionAndPush() {
         dbgFrameBuf = jBuf;
         dbgFrameLen = jLen;
         portEXIT_CRITICAL(&dbgMux);
-        Serial.printf("[DBG] Gray frame stashed: %d bytes\n", (int)jLen);
+        // Serial.printf("[DBG] Gray frame stashed: %d bytes\n", (int)jLen);
       }
     }
 
@@ -480,7 +480,7 @@ void runDetectionAndPush() {
   free(rgb);
 
   // ── POST to controller /overlay ──
-  Serial.printf("[DET] Posting %d detection(s)\n", (int)detections.size());
+  // Serial.printf("[DET] Posting %d detection(s)\n", (int)detections.size());
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -495,7 +495,7 @@ void runDetectionAndPush() {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   if (code < 0) Serial.printf("[DET] POST failed: %s\n", http.errorToString(code).c_str());
-  else Serial.printf("[DET] POST /overlay -> HTTP %d\n", code);
+  // else Serial.printf("[DET] POST /overlay -> HTTP %d\n", code);
   http.end();
 }
 

@@ -318,25 +318,11 @@ void processDetection(const String& json) {
   int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
   int offsetY = (int)((cy - 0.5f) * 2.0f * 100.0f);
 
-  // ── 5. DECISION POINT ──────────────────────────────────────────────────
-  // offsetX and offsetY hold the target's position relative to frame centre.
-  // Define actions[] — all actions start simultaneously; each stops after
-  // its own durationMs independently.
-  //
-  // Available button names:
-  //   "spin_left", "spin_right", "fwd", "back",
-  //   "turn_left", "turn_right", "arm_fwd", "arm_back"
-  //
-  // Controls are binary with ~0.5–2 s mechanical delay — keep durations short.
-  //
-  // Example:
-  //   AutoAction actions[] = {
-  //     { "spin_right", 300 },
-  //     { "arm_fwd",    500 },
-  //   };
-  //   int actionCount = sizeof(actions) / sizeof(actions[0]);
 
-  AutoAction actions[] = {};   // <── fill in decision logic here
+
+  AutoAction actions[] = {
+    { "spin_right", 1 },
+  };   // <── fill in decision logic here
   int actionCount = sizeof(actions) / sizeof(actions[0]);
 
   // ── 6. Perform all actions simultaneously, each stops after its own duration ──
