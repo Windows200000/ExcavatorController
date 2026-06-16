@@ -303,24 +303,32 @@ void processDetection(const String& json) {
 
   // ── 1. Parse JSON ──────────────────────────────────────────────────────
   StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, json)) { autoStatus = AUTO_WAITING; return; }
+  if (deserializeJson(doc, json)) {
+    Serial.println("[AUTO] JSON parse FAILED");
+    autoStatus = AUTO_WAITING; return;
+  }
   JsonArray detections = doc["detections"].as<JsonArray>();
+  Serial.printf("[AUTO] Detection count: %d\n", detections.size());
 
   // ── 2. Choose which detection label to follow ──────────────────────────
   const char* TARGET_LABEL = "qr_0";
 
   float bx = -1, by = -1, bw = -1, bh = -1;
   for (JsonObject det : detections) {
-    if (strcmp(det["label"].as<const char*>(), TARGET_LABEL) == 0) {
+    const char* lbl = det["label"].as<const char*>();
+    Serial.printf("[AUTO]   label='%s' x=%.3f y=%.3f w=%.3f h=%.3f conf=%.2f\n",
+      lbl, det["x"].as<float>(), det["y"].as<float>(),
+      det["w"].as<float>(), det["h"].as<float>(), det["confidence"].as<float>());
+    if (strcmp(lbl, TARGET_LABEL) == 0) {
       bx = det["x"]; by = det["y"]; bw = det["w"]; bh = det["h"];
-      break;
     }
   }
+
   if (bx < 0) {
-      autoStatus = AUTO_WAITING;
-      if (autoState.armPos > 1000)
-      return;
-    }  // target not in frame
+    Serial.println("[AUTO] Target 'qr_0' not found — returning");
+    autoStatus = AUTO_WAITING;
+    if (autoState.armPos > 1000) return;
+  }
 
   // ── 3. Calculate bounding box centre (normalised 0..1) ─────────────────
   float cx = bx + bw / 2.0f;
@@ -331,6 +339,9 @@ void processDetection(const String& json) {
   //   offsetY: 0=centre, positive=above centre, negative=below centre
   int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
   int offsetY = (int)((0.5f - cy) * 2.0f * 100.0f);
+  Serial.printf("[AUTO] cx=%.3f cy=%.3f offsetX=%d offsetY=%d armPos=%d turretPos=%d\n",
+    cx, cy, offsetX, offsetY, autoState.armPos, autoState.turretPos);
+
   // Available buttons (use in actions[] or startAction/stopAction directly):
   //   Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
   //   Composite: "fwd"  "back"  "spin_left"  "spin_right"
@@ -341,34 +352,49 @@ void processDetection(const String& json) {
   // turretPos = 0, armPos 2000
   std::vector<AutoAction> actions;
   int DEADZONE = 30;
-  // Vertical
+
+  // Vertical — offsetY drives arm
   if (abs(offsetY) > DEADZONE) {
     if (offsetY > 0 && autoState.armPos > 0) {
+      Serial.printf("[AUTO] offsetY=%d → arm_back (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
       actions.push_back({ "arm_back", 300 });
       autoState.armPos -= 300;
-    } else if (autoState.armPos < ARM_MAX){
+    } else if (autoState.armPos < ARM_MAX) {
+      Serial.printf("[AUTO] offsetY=%d → arm_fwd (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
       actions.push_back({ "arm_fwd", 300 });
       autoState.armPos += 300;
+    } else {
+      Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
     }
+  } else {
+    Serial.printf("[AUTO] offsetY=%d in deadzone — no arm action\n", offsetY);
   }
-  // Horizontal
+
+  // Horizontal — offsetX drives turret/track
   if (abs(offsetX) > DEADZONE) {
     if (offsetX > 0 && autoState.turretPos > -TURRET_MAX) {
+      Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
       actions.push_back({ "right_fwd", 300 });
       autoState.turretPos -= 300;
     } else if (autoState.turretPos < TURRET_MAX) {
+      Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
       actions.push_back({ "right_back", 300 });
       autoState.turretPos += 300;
+    } else {
+      Serial.printf("[AUTO] offsetX=%d but turret at limit (%d)\n", offsetX, autoState.turretPos);
     }
+  } else {
+    Serial.printf("[AUTO] offsetX=%d in deadzone — no turret action\n", offsetX);
   }
 
-
   int actionCount = actions.size();
+  Serial.printf("[AUTO] Total actions queued: %d\n", actionCount);
 
   // ── 6. Perform all actions simultaneously, each stops after its own duration ──
   HeldPin tmpPins[4];
   for (int i = 0; i < actionCount; i++) {
     int c = buttonToHeldPins(String(actions[i].button), tmpPins);
+    Serial.printf("[AUTO] buttonToHeldPins('%s') -> count=%d\n", actions[i].button, c);
     startAction(String(actions[i].button), tmpPins, c);
   }
 
@@ -425,8 +451,14 @@ void handleCamIP() {
 void handleOverlayPost() {
   if (server.hasArg("plain")) {
     overlayJson = server.arg("plain");
-    if (autoEnabled && autoStatus == AUTO_WAITING)
+    Serial.printf("[OVERLAY] Recv len=%d autoEnabled=%d autoStatus=%d\n",
+      overlayJson.length(), autoEnabled, (int)autoStatus);
+    if (autoEnabled && autoStatus == AUTO_WAITING) {
       processDetection(overlayJson);
+    } else {
+      Serial.printf("[OVERLAY] Skipped: autoEnabled=%d autoStatus=%s\n",
+        autoEnabled, autoStatus == AUTO_BUSY ? "BUSY" : "WAITING");
+    }
   }
   server.send(200, "text/plain", "OK");
 }
