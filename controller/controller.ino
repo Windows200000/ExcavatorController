@@ -131,9 +131,10 @@ String camIP = "";
 String overlayJson = "{\"detections\":[]}";
 
 // ─────────────────────────────────────────────
-//  Light toggle state
+//  Toggle states (internally tracked; pulse-based)
 // ─────────────────────────────────────────────
 bool lightOn = false;
+bool testOn  = false;
 
 // ─────────────────────────────────────────────
 //  Autonomous driving
@@ -516,6 +517,23 @@ void handleCmd() {
     return;
   }
 
+  // Test toggle — pulse pin LOW each press, state tracked internally
+  if (btn == "test") {
+    if (action == "press") {
+      testOn = !testOn;
+      for (int i = 0; i < PIN_COUNT; i++) {
+        const PinDef& p = PIN_TABLE[i];
+        if (p.actionLow && String(p.actionLow) == "test") {
+          pulsePin(p, _LOW, PULSE_DURATION_MS);
+          break;
+        }
+      }
+      Serial.printf("[CMD] Test %s\n", testOn ? "ON" : "OFF");
+    }
+    server.send(200, "text/plain", testOn ? "on" : "off");
+    return;
+  }
+
   HeldPin pins[4];
   int count = buttonToHeldPins(btn, pins);
   if (count == 0) { server.send(400, "text/plain", "Unknown button"); return; }
@@ -549,6 +567,7 @@ void handleStatus() {
   doc["uptime"] = millis() / 1000;
   doc["heap"]   = ESP.getFreeHeap();
   doc["light"]  = lightOn;
+  doc["test"]   = testOn;
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -923,7 +942,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
       <button class="ctrl" id="btn-light" data-action="light" data-toggle="1"><span class="icon">&#128161;</span><span class="label">LIGHT</span><span class="key">L</span></button>
     </div>
     <div class="btn-row">
-      <button class="ctrl danger-btn" data-action="test"><span class="icon">&#9312;</span><span class="label">TEST</span><span class="key">T</span></button>
+      <button class="ctrl danger-btn" id="btn-test" data-action="test" data-toggle="1"><span class="icon">&#9312;</span><span class="label">TEST</span><span class="key">T</span></button>
     </div>
   </div>
 </div>
@@ -938,10 +957,12 @@ const OVERLAY_POLL   = 500;
 const CAM_POLL       = 2000;
 const MODE_POLL      = 300;  // poll cam /status for armed/safe
 const AUTO_POLL      = 500;  // poll /auto_status
+const TOGGLE_SYNC_MS = 500;  // delay before re-syncing toggle state from /status
 
 // ── State ──────────────────────────────────────────────────
 let camIP = null;
 let lightToggleOn = false;
+let testToggleOn  = false;
 const activeHolds = {};
 
 // ── Visual model parts map ──────────────────────────────────
@@ -1016,6 +1037,22 @@ function camCmd(c) {
   fetch('/camcmd?cmd=' + c).catch(() => {});
 }
 
+// ── Toggle sync — fetch /status and reconcile both toggles ──
+function syncTogglesFromStatus() {
+  fetch('/status').then(r => r.json()).then(d => {
+    // Light
+    lightToggleOn = !!d.light;
+    const btnLight = document.getElementById('btn-light');
+    if (btnLight) btnLight.classList.toggle('toggle-on', lightToggleOn);
+    if (lightToggleOn) svgActivate('light'); else svgDeactivate('light');
+    // Test
+    testToggleOn = !!d.test;
+    const btnTest = document.getElementById('btn-test');
+    if (btnTest) btnTest.classList.toggle('toggle-on', testToggleOn);
+    if (testToggleOn) svgActivate('test'); else svgDeactivate('test');
+  }).catch(() => {});
+}
+
 // ── Hold logic ──────────────────────────────────────────────
 function startHold(action, isCamAction) {
   if (activeHolds[action]) return;
@@ -1058,11 +1095,8 @@ document.querySelectorAll('button.ctrl').forEach(btn => {
   function onDown(e) {
     e.preventDefault();
     if (isToggle) {
-      lightToggleOn = !lightToggleOn;
-      cmd('light', 'press');
-      btn.classList.toggle('toggle-on', lightToggleOn);
-      svgActivate('light');
-      if (!lightToggleOn) svgDeactivate('light');
+      cmd(action, 'press');
+      setTimeout(syncTogglesFromStatus, TOGGLE_SYNC_MS);
       return;
     }
     if (camAction) startHold(camAction, true);
@@ -1107,9 +1141,9 @@ safetyBadge.addEventListener('click', () => {
 const KEY_MAP = {
   'w':'fwd','s':'back','a':'spin_left','d':'spin_right',
   'ArrowLeft':'turn_left','ArrowRight':'turn_right',
-  'ArrowUp':'arm_fwd','ArrowDown':'arm_back','t':'test',
+  'ArrowUp':'arm_fwd','ArrowDown':'arm_back',
 };
-const TOGGLE_KEYS = new Set(['l']);
+const TOGGLE_KEYS = new Set(['l', 't']);
 const CAM_KEYS    = new Set([' ']);
 const activeKeys  = new Set();
 
@@ -1118,10 +1152,9 @@ document.addEventListener('keydown', ev => {
   ev.preventDefault();
   if (TOGGLE_KEYS.has(ev.key)) {
     if (ev.repeat) return;
-    lightToggleOn = !lightToggleOn;
-    cmd('light', 'press');
-    document.getElementById('btn-light')?.classList.toggle('toggle-on', lightToggleOn);
-    if (lightToggleOn) svgActivate('light'); else svgDeactivate('light');
+    const action = ev.key === 'l' ? 'light' : 'test';
+    cmd(action, 'press');
+    setTimeout(syncTogglesFromStatus, TOGGLE_SYNC_MS);
     return;
   }
   if (CAM_KEYS.has(ev.key)) { if (!ev.repeat) startHold('pump', true); return; }
