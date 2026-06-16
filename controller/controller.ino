@@ -137,6 +137,16 @@ bool lightOn = false;
 bool testOn  = false;
 
 // ─────────────────────────────────────────────
+//  Debug flags — accessible anywhere in firmware
+//  Set via /debug_flags endpoint from the browser header controls
+// ─────────────────────────────────────────────
+bool debugFlag1    = false;  // DBG1 toggle
+bool debugFlag2    = false;  // DBG2 toggle
+bool debugFlag3    = false;  // DBG3 toggle
+bool debugFlag4    = false;  // DBG4 toggle
+int  debugDropdown = 0;      // DBG-DD dropdown, values 0–4 (OPT0..OPT4)
+
+// ─────────────────────────────────────────────
 //  Autonomous driving
 // ─────────────────────────────────────────────
 
@@ -597,6 +607,33 @@ void handleAutoSet() {
   server.send(200, "text/plain", autoEnabled ? "on" : "off");
 }
 
+// ─────────────────────────────────────────────
+//  /debug_flags  GET → returns JSON of all debug flags
+//               POST → updates flags from JSON body, then returns same JSON
+//  JSON shape: {"f1":bool,"f2":bool,"f3":bool,"f4":bool,"dd":int}
+// ─────────────────────────────────────────────
+void handleDebugFlags() {
+  if (server.method() == HTTP_POST && server.hasArg("plain")) {
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, server.arg("plain"))) {
+      if (doc.containsKey("f1")) debugFlag1    = doc["f1"].as<bool>();
+      if (doc.containsKey("f2")) debugFlag2    = doc["f2"].as<bool>();
+      if (doc.containsKey("f3")) debugFlag3    = doc["f3"].as<bool>();
+      if (doc.containsKey("f4")) debugFlag4    = doc["f4"].as<bool>();
+      if (doc.containsKey("dd")) debugDropdown = doc["dd"].as<int>();
+      Serial.printf("[DBG] flags f1=%d f2=%d f3=%d f4=%d dd=%d\n",
+        debugFlag1, debugFlag2, debugFlag3, debugFlag4, debugDropdown);
+    }
+  }
+  String out = String("{\"f1\":") + (debugFlag1 ? "true" : "false") +
+               ",\"f2\":"         + (debugFlag2 ? "true" : "false") +
+               ",\"f3\":"         + (debugFlag3 ? "true" : "false") +
+               ",\"f4\":"         + (debugFlag4 ? "true" : "false") +
+               ",\"dd\":"         + String(debugDropdown) + "}";
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", out);
+}
+
 extern const char INDEX_HTML[] PROGMEM;
 
 // ════════════════════════════════════════════════════════════
@@ -612,16 +649,18 @@ void setup() {
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   Serial.printf("[WIFI] AP started  SSID: %s  IP: %s\n", AP_SSID, AP_IP.toString().c_str());
 
-  server.on("/",           HTTP_GET,  handleRoot);
-  server.on("/register",   HTTP_POST, handleRegister);
-  server.on("/camip",      HTTP_GET,  handleCamIP);
-  server.on("/overlay",    HTTP_GET,  handleOverlayGet);
-  server.on("/overlay",    HTTP_POST, handleOverlayPost);
-  server.on("/cmd",        HTTP_GET,  handleCmd);
-  server.on("/camcmd",     HTTP_GET,  handleCamCmd);
-  server.on("/status",     HTTP_GET,  handleStatus);
-  server.on("/auto_status",HTTP_GET,  handleAutoStatus);
-  server.on("/auto",       HTTP_GET,  handleAutoSet);
+  server.on("/",            HTTP_GET,  handleRoot);
+  server.on("/register",    HTTP_POST, handleRegister);
+  server.on("/camip",       HTTP_GET,  handleCamIP);
+  server.on("/overlay",     HTTP_GET,  handleOverlayGet);
+  server.on("/overlay",     HTTP_POST, handleOverlayPost);
+  server.on("/cmd",         HTTP_GET,  handleCmd);
+  server.on("/camcmd",      HTTP_GET,  handleCamCmd);
+  server.on("/status",      HTTP_GET,  handleStatus);
+  server.on("/auto_status", HTTP_GET,  handleAutoStatus);
+  server.on("/auto",        HTTP_GET,  handleAutoSet);
+  server.on("/debug_flags", HTTP_GET,  handleDebugFlags);
+  server.on("/debug_flags", HTTP_POST, handleDebugFlags);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
   Serial.println("[BOOT] HTTP server started");
@@ -689,6 +728,26 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     padding:2px 8px;cursor:pointer;user-select:none;
     transition:color .2s,border-color .2s;
   }
+
+  /* ── Debug controls in header ── */
+  #debug-controls{display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
+  .dbg-label{
+    font-family:'Share Tech Mono',monospace;font-size:.6rem;color:var(--dim);
+    letter-spacing:.08em;
+  }
+  button.dbg-toggle{
+    font-family:'Share Tech Mono',monospace;font-size:.62rem;font-weight:700;
+    padding:2px 8px;border-radius:4px;border:1px solid var(--border);
+    background:#0d1520;color:var(--dim);cursor:pointer;user-select:none;
+    transition:all .15s;letter-spacing:.06em;
+  }
+  button.dbg-toggle.on{background:#0a1a0a;border-color:var(--green);color:var(--green);}
+  select.dbg-select{
+    font-family:'Share Tech Mono',monospace;font-size:.62rem;
+    padding:2px 4px;border-radius:4px;border:1px solid var(--border);
+    background:#0d1520;color:var(--dim);cursor:pointer;
+  }
+  select.dbg-select:focus{outline:none;border-color:var(--blue);color:var(--blue);}
 
   /* ── Main layout: feed left, model right ── */
   #main-row{
@@ -781,6 +840,21 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     <span id="kbd-hint">WASD=drive &nbsp; &#8592;&#8594;=turret &nbsp; &#8593;&#8595;=arm &nbsp; L=light &nbsp; T=test &nbsp; Space=pump</span>
     <span id="cam-status">CAM: searching&hellip;</span>
     <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
+    <!-- Debug controls -->
+    <div id="debug-controls">
+      <span class="dbg-label">DBG:</span>
+      <button class="dbg-toggle" id="dbg-f1" data-flag="f1">F1</button>
+      <button class="dbg-toggle" id="dbg-f2" data-flag="f2">F2</button>
+      <button class="dbg-toggle" id="dbg-f3" data-flag="f3">F3</button>
+      <button class="dbg-toggle" id="dbg-f4" data-flag="f4">F4</button>
+      <select class="dbg-select" id="dbg-dd">
+        <option value="0">OPT0</option>
+        <option value="1">OPT1</option>
+        <option value="2">OPT2</option>
+        <option value="3">OPT3</option>
+        <option value="4">OPT4</option>
+      </select>
+    </div>
   </div>
 </header>
 
@@ -965,6 +1039,9 @@ let lightToggleOn = false;
 let testToggleOn  = false;
 const activeHolds = {};
 
+// ── Debug flag state (mirrors firmware globals) ─────────────
+const dbgState = { f1: false, f2: false, f3: false, f4: false, dd: 0 };
+
 // ── Visual model parts map ──────────────────────────────────
 const ACTION_SVG = {
   fwd:        ['lt-fill','rt-fill','lt-arrow-fwd','rt-arrow-fwd'],
@@ -1051,6 +1128,50 @@ function syncTogglesFromStatus() {
     if (btnTest) btnTest.classList.toggle('toggle-on', testToggleOn);
     if (testToggleOn) svgActivate('test'); else svgDeactivate('test');
   }).catch(() => {});
+}
+
+// ── Debug flags sync ────────────────────────────────────────
+function applyDbgUI(d) {
+  ['f1','f2','f3','f4'].forEach(k => {
+    dbgState[k] = !!d[k];
+    const btn = document.getElementById('dbg-' + k);
+    if (btn) btn.classList.toggle('on', dbgState[k]);
+  });
+  dbgState.dd = d.dd || 0;
+  const sel = document.getElementById('dbg-dd');
+  if (sel) sel.value = String(dbgState.dd);
+}
+
+function pushDebugFlags() {
+  fetch('/debug_flags', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dbgState)
+  }).then(r => r.json()).then(applyDbgUI).catch(() => {});
+}
+
+function pollDebugFlags() {
+  fetch('/debug_flags').then(r => r.json()).then(applyDbgUI).catch(() => {});
+}
+
+// Wire debug toggle buttons
+['f1','f2','f3','f4'].forEach(k => {
+  const btn = document.getElementById('dbg-' + k);
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    dbgState[k] = !dbgState[k];
+    btn.classList.toggle('on', dbgState[k]);
+    pushDebugFlags();
+  });
+});
+
+// Wire debug dropdown
+const dbgDdEl = document.getElementById('dbg-dd');
+if (dbgDdEl) {
+  dbgDdEl.addEventListener('change', () => {
+    dbgState.dd = parseInt(dbgDdEl.value, 10);
+    pushDebugFlags();
+  });
 }
 
 // ── Hold logic ──────────────────────────────────────────────
@@ -1281,6 +1402,9 @@ function pollOverlay() {
   }).catch(() => {});
 }
 setInterval(pollOverlay, OVERLAY_POLL);
+
+// ── Initial sync ─────────────────────────────────────────────
+pollDebugFlags();
 
 })();
 </script>
