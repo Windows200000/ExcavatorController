@@ -279,7 +279,7 @@ void stopAction(const String& name) {
   if (!h) return;
   for (int i = 0; i < h->pinCount; i++) setPinIdle(*h->pins[i].pin);
   h->active = false;
-  Serial.printf("[CMD] Release '%s'\n", name.c_str());
+  // Serial.printf("[CMD] Release '%s'\n", name.c_str());
 }
 
 // ════════════════════════════════════════════════════════════
