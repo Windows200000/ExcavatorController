@@ -307,17 +307,16 @@ void processDetection(const String& json) {
   if (bx < 0) { autoStatus = AUTO_WAITING; return; }  // target not in frame
 
   // ── 3. Calculate bounding box centre (normalised 0..1) ─────────────────
-  float cx = bx + bw / 2.0f;   // 0 = left edge,  1 = right edge
-  float cy = by + bh / 2.0f;   // 0 = top edge,   1 = bottom edge
+  float cx = bx + bw / 2.0f;
+  float cy = by + bh / 2.0f;
 
   // ── 4. Calculate offset from camera frame centre ───────────────────────
-  // Horizontal range is aspect-ratio-scaled using AUTO_FRAME_W / AUTO_FRAME_H.
-  // For 640x480 (4:3): offsetX range ≈ ±133, offsetY range = ±100.
   //   offsetX: 0=centre, positive=right, negative=left
   //   offsetY: 0=centre, positive=below centre, negative=above centre
   int offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
   int offsetY = (int)((cy - 0.5f) * 2.0f * 100.0f);
-
+  //   "spin_left", "spin_right", "fwd", "back",
+  //   "turn_left", "turn_right", "arm_fwd", "arm_back"
 
 
   AutoAction actions[] = {
