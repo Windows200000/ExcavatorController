@@ -499,6 +499,7 @@ const uint32_t    DETECTION_INTERVAL_MS = 500;             // AprilTag detection
 const uint32_t    SNAPSHOT_FACTOR       = 4;               // snapshots per detection cycle
 // Derived — do not change directly:
 const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;  // 125 ms → ~8 fps
+const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;          // CPU task stats printed every 10 s
 ```
 
 ### Pixel Format
@@ -535,6 +536,36 @@ With `PIXFORMAT_GRAYSCALE` and no concurrent stream task grabbing frames, two sl
 
 Detection always preempts snapshot capture on Core 0. Stream serving and HTTP handling run independently on Core 1.
 
+### CPU Run-Time Stats
+
+`printTopCpuTasks()` runs every `CPU_REPORT_INTERVAL_MS` (10 s) from `loop()`. Uses `uxTaskGetSystemState()` + `TaskStatus_t.xCoreID` — no `vTaskGetRunTimeStats()` string parsing. Percentages are **cumulative since boot**, not a rolling window.
+
+Hardcoded watched tasks (top 5 most demanding, analyzed from sketch + ESP32 Arduino runtime):
+
+| Task name | Core | Priority | Why watched |
+|-----------|------|----------|-------------|
+| `det_task` | 0 | 2 | AprilTag detect + HTTP POST — heaviest compute |
+| `snap_task` | 0 | 1 | `frame2jpg` encode each snapshot |
+| `stream_task` | 1 | 1 | MJPEG write per connected client |
+| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` (ESP32 Arduino runtime name) |
+| `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker |
+
+Serial output format (one line per task, printed every 10 s):
+
+```
+[CPU] ══ Top-5 Task CPU Report ══
+[CPU]  det_task      core=0     X.X%  ticks=NNNN
+[CPU]  snap_task     core=0     X.X%  ticks=NNNN
+[CPU]  stream_task   core=1     X.X%  ticks=NNNN
+[CPU]  loopTask      core=1     X.X%  ticks=NNNN
+[CPU]  tiT           core=0     X.X%  ticks=NNNN
+[CPU] ════════════════════════════
+```
+
+If a task is not running (e.g. no stream client connected), the line prints `not found`.
+
+> **Note:** `stream_task` is spawned per client — if multiple stream clients connect simultaneously, only the first matching task name is reported, not a sum. `totalRunTime` covers both cores combined on ESP32 FreeRTOS, so per-core % values may not sum to 100%.
+
 ### AprilTag Detection
 
 Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JSON to the controller's `/overlay` endpoint.
@@ -569,6 +600,11 @@ Detection result JSON schema:
 ```
 
 **Detection labels:** `marker_<id>` where `<id>` is the raw integer from the `tag16h5` dictionary (IDs 0–29).
+
+**Confidence / skip log behaviour:**
+- Detections with `confidence >= MARKER_CONFIDENCE_CUTOFF` (50%) are accepted and pushed.
+- Detections with `5% < confidence < 50%` log a `[AT] SKIPPING` line — tag is visible but weak.
+- Detections with `confidence <= 5%` are silently discarded — treated as noise, not logged, to avoid serial spam.
 
 **Performance notes:**
 - `quad_decimate = 4.0` reduces the quad search to 160×120 — the primary speed lever. Revert to 2.0 if detection range needs to increase.
@@ -615,8 +651,9 @@ setup():
 loop() [Core 1, priority 0]:
   server.handleClient()
   if pumpActive and timeout: pumpOff()
-  if millis() - lastSnapshotMs  >= SNAPSHOT_INTERVAL_MS:  notify snap_task
-  if millis() - lastDetectionMs >= DETECTION_INTERVAL_MS: notify det_task
+  if millis() - lastCpuReportMs  >= CPU_REPORT_INTERVAL_MS: printTopCpuTasks()
+  if millis() - lastSnapshotMs   >= SNAPSHOT_INTERVAL_MS:  notify snap_task
+  if millis() - lastDetectionMs  >= DETECTION_INTERVAL_MS: notify det_task
 ```
 
 ---
