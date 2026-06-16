@@ -13,7 +13,7 @@ This document describes the full firmware architecture for a two-module wireless
 | Module | Hardware | Role |
 |--------|----------|------|
 | Controller | Berrybase NodeMCU-ESP32 | WiFi AP · Web console · GPIO button driver · Overlay store |
-| Camera | Joy-IT SBC-ESP32-Cam | WiFi client · MJPEG streamer · Image processing · Overlay pusher |
+| Camera | Joy-IT SBC-ESP32-Cam | WiFi client · Snapshot-based MJPEG streamer · Image processing · Overlay pusher |
 
 ---
 
@@ -40,7 +40,7 @@ All three parties communicate over the single `ExcavatorAP` network. The browser
 ### Camera Feed
 
 ```
-ESP32-CAM  ->  /stream (MJPEG)  ->  Browser <img> tag
+ESP32-CAM  ->  /stream (snapshot-based MJPEG)  ->  Browser <img> tag
 ```
 
 ### Detection Overlay
@@ -75,7 +75,7 @@ Browser (pump / mode actions)
 Browser  ->  GET http://<camIP>/status  ->  { mode, pumpActive }  ->  SAFE/ARMED badge
 ```
 
-### Autonomous Action (future)
+### Autonomous Action
 
 ```
 ESP32-CAM  ->  POST /overlay (detections)  ->  Controller
@@ -344,7 +344,6 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 #### Overlay Canvas
 
 The browser polls `/overlay` every 500 ms. Detection boxes are drawn with label and confidence percentage:
-- `red_dot` → red (`#ff3030`)
 - `qr_*` (AprilTag) → cyan (`#00e5ff`)
 - Everything else → amber (`#f0a500`)
 
@@ -377,7 +376,7 @@ loop():
 
 ## Camera Module – Joy-IT SBC-ESP32-Cam
 
-The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller's WiFi AP as a client, streams MJPEG video, runs on-device image processing, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
+The camera module runs on the Joy-IT SBC-ESP32-Cam (AI-Thinker ESP32-CAM). It connects to the controller's WiFi AP as a client, streams MJPEG video via a snapshot-based architecture, runs on-device AprilTag detection, and pushes detection overlays to the controller. It also exposes pump control and safe/armed mode endpoints, which the controller relays to from the browser.
 
 > Select `AI Thinker ESP32-CAM` in Arduino IDE under Tools -> Board -> ESP32 Arduino.
 
@@ -452,140 +451,90 @@ To put the device into flash mode: connect **IO0 to GND** before power-on. Remov
 | U0T (IO1) | RX |
 | U0R (IO3) | TX |
 
-### Stream / Quality Constants
+### Timing Constants
 
 ```cpp
-const framesize_t STREAM_FRAME_SIZE = FRAMESIZE_VGA;      // 640×480
-const framesize_t SNAP_FRAME_SIZE   = FRAMESIZE_VGA;      // 640×480
-const uint8_t     JPEG_QUALITY      = 12;                 // 0 = best ... 63 = worst; 10-15 sweet spot
-const int         STREAM_DELAY_MS   = 0;                  // extra inter-frame delay (ms)
+const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;   // 640×480
+const uint8_t     JPEG_QUALITY          = 12;              // 0=best … 63=worst
+const uint32_t    DETECTION_INTERVAL_MS = 500;             // AprilTag detection cycle
+const uint32_t    SNAPSHOT_FACTOR       = 4;               // snapshots per detection cycle
+// Derived — do not change directly:
+const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;  // 125 ms → ~8 fps
 ```
 
 ### Pixel Format
 
-The camera is initialised with `PIXFORMAT_JPEG`. The MJPEG stream sends frames directly. For detection, `fmt2rgb888()` decodes each JPEG frame into a raw RGB888 buffer in PSRAM before colour thresholding or AprilTag preprocessing. This avoids keeping a second raw frame buffer resident at all times.
+The camera is initialised with `PIXFORMAT_GRAYSCALE`. The camera driver outputs raw single-byte-per-pixel grayscale data directly in `fb->buf`. No JPEG decode step (`fmt2rgb888`) is needed — the buffer is passed directly to AprilTag's `image_u8_t`. JPEG encoding happens only at snapshot time (`frame2jpg`) to produce frames for the MJPEG stream.
 
-### `/snapshot` Endpoint
+### Snapshot-Based MJPEG Stream
 
-`handleSnapshot()` checks `fb->format` before encoding:
-- If `PIXFORMAT_JPEG`: `fb->buf` sent directly via `send_P`; `fb` returned before the send to free the buffer slot for the stream task sooner.
-- Otherwise: `frame2jpg()` called with `JPEG_QUALITY` to convert raw pixel data to JPEG, then buffer is freed after send.
+There is no continuous stream task grabbing frames. Instead:
 
-`frame2jpg()` expects raw pixel data (RGB/YUV). Calling it on an already-JPEG frame produces corrupted output and must be avoided.
+1. A **snapshot task** (`snap_task`, Core 0, priority 1) is notified every `SNAPSHOT_INTERVAL_MS` from `loop()`.
+2. Each notification: `esp_camera_fb_get()` → `frame2jpg()` → result stored in `streamFrameBuf` under a mutex → `esp_camera_fb_return()`.
+3. A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It copies `streamFrameBuf` under the mutex and sends it as an MJPEG multipart frame. If no frame is stashed yet, it waits 10 ms and retries.
+4. The MJPEG multipart format (`multipart/x-mixed-replace; boundary=frame`) is unchanged — no changes required in the controller or browser.
 
-### Concurrent Stream and Detection
+At `SNAPSHOT_INTERVAL_MS = 125 ms` the stream delivers approximately **8 fps** to the browser.
 
-The MJPEG stream runs in a dedicated FreeRTOS task (pinned to core 1). Detection runs in `loop()` on core 1 as well, every `DETECTION_INTERVAL_MS`. Both call `esp_camera_fb_get()` independently. With `fb_count = 2` (PSRAM path), the camera driver maintains two frame buffer slots and hands them out to concurrent callers without conflict. Detection is only suppressed while the pump is actively firing (`!pumpActive`) to avoid contention during a critical actuation window.
-
-```cpp
-const uint32_t DETECTION_INTERVAL_MS = 500;   // Detection runs every 500 ms, independent of stream state
-```
-
-### Image Processing
-
-Detection runs on-device at `DETECTION_INTERVAL_MS` intervals. Results are POSTed as JSON to the controller's `/overlay` endpoint:
+### fb_count
 
 ```cpp
-struct Detection {
-  String label;
-  float  x, y, w, h;   // normalised 0..1, top-left origin
-  float  confidence;
-};
+config.fb_count = psramFound() ? 2 : 1;
 ```
+
+With `PIXFORMAT_GRAYSCALE` and no concurrent stream task grabbing frames, two slots are sufficient. The snapshot task and detection task both run on Core 0 and are notified sequentially from `loop()`, so they do not compete for slots simultaneously.
+
+### Task Priorities
+
+| Task | Core | Priority | Role |
+|------|------|----------|------|
+| `det_task` | 0 | 2 (highest) | AprilTag detection + POST to controller |
+| `snap_task` | 0 | 1 | Grayscale capture + JPEG encode for stream |
+| `stream_task` | 1 | 1 | MJPEG frame serve per connected client |
+| `loop()` / `handleClient()` | 1 | 0 | HTTP request handling, timer dispatch |
+
+Detection always preempts snapshot capture on Core 0. Stream serving and HTTP handling run independently on Core 1.
+
+### AprilTag Detection
+
+Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JSON to the controller's `/overlay` endpoint.
+
+**Detector configuration** (set once in `initAprilTag()`):
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `quad_decimate` | 4.0 | Downsample 4× before quad detection — processes 160×120 internally, significantly faster than 2.0 |
+| `quad_sigma` | 0.0 | No blur |
+| `nthreads` | 1 | ESP32 single-core detection task |
+| `refine_edges` | 1 | Sub-pixel edge refinement |
+| `debug` | 0 | No debug image output |
+
+**Processing steps:**
+1. `esp_camera_fb_get()` — grayscale frame, `fb->buf` is raw bytes, one per pixel
+2. Wrap directly in `image_u8_t { .width=W, .height=H, .stride=W, .buf=fb->buf }` — no decode needed
+3. `apriltag_detector_detect()` — AprilTag runs its own adaptive binarization internally
+4. For each result: extract bounding box from four corner points, populate `Detection` with label `"marker_<id>"`, normalised coords, `decision_margin / 100.0` as confidence
+5. `apriltag_detections_destroy()`, `esp_camera_fb_return(fb)`
+6. POST `detections` JSON to `/overlay`
 
 Detection result JSON schema:
 
 ```json
 {
   "detections": [
-    { "label": "red_dot", "x": 0.30, "y": 0.20, "w": 0.10, "h": 0.15, "confidence": 0.87 },
-    { "label": "qr_7",    "x": 0.42, "y": 0.18, "w": 0.22, "h": 0.29, "confidence": 0.81 }
+    { "label": "marker_0", "x": 0.42, "y": 0.18, "w": 0.22, "h": 0.29, "confidence": 0.81 }
   ],
   "ts": 12345
 }
 ```
 
-#### Red Dot Detection (RGB888 Colour Thresholding)
-
-The active colour detector finds a bright red dot using per-pixel RGB888 thresholding followed by a simple bounding-box blob finder. The JPEG frame is decoded to RGB888 via `fmt2rgb888()` before thresholding.
-
-**Thresholds** (tuned for a bright red dot, 8-bit per channel):
-
-| Channel | Threshold | Rationale |
-|---------|-----------|-----------|
-| R | > 160 | Saturated red |
-| G | < 80 | Low green |
-| B | < 80 | Low blue |
-
-**Blob finder**: Iterates all pixels, accumulates a bounding box (`bx1`, `by1`, `bx2`, `by2`) and pixel count for matching pixels. If `blobCount >= 30`, a `Detection` is emitted with label `"red_dot"`, normalised bounding box coordinates, and confidence scaled as `min(1.0, blobCount / 500.0)`.
-
-**Serial output** on detection:
-```
-[RED] Detected @ (x,y) size WxH conf=C
-```
-
-#### AprilTag Detection (tag16h5, raspiduino/apriltag-esp32)
-
-AprilTag detection (family `tag16h5`) is used for marker-based target recognition and positioning. The library is [raspiduino/apriltag-esp32](https://github.com/raspiduino/apriltag-esp32), installed from ZIP in Arduino IDE.
-
-**Detector configuration** (set once in `initAprilTag()`):
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `quad_decimate` | 2.0 | Downsample 2× before quad detection — faster, fine at VGA |
-| `quad_sigma` | 0.0 | No blur — camera is already soft enough |
-| `nthreads` | 1 | ESP32 single-core detection task |
-| `refine_edges` | 1 | Sub-pixel edge refinement — worth it for low-res images |
-| `debug` | 0 | No debug image output |
-
-**Processing steps:**
-1. Capture JPEG frame and decode to RGB888 via `fmt2rgb888()`
-2. Build grayscale buffer: plain BT.601 luma (`(r*77 + g*150 + b*29) >> 8`) by default. Set `GRAY_ACHROMATIC_FILTER = true` to instead map coloured pixels to 255 before detection (legacy ArUco behaviour; generally not needed — AprilTag's adaptive binarization handles colour noise internally)
-3. Wrap in `image_u8_t` and call `apriltag_detector_detect()`
-4. For each result: extract bounding box from the four corner points (`det->p[0..3]`), populate a `Detection` with label `"qr_<id>"`, normalised coords, and `decision_margin / 100.0` as confidence
-5. Call `apriltag_detections_destroy()` to free library-allocated results
-
-**Grayscale filter constants:**
-
-```cpp
-const bool    GRAY_ACHROMATIC_FILTER = false;  // false = plain luma (recommended)
-const uint8_t GRAY_SAT_MAX           = 30;     // saturation threshold (used only when filter = true)
-```
-
-**Serial output** on detection:
-```
-[AT] Detections: N
-[AT] ID N @ (x,y) size WxH margin=M
-```
-
-**Detection labels:** `qr_<id>` where `<id>` is the raw integer from the `tag16h5` dictionary (IDs 0–29, 30 valid tags).
+**Detection labels:** `marker_<id>` where `<id>` is the raw integer from the `tag16h5` dictionary (IDs 0–29).
 
 **Performance notes:**
-- `quad_decimate = 2.0` halves the resolution before quad detection — the primary speed lever. Increase to `4.0` if heap/CPU is tight.
+- `quad_decimate = 4.0` reduces the quad search to 160×120 — the primary speed lever. Revert to 2.0 if detection range needs to increase.
 - `refine_edges = 1` recovers sub-pixel accuracy after decimation; recommended at VGA.
-- AprilTag's internal adaptive thresholding handles most lighting conditions without a pre-filter.
-
-**Known limitations:**
-- Designed for one or a few markers in frame at moderate distance
-- Very small markers (< ~40 px per side after decimation) may not be detected reliably
-- RAM usage: the library allocates intermediate buffers from heap; PSRAM allocation path in `runDetectionAndPush()` is used for the gray buffer
-
-#### Extension Points
-
-1. Capture frame suited to algorithm (`STREAM_FRAME_SIZE` for all current detectors)
-2. Run detection algorithm
-3. Populate the `detections` vector with `Detection` structs
-4. JSON serialisation and POST to `/overlay` are reused unchanged
-
-Current algorithms:
-- Colour thresholding for `red_dot` (implemented)
-- AprilTag `tag16h5` marker tracking for `qr_N` IDs (implemented, raspiduino/apriltag-esp32)
-
-Future candidates:
-- Multi-colour blob tracking
-- TFLite Micro model inference
-- Optical flow / motion tracking
-- Multi-family AprilTag support (e.g. `tag36h11`)
+- With `PIXFORMAT_GRAYSCALE`, the ~80–200 ms JPEG decode step (`fmt2rgb888`) is eliminated entirely.
 
 ### Pump Control
 
@@ -605,8 +554,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/stream` | MJPEG multipart stream (live, full FPS) |
-| `GET` | `/snapshot` | Single JPEG at `SNAP_FRAME_SIZE` |
+| `GET` | `/stream` | Snapshot-based MJPEG multipart stream (~8 fps) |
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
@@ -616,49 +564,44 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 ```
 setup():
-  initCamera()          <- PIXFORMAT_JPEG, fb_count=2 (PSRAM)
-  initAprilTag()        <- tag16h5 family, quad_decimate=2.0, refine_edges=1
+  initCamera()          <- PIXFORMAT_GRAYSCALE, fb_count=2 (PSRAM)
+  initAprilTag()        <- tag16h5 family, quad_decimate=4.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
+  start det_task        <- Core 0, priority 2; notified every DETECTION_INTERVAL_MS
+  start snap_task       <- Core 0, priority 1; notified every SNAPSHOT_INTERVAL_MS
   register HTTP routes
   server.begin()
 
-loop():
+loop() [Core 1, priority 0]:
   server.handleClient()
-  // pump heartbeat watchdog
   if pumpActive and timeout: pumpOff()
-  // detection — runs independently of stream; suppressed only while pump is active
-  if (!pumpActive && millis() - lastDetectionMs >= DETECTION_INTERVAL_MS):
-    runDetectionAndPush()   // posts detection JSON to controller /overlay
+  if millis() - lastSnapshotMs  >= SNAPSHOT_INTERVAL_MS:  notify snap_task
+  if millis() - lastDetectionMs >= DETECTION_INTERVAL_MS: notify det_task
 ```
 
 ---
 
 ## Future: Automatic Action
 
-The detection overlay pipeline is designed to support future autonomous operation:
+The detection overlay pipeline is designed to support autonomous operation:
 
 - Detections from on-device image processing are already available on the controller via `/overlay`
 - The controller can read these detections in `loop()` and autonomously issue `setPinActive` / `setPinIdle` calls without browser involvement
-- The **SAFE / ARMED** mode gate on the cam ensures the pump (and by extension any autonomous actuator) cannot operate until explicitly armed
-- The controller is the single decision-maker: the cam detects and reports, the controller acts. This keeps all actuation logic in one place.
+- The **SAFE / ARMED** mode gate on the cam ensures the pump cannot operate until explicitly armed
+- The controller is the single decision-maker: the cam detects and reports, the controller acts.
 
 ### Auto-Drive Status
 
-The controller exposes `/auto_status` — polled by the browser every 500 ms. When `autoEnabled` is false the status reads `"waiting_for_detection"` as a neutral idle state. When a detection triggers autonomous actuation, status switches to `"performing_action"` for the duration of the blocking action sequence, then returns to `"waiting_for_detection"`. The dashboard displays this live so the operator always knows whether the controller is idle or actively executing a move.
+The controller exposes `/auto_status` — polled by the browser every 500 ms. When `autoEnabled` is false the status reads `"waiting_for_detection"`. When a detection triggers autonomous actuation, status switches to `"performing_action"` for the duration of the blocking action sequence, then returns to `"waiting_for_detection"`.
 
 A practical first autonomous mode for this project is **marker-guided seek-and-shoot**:
 
-1. Camera detects an AprilTag marker and reports `qr_N` with normalised bounding box
+1. Camera detects an AprilTag marker and reports `marker_N` with normalised bounding box
 2. Controller reads detection centre X position from `/overlay`
 3. Controller steers left or right until marker is centred in frame
 4. When marker is centred and confidence is high enough, controller can stop drive motion and activate the pump
-5. All actuation still remains gated by SAFE / ARMED mode and controlled only by the controller
-
-Suggested detection algorithms now implemented:
-- Colour thresholding (`red_dot`) — simple, implemented
-- AprilTag `tag16h5` marker tracking (`qr_N`) — positioning and target ID, implemented (raspiduino/apriltag-esp32)
-- TFLite Micro model inference — future object recognition
+5. All actuation remains gated by SAFE / ARMED mode and controlled only by the controller
 
 ---
 
