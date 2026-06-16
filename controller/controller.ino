@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <vector>
 
 // ─────────────────────────────────────────────
 //  WiFi AP credentials
@@ -153,6 +154,7 @@ AutoStatus_t autoStatus = AUTO_WAITING;
 // ─────────────────────────────────────────────
 struct AutoState {
   int32_t turretPos = 0;   // estimated turntable position; increment/decrement as turn_left/right are issued
+  int32_t armPos = 2000;     //from Bottom
   // int phase = 0;    // example: add a phase/step counter like this
 } autoState;
 
@@ -295,6 +297,8 @@ void relayCamCmd(const String& path) {
 //  Autonomous detection handler
 // ════════════════════════════════════════════════════════════
 void processDetection(const String& json) {
+  int TURRET_MAX = 3000; // both directions
+  int ARM_MAX = 2000; // starts down, arm fwd = arm up
   autoStatus = AUTO_BUSY;
 
   // ── 1. Parse JSON ──────────────────────────────────────────────────────
@@ -312,7 +316,11 @@ void processDetection(const String& json) {
       break;
     }
   }
-  if (bx < 0) { autoStatus = AUTO_WAITING; return; }  // target not in frame
+  if (bx < 0) {
+      autoStatus = AUTO_WAITING;
+      if (autoState.armPos > 1000)
+      return;
+    }  // target not in frame
 
   // ── 3. Calculate bounding box centre (normalised 0..1) ─────────────────
   float cx = bx + bw / 2.0f;
@@ -327,17 +335,35 @@ void processDetection(const String& json) {
   //   Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
   //   Composite: "fwd"  "back"  "spin_left"  "spin_right"
   //   Turntable: "turn_left"  "turn_right"
-  //   Arm:       "arm_fwd"  "arm_back"
+  //   Arm:       "arm_fwd"(up)  "arm_back"(down)
   //   Aux:       "light"  "test"
-  // Access persistent state via autoState.turretPos (etc.)
-  int turret_max = 3000
-  int deadzone = 0.3
-  
+  // TURRET_MAX = 3000, ARM_MAX = 2000
+  // turretPos = 0, armPos 2000
+  std::vector<AutoAction> actions;
+  int DEADZONE = 30;
+  // Vertical
+  if (abs(offsetX) > DEADZONE) {
+    if (offsetX > 0 && autoState.armPos > 0) {
+      actions.push_back({ "arm_down", 300 });
+      autoState.armPos -= 300;
+    } else if (autoState.armPos < ARM_MAX){
+      actions.push_back({ "arm_up", 300 });
+      autoState.armPos += 300;
+    }
+  }
+  // Horizontal
+  if (abs(offsetY) > DEADZONE) {
+    if (offsetY > 0 && autoState.turretPos > -TURRET_MAX) {
+      actions.push_back({ "right_fwd", 300 });
+      autoState.turretPos -= 300;
+    } else if (autoState.turretPos < TURRET_MAX) {
+      actions.push_back({ "right_back", 300 });
+      autoState.turretPos += 300;
+    }
+  }
 
-  AutoAction actions[] = {
-    { "spin_right", 1 },
-  };   // <── fill in decision logic here
-  int actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  int actionCount = actions.size();
 
   // ── 6. Perform all actions simultaneously, each stops after its own duration ──
   HeldPin tmpPins[4];
@@ -352,7 +378,7 @@ void processDetection(const String& json) {
 
   if (maxDuration > 0) {
     uint32_t actionStart = millis();
-    bool stopped[MAX_HELD] = {};
+    bool stopped[actionCount] = {};
 
     while (millis() - actionStart < maxDuration) {
       uint32_t elapsed = millis() - actionStart;
