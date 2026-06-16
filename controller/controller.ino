@@ -311,7 +311,7 @@ void processDetection(const String& json) {
   Serial.printf("[AUTO] Detection count: %d\n", detections.size());
 
   // ── 2. Choose which detection label to follow ──────────────────────────
-  const char* TARGET_LABEL = "qr_0";
+  const char* TARGET_LABEL = "marker_0";
 
   float bx = -1, by = -1, bw = -1, bh = -1;
   for (JsonObject det : detections) {
@@ -325,7 +325,7 @@ void processDetection(const String& json) {
   }
 
   if (bx < 0) {
-    Serial.println("[AUTO] Target 'qr_0' not found — returning");
+    Serial.println("[AUTO] Target marker_0' not found — returning");
     autoStatus = AUTO_WAITING;
     if (autoState.armPos > 1000) return;
   }
@@ -1232,7 +1232,7 @@ function drawOverlay(detections) {
   detections.forEach(d => {
     const x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
     const isRedDot = d.label === 'red_dot';
-    const isMarker = d.label.startsWith('qr_');
+    const isMarker = d.label.startsWith('marker_');
     const color = isRedDot ? '#ff3030' : (isMarker ? '#00e5ff' : '#f0a500');
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
