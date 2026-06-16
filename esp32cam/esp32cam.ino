@@ -6,6 +6,11 @@
  * Pixel format: PIXFORMAT_GRAYSCALE — no JPEG decode needed for detection.
  * Stream: snapshot-based MJPEG. Snapshots taken at DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR.
  * Detection runs every DETECTION_INTERVAL_MS on the latest grayscale frame.
+ *
+ * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
+ *   Uses uxTaskGetSystemState() — reports runtime % and core for 5 hardcoded tasks:
+ *   det_task, snap_task, stream_task, loopTask, tiT.
+ *   Percentages are cumulative since boot (not rolling window).
  */
 
 #include "esp_camera.h"
@@ -16,6 +21,9 @@
 #include <vector>
 #include <apriltag.h>
 #include <tag16h5.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <string.h>
 
 struct Detection {
   String label;
@@ -58,13 +66,16 @@ const uint32_t    SNAPSHOT_FACTOR       = 4;  // snapshots per detection cycle
 // Snapshot fires every DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR ms
 const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
 
+const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;  // print CPU stats every 10 s
+
 WebServer server(80);
 
 apriltag_detector_t* atDetector = nullptr;
 apriltag_family_t*   atFamily   = nullptr;
 
-uint32_t lastDetectionMs = 0;
-uint32_t lastSnapshotMs  = 0;
+uint32_t lastDetectionMs  = 0;
+uint32_t lastSnapshotMs   = 0;
+uint32_t lastCpuReportMs  = 0;
 
 enum CamMode { MODE_SAFE, MODE_ARMED };
 CamMode camMode = MODE_SAFE;
@@ -80,6 +91,79 @@ static portMUX_TYPE streamMux      = portMUX_INITIALIZER_UNLOCKED;
 // ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
 TaskHandle_t snapshotTaskHandle  = NULL;
+
+// ════════════════════════════════════════════════════════════
+//  CPU profiling — top-5 hardcoded tasks
+//
+//  Uses uxTaskGetSystemState() to get per-task runtime counters.
+//  Hardcoded task names (analyzed from sketch + ESP32 Arduino runtime):
+//    det_task    — Core 0, prio 2 — AprilTag detect + HTTP POST (heaviest)
+//    snap_task   — Core 0, prio 1 — frame2jpg encode
+//    stream_task — Core 1, prio 1 — MJPEG write per client (first instance only)
+//    loopTask    — Core 1, prio 1 — Arduino loop() / handleClient
+//    tiT         — Core 0, prio 18 — lwIP / WiFi TCP stack
+//
+//  % values are cumulative since boot, not a rolling window.
+//  stream_task: only first matching task reported if multiple stream clients active.
+// ════════════════════════════════════════════════════════════
+struct CpuWatchTask {
+  const char* exactName;
+};
+
+static const CpuWatchTask CPU_WATCH_TOP5[5] = {
+  { "det_task"    },
+  { "snap_task"   },
+  { "stream_task" },
+  { "loopTask"    },
+  { "tiT"         }
+};
+
+void printTopCpuTasks() {
+  UBaseType_t taskCount = uxTaskGetNumberOfTasks();
+  if (taskCount == 0) { Serial.println("[CPU] No tasks"); return; }
+
+  TaskStatus_t* taskStatus = (TaskStatus_t*)malloc(taskCount * sizeof(TaskStatus_t));
+  if (!taskStatus) { Serial.println("[CPU] malloc failed"); return; }
+
+  uint32_t totalRunTime = 0;
+  UBaseType_t actualCount = uxTaskGetSystemState(taskStatus, taskCount, &totalRunTime);
+  if (actualCount == 0 || totalRunTime == 0) {
+    Serial.println("[CPU] Stats unavailable (totalRunTime=0 — configGENERATE_RUN_TIME_STATS may be off)");
+    free(taskStatus);
+    return;
+  }
+
+  Serial.println("[CPU] ══ Top-5 Task CPU Report ══");
+  for (int i = 0; i < 5; i++) {
+    bool found = false;
+    for (UBaseType_t j = 0; j < actualCount; j++) {
+      if (strcmp(taskStatus[j].pcTaskName, CPU_WATCH_TOP5[i].exactName) == 0) {
+        uint32_t pct10 = (uint32_t)(((uint64_t)taskStatus[j].ulRunTimeCounter * 1000ULL) / totalRunTime);
+        BaseType_t core = taskStatus[j].xCoreID;
+        if (core == tskNO_AFFINITY) {
+          Serial.printf("[CPU]  %-12s  core=any  %2lu.%lu%%  ticks=%lu\n",
+            CPU_WATCH_TOP5[i].exactName,
+            (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
+            (unsigned long)taskStatus[j].ulRunTimeCounter);
+        } else {
+          Serial.printf("[CPU]  %-12s  core=%ld    %2lu.%lu%%  ticks=%lu\n",
+            CPU_WATCH_TOP5[i].exactName,
+            (long)core,
+            (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
+            (unsigned long)taskStatus[j].ulRunTimeCounter);
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      Serial.printf("[CPU]  %-12s  not found\n", CPU_WATCH_TOP5[i].exactName);
+    }
+  }
+  Serial.println("[CPU] ════════════════════════════");
+
+  free(taskStatus);
+}
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
@@ -271,6 +355,9 @@ void handleStatus() {
 //  PIXFORMAT_GRAYSCALE: fb->buf is raw grayscale bytes — passed directly to
 //  image_u8_t. No fmt2rgb888 decode. No red dot detection.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
+//
+//  Skip log: only printed when confidence > 5.0 (i.e. tag visible but weak).
+//  Sub-5% detections are noise — not logged to avoid serial spam.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   camera_fb_t* fb = esp_camera_fb_get();
@@ -301,8 +388,11 @@ void runDetectionAndPush() {
     }
     float confidence = det->decision_margin;
     if (confidence < MARKER_CONFIDENCE_CUTOFF) {
-      Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%.1f\n",
-                    det->id, confidence, MARKER_CONFIDENCE_CUTOFF);
+      // Only log skip if confidence is meaningfully above noise floor (>5%)
+      if (confidence > 5.0f) {
+        Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%.1f\n",
+                      det->id, confidence, MARKER_CONFIDENCE_CUTOFF);
+      }
     } else {
       Detection d;
       d.label      = "marker_" + String(det->id);
@@ -427,6 +517,11 @@ void loop() {
   }
 
   uint32_t now = millis();
+
+  if ((now - lastCpuReportMs) >= CPU_REPORT_INTERVAL_MS) {
+    lastCpuReportMs = now;
+    printTopCpuTasks();
+  }
 
   if ((now - lastSnapshotMs) >= SNAPSHOT_INTERVAL_MS) {
     lastSnapshotMs = now;
