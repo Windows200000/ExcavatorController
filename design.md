@@ -158,7 +158,7 @@ Pin definitions use a unified `PinDef` struct. Every GPIO is described by an exp
 - `HiZ`  → `pinMode(INPUT)` — floating / high-impedance
 
 ```cpp
-enum PinState_t { HIGH_STATE, LOW_STATE, HIZ_STATE };
+enum PinState_t { _HIGH, _LOW, _HiZ };
 
 struct PinDef {
   int         gpio;
@@ -195,23 +195,32 @@ The excavator tracks are driven through a single N-channel MOSFET per track. One
 - Drain → ESP32 GPIO  
 - Source → Excavator remote "P" for pair. It goes to the remote mistery chip and 2 buttons - one connected to ground and the other to S. It has a pullup. If directly driven to 0, it triggers the Button connected to ground.
 
-### Pin Table
+### Pin Table ("Weirdo Mode" — current wiring)
+
+The current wiring uses **separate GPIOs per direction** rather than one GPIO per axis in the classic MOSFET pattern. Each direction has its own dedicated pin. Idle states are chosen so the pin is electrically passive when no action is active.
 
 All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactly one entry per GPIO:
 
 | GPIO | idle | actionHigh | actionHiZ | actionLow | Notes |
 |------|------|------------|-----------|-----------|-------|
-| 13 | HIGH | — | `left_fwd` | `left_back` | Left track gate |
-| 14 | HIGH | — | `right_fwd` | `right_back` | Right track gate |
-| 26 | HIGH | — | `turn_left` | `turn_right` | Turntable |
-| 33 | HIGH | — | `arm_fwd` | `arm_back` | Arm / bucket |
-| 15 | HIGH | — | `light_on` | `light_off` | Light (Pulse) |
-| 4 | HiZ | — | — | `test` | Test hold (active LOW) |
+| 12 | LOW | `left_fwd` | — | — | Left track forward |
+| 26 | LOW | `right_fwd` | — | — | Right track forward |
+| 33 | LOW | `arm_fwd` | — | — | Arm forward (up) |
+| 14 | HiZ | — | — | `left_back` | Left track back |
+| 25 | HiZ | — | — | `right_back` | Right track back |
+| 32 | HiZ | — | — | `arm_back` | Arm back (down) |
+| 16 | LOW | `turn_left` | — | — | Turntable left |
+| 17 | HiZ | — | — | `turn_right` | Turntable right |
+| 18 | LOW | `light_off` | — | — | Light off pulse |
+| 19 | HiZ | — | — | `light_on` | Light on pulse |
+| 4 | HiZ | — | — | `test` | Test pin (active LOW pulse) |
+
+> **Note:** The classic single-MOSFET-per-axis wiring (GPIOs 13, 14, 26, 33, 15) is preserved as commented-out entries in the source for reference.
 
 ### Timing Constants
 
 ```cpp
-const uint32_t PULSE_DURATION_MS = 150;   // Duration of light on/off pulse
+const uint32_t PULSE_DURATION_MS = 150;   // Duration of light/test pulse
 const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat stops
 ```
 
@@ -221,24 +230,35 @@ const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat
 - All controls have a mechanical response delay of approximately **0.5–2 s** after the GPIO signal changes.
 - With camera-in-the-loop (detection → POST → decision → actuation), the total effective delay is even longer and must be accounted for in all autonomous timing logic.
 
+### Toggle State Variables
+
+Two boolean variables track the software state of pulse-based toggles. These are updated by `handleCmd` on every `press` action and reported via `/status`:
+
+```cpp
+bool lightOn = false;  // true when light is currently on
+bool testOn  = false;  // true when test was last toggled on
+```
+
+Because both controls are **pulse-based** (the hardware toggle is a momentary GPIO pulse, not a sustained level), the ESP32 tracks state internally in software.
+
 ### Button Behaviour
 
 | Button | Type | Behaviour |
 |--------|------|-----------|
-| `left_fwd` | Hold | Left track forward (GPIO13 Hi-Z) |
-| `left_back` | Hold | Left track back (GPIO13 LOW) |
-| `right_fwd` | Hold | Right track forward (GPIO14 Hi-Z) |
-| `right_back` | Hold | Right track back (GPIO14 LOW) |
+| `left_fwd` | Hold | Left track forward (GPIO 12 HIGH) |
+| `left_back` | Hold | Left track back (GPIO 14 LOW) |
+| `right_fwd` | Hold | Right track forward (GPIO 26 HIGH) |
+| `right_back` | Hold | Right track back (GPIO 25 LOW) |
 | `fwd` | Hold | Both tracks forward simultaneously |
 | `back` | Hold | Both tracks back simultaneously |
 | `spin_left` | Hold | Left back + Right forward (counter-clockwise) |
 | `spin_right` | Hold | Left forward + Right back (clockwise) |
-| `turn_left` | Hold | Turntable rotate left |
-| `turn_right` | Hold | Turntable rotate right |
-| `arm_fwd` | Hold | Arm / bucket forward (GPIO33 Hi-Z) |
-| `arm_back` | Hold | Arm / bucket backward (GPIO33 LOW) |
-| `light` | Pulse | Toggle: pulses `light_on` or `light_off` pin |
-| `test` | Hold | Active while held (GPIO4 LOW) |
+| `turn_left` | Hold | Turntable rotate left (GPIO 16 HIGH) |
+| `turn_right` | Hold | Turntable rotate right (GPIO 17 LOW) |
+| `arm_fwd` | Hold | Arm forward / up (GPIO 33 HIGH) |
+| `arm_back` | Hold | Arm back / down (GPIO 32 LOW) |
+| `light` | Toggle/Pulse | Pulses `light_on` (GPIO 19 LOW) or `light_off` (GPIO 18 HIGH) depending on tracked `lightOn` state |
+| `test` | Toggle/Pulse | Pulses GPIO 4 LOW for `PULSE_DURATION_MS`; flips tracked `testOn` state each press |
 
 Up to `MAX_HELD = 6` simultaneous held actions are supported.
 
@@ -303,14 +323,29 @@ The browser sends a heartbeat `action=hold` every 150 ms while a key or button i
 | `GET` | `/overlay` | Browser polls detection overlay JSON |
 | `GET` | `/cmd?btn=X&action=Y` | Browser sends button press / hold / release |
 | `GET` | `/camcmd?cmd=X` | Controller relays pump and mode commands to cam |
-| `GET` | `/status` | Returns `{camIP, uptime, heap, light}` |
+| `GET` | `/status` | Returns `{camIP, uptime, heap, light, test}` |
 | `GET` | `/auto_status` | Returns `{autoEnabled, status}` — status is `"waiting_for_detection"` or `"performing_action"` |
+| `GET` | `/auto?set=on\|off` | Enable / disable autonomous mode |
 
 #### `/cmd` Action Values
 
-- `press` – start holding the pin; begins heartbeat window
-- `hold` – heartbeat renewal; resets the `HOLD_TIMEOUT_MS` watchdog
-- `release` – release the pin immediately (back to idle state)
+- `press` – for hold buttons: starts holding the pin and begins the heartbeat window. For toggle buttons (`light`, `test`): pulses the pin and flips the internal state.
+- `hold` – heartbeat renewal; resets the `HOLD_TIMEOUT_MS` watchdog (hold buttons only)
+- `release` – release the pin immediately (back to idle state; hold buttons only)
+
+#### `/status` Response
+
+```json
+{
+  "camIP":  "192.168.4.x",
+  "uptime": 123,
+  "heap":   182432,
+  "light":  false,
+  "test":   false
+}
+```
+
+`light` and `test` reflect the current software-tracked toggle state. The browser re-reads this endpoint 500 ms after any toggle press to reconcile UI state with the server.
 
 ### Web Console
 
@@ -327,24 +362,29 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 
 #### Keyboard Shortcuts
 
-| Key | Action |
-|-----|--------|
-| `W` | Both tracks forward |
-| `S` | Both tracks back |
-| `A` | Spin left (counter-clockwise) |
-| `D` | Spin right (clockwise) |
-| `←` Arrow Left | Turntable rotate left |
-| `→` Arrow Right | Turntable rotate right |
-| `↑` Arrow Up | Arm forward (`arm_fwd`) |
-| `↓` Arrow Down | Arm backward (`arm_back`) |
-| `L` | Light toggle (pulse) |
-| `T` | Test hold |
-| `Space` | Pump hold (relayed to cam via `/camcmd`) |
+| Key | Action | Type |
+|-----|--------|------|
+| `W` | Both tracks forward | Hold |
+| `S` | Both tracks back | Hold |
+| `A` | Spin left (counter-clockwise) | Hold |
+| `D` | Spin right (clockwise) | Hold |
+| `←` Arrow Left | Turntable rotate left | Hold |
+| `→` Arrow Right | Turntable rotate right | Hold |
+| `↑` Arrow Up | Arm forward (`arm_fwd`) | Hold |
+| `↓` Arrow Down | Arm backward (`arm_back`) | Hold |
+| `L` | Light toggle (pulse) | Toggle |
+| `T` | Test toggle (pulse) | Toggle |
+| `Space` | Pump hold (relayed to cam via `/camcmd`) | Hold |
+
+#### Toggle Button Behaviour (Light & Test)
+
+Both `light` and `test` are **toggle buttons** — a single press pulses the hardware pin and flips the tracked state. The UI does **not** use an optimistic flip; instead, after sending `cmd(action, 'press')` the browser waits `TOGGLE_SYNC_MS = 500 ms` then fetches `/status` and reconciles both toggle button visuals and SVG indicator to match the server-reported state. This ensures the UI stays correct even if a request is lost.
 
 #### Overlay Canvas
 
 The browser polls `/overlay` every 500 ms. Detection boxes are drawn with label and confidence percentage:
-- `qr_*` (AprilTag) → cyan (`#00e5ff`)
+- `marker_*` (AprilTag) → cyan (`#00e5ff`)
+- `red_dot` → red (`#ff3030`)
 - Everything else → amber (`#f0a500`)
 
 The canvas is sized to match the feed container on every resize event.
@@ -358,7 +398,6 @@ The browser polls `/camip` every 2000 ms. When the cam's IP is received, `feedIm
 ```
 setup():
   releaseAllPins()      <- ensure all pins start in idle state
-                           (MOSFET gates → OUTPUT HIGH / track off; simple buttons → Hi-Z)
   WiFi.softAP(...)
   register HTTP routes
   server.begin()
