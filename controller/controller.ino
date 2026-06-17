@@ -430,10 +430,12 @@ void autoOnDetection(int offsetX, int offsetY) {
     if (offsetX < 0 && autoState.turretPos > -AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
       actions.push_back({ "right_fwd", 400 });
+      actions.push_back({ "left_back", 300 });
       //autoState.turretPos -= 300;
     } else if (autoState.turretPos < AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
       actions.push_back({ "right_back", 300 });
+      actions.push_back({ "left_fwd", 400 });
       //autoState.turretPos += 300;
     } else {
       Serial.printf("[AUTO] offsetX=%d but turret at limit (%d)\n", offsetX, autoState.turretPos);
