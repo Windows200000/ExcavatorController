@@ -373,10 +373,14 @@ void autoNoDetection() {
   // ─────────────────────────────────────────────────────────
 
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
-  if (autoState.armPos > AUTO_ARM_RESET && autoState.last_det >= 20) {
+  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det >= 20) {
     Serial.println("[AUTO] Moving back to default height");
-    int resetDuration = autoState.armPos - AUTO_ARM_RESET;
-    runActionSync("arm_back", resetDuration);
+    int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
+    if (autoState.armPos > AUTO_ARM_RESET) {
+      runActionSync("arm_back", resetDuration);
+    } else {
+      runActionSync("arm_forward", resetDuration);
+    }
     autoState.armPos = AUTO_ARM_RESET;
   }
 }
