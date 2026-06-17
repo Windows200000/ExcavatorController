@@ -351,9 +351,9 @@ void runActionSync(const char* button, uint32_t durationMs) {
 }
 
 void autoDefaultPosition() {
-  Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
+  // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
-  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det + AUTO_TIMEOUT_MS > millis() && autoEnabled && autoStatus == AUTO_WAITING) {
+  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
     Serial.println("[AUTO] Moving back to default height");
     int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
     if (autoState.armPos > AUTO_ARM_RESET) {
