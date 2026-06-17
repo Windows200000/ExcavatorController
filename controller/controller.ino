@@ -100,7 +100,7 @@ const int PIN_COUNT = sizeof(PIN_TABLE) / sizeof(PIN_TABLE[0]);
 // ─────────────────────────────────────────────
 //  Timing
 // ─────────────────────────────────────────────
-const uint32_t PULSE_DURATION_MS = 150;   // light on/off pulse
+const uint32_t PULSE_DURATION_MS = 300;   // light on/off pulse
 const uint32_t HOLD_TIMEOUT_MS   = 300;   // auto-release if heartbeat stops
 
 // ─────────────────────────────────────────────
