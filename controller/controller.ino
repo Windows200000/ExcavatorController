@@ -181,10 +181,10 @@ struct AutoAction {
 // ─────────────────────────────────────────────
 const int AUTO_TURRET_MAX = 3000; // both directions
 const int AUTO_ARM_MAX    = 2000; // starts down, arm fwd = arm up
-const int AUTO_ARM_RESET  = 1000; // target armPos after 20x no detection
+const int AUTO_ARM_RESET  = 1000; // target for armPos
 const int AUTO_DEADZONE   = 15;
 const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
-const uint32_t AUTO_TIMEOUT_MS = 20000;   // return arm to defualt position
+const uint32_t AUTO_TIMEOUT_MS = 20000;   // return arm to defualt position after 20s
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
@@ -351,7 +351,8 @@ void runActionSync(const char* button, uint32_t durationMs) {
 }
 
 void autoDefaultPosition() {
-    // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
+  Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
+  // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
   if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det + AUTO_TIMEOUT_MS > millis() && autoEnabled && autoStatus == AUTO_WAITING) {
     Serial.println("[AUTO] Moving back to default height");
     int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
