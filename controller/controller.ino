@@ -377,9 +377,9 @@ void autoNoDetection() {
     Serial.println("[AUTO] Moving back to default height");
     int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
     if (autoState.armPos > AUTO_ARM_RESET) {
-      runActionSync("arm_up", resetDuration);
+      runActionSync("arm_dwn", resetDuration);
     } else {
-      runActionSync("arm_forward", resetDuration);
+      runActionSync("arm_up", resetDuration);
     }
     autoState.armPos = AUTO_ARM_RESET;
   }
@@ -416,11 +416,11 @@ void autoOnDetection(int offsetX, int offsetY) {
   if (abs(offsetY) > AUTO_DEADZONE) {
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
-      actions.push_back({ "arm_up", 300 });
+      actions.push_back({ "arm_dwn", 300 });
       autoState.armPos -= 300;
     } else if (autoState.armPos < AUTO_ARM_MAX) {
       Serial.printf("[AUTO] offsetY=%d → arm_dwn (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
-      actions.push_back({ "arm_dwn", 300 });
+      actions.push_back({ "arm_up", 300 });
       autoState.armPos += 300;
     } else {
       Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
@@ -1147,7 +1147,7 @@ const ACTION_SVG = {
   turn_left:  ['svg-turntable','tt-arrow-left'],
   turn_right: ['svg-turntable','tt-arrow-right'],
   arm_dwn:    ['svg-boom','svg-stick','svg-bucket','arm-arrow-up'],
-  arm_up:   ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
+  arm_up:     ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
   test:       ['svg-test'],
   light:      ['svg-light'],
   pump:       ['svg-pump-body','pump-spray-1','pump-spray-2','pump-spray-3'],
