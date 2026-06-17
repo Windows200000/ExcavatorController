@@ -17,10 +17,19 @@
  *   fb->len >= fb->width * (fb->height - 4). Actual fb->height passed into
  *   sharedGrayH so AprilTag always sees correct dimensions.
  *
+ * Shared buffer locking: grayMux and streamMux are FreeRTOS mutexes (not spinlocks).
+ *   portENTER_CRITICAL spinlocks were replaced because memcpy of ~305KB under a
+ *   spinlock busy-waits the other core for 1-3ms per frame. Mutexes allow the
+ *   scheduler to yield instead. Timeout 10-20ms; on timeout the frame is skipped
+ *   for that consumer but fb is still returned — no stall.
+ *
  * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
  *   Uses uxTaskGetSystemState() — reports runtime % and core for 5 hardcoded tasks:
  *   det_task, snap_task, stream_task, loopTask, tiT.
  *   Percentages are cumulative since boot (not rolling window).
+ *
+ * Stream: max 1 concurrent client enforced via streamClientActive flag.
+ *   A second /stream request is rejected with 503 while a client is connected.
  */
 
 #include "esp_camera.h"
@@ -33,6 +42,7 @@
 #include <tag16h5.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <string.h>
 
 struct Detection {
@@ -72,10 +82,8 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;  // 640x480 (sensor outputs 640x477)
 const uint8_t     JPEG_QUALITY          = 12;
 const uint32_t    DETECTION_INTERVAL_MS = 500;
-// SNAPSHOT_FACTOR kept for reference: snap_task is free-running, not timer-driven.
+// snap_task is free-running, not timer-driven.
 // At ~8fps the sensor+encode cycle self-paces to ~125ms per frame naturally.
-// const uint32_t SNAPSHOT_FACTOR      = 4;
-// const uint32_t SNAPSHOT_INTERVAL_MS = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
 
 const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;
 
@@ -94,18 +102,24 @@ bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
 // ── Stashed JPEG for /stream — written by snap_task, read by stream_task ──
-static uint8_t*     streamFrameBuf = nullptr;
-static size_t       streamFrameLen = 0;
-static portMUX_TYPE streamMux      = portMUX_INITIALIZER_UNLOCKED;
+// Protected by FreeRTOS mutex (not spinlock) — memcpy of JPEG can be >10KB,
+// too long to hold a spinlock across cores.
+static uint8_t*          streamFrameBuf    = nullptr;
+static size_t            streamFrameLen    = 0;
+static SemaphoreHandle_t streamMux         = nullptr;
 
 // ── Shared grayscale frame — written by snap_task, read by det_task ──
+// Protected by FreeRTOS mutex — memcpy of ~305KB must not spinlock-stall Core 1.
 // snap_task is the SOLE owner of esp_camera_fb_get/return.
 // det_task copies sharedGrayBuf under grayMux, then works on local copy.
-static uint8_t*     sharedGrayBuf = nullptr;
-static size_t       sharedGrayLen = 0;
-static int          sharedGrayW   = 0;
-static int          sharedGrayH   = 0;
-static portMUX_TYPE grayMux       = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t*          sharedGrayBuf     = nullptr;
+static size_t            sharedGrayLen     = 0;
+static int               sharedGrayW       = 0;
+static int               sharedGrayH       = 0;
+static SemaphoreHandle_t grayMux           = nullptr;
+
+// ── Stream client guard — only 1 concurrent stream client allowed ──
+static volatile bool     streamClientActive = false;
 
 // ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
@@ -252,8 +266,11 @@ void initAprilTag() {
 //  Actual fb->width/height stored in sharedGrayW/H for correct AprilTag dims.
 //
 //  On each valid frame:
-//    1. Copies raw grayscale into sharedGrayBuf (grayMux) for det_task.
-//    2. JPEG-encodes and stashes in streamFrameBuf (streamMux) for /stream.
+//    1. Copies raw grayscale into sharedGrayBuf (grayMux mutex) for det_task.
+//    2. JPEG-encodes and stashes in streamFrameBuf (streamMux mutex) for /stream.
+//
+//  Mutex timeouts: 10ms. If lock not acquired in time, frame is skipped for
+//  that consumer (gray or stream) but fb is still returned — no stall.
 // ════════════════════════════════════════════════════════════
 void snapshotTask(void*) {
   for (;;) {
@@ -274,29 +291,36 @@ void snapshotTask(void*) {
       continue;
     }
 
-    // ── 1. Stash raw grayscale for det_task ──
-    portENTER_CRITICAL(&grayMux);
-    if (sharedGrayLen != fb->len) {
-      free(sharedGrayBuf);
-      sharedGrayBuf = (uint8_t*)malloc(fb->len);
+    // ── 1. Stash raw grayscale for det_task (mutex, not spinlock) ──
+    if (xSemaphoreTake(grayMux, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (sharedGrayLen != fb->len) {
+        free(sharedGrayBuf);
+        sharedGrayBuf = (uint8_t*)malloc(fb->len);
+      }
+      if (sharedGrayBuf) {
+        memcpy(sharedGrayBuf, fb->buf, fb->len);
+        sharedGrayLen = fb->len;
+        sharedGrayW   = fb->width;
+        sharedGrayH   = fb->height;
+      }
+      xSemaphoreGive(grayMux);
+    } else {
+      Serial.println("[SNAP] grayMux timeout — skipping gray update");
     }
-    if (sharedGrayBuf) {
-      memcpy(sharedGrayBuf, fb->buf, fb->len);
-      sharedGrayLen = fb->len;
-      sharedGrayW   = fb->width;
-      sharedGrayH   = fb->height;
-    }
-    portEXIT_CRITICAL(&grayMux);
 
     // ── 2. JPEG encode for /stream ──
     uint8_t* jBuf = nullptr;
     size_t   jLen = 0;
     if (frame2jpg(fb, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
-      portENTER_CRITICAL(&streamMux);
-      free(streamFrameBuf);
-      streamFrameBuf = jBuf;
-      streamFrameLen = jLen;
-      portEXIT_CRITICAL(&streamMux);
+      if (xSemaphoreTake(streamMux, pdMS_TO_TICKS(10)) == pdTRUE) {
+        free(streamFrameBuf);
+        streamFrameBuf = jBuf;
+        streamFrameLen = jLen;
+        xSemaphoreGive(streamMux);
+      } else {
+        Serial.println("[SNAP] streamMux timeout — dropping JPEG frame");
+        free(jBuf);
+      }
     }
 
     esp_camera_fb_return(fb);
@@ -308,24 +332,36 @@ void snapshotTask(void*) {
 // ════════════════════════════════════════════════════════════
 
 void handleStream() {
-  WiFiClient client = server.client();
+  if (streamClientActive) {
+    server.send(503, "text/plain", "Stream busy — only 1 client allowed");
+    Serial.println("[CAM] Stream rejected — client already connected");
+    return;
+  }
+
+  WiFiClient* clientPtr = new WiFiClient(server.client());
+
   String header =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
     "Access-Control-Allow-Origin: *\r\n"
     "Connection: close\r\n\r\n";
-  client.print(header);
+  clientPtr->print(header);
 
-  WiFiClient* clientPtr = new WiFiClient(client);
+  streamClientActive = true;
+
   xTaskCreatePinnedToCore(
     [](void* arg) {
       WiFiClient* c = (WiFiClient*)arg;
       while (c->connected()) {
-        portENTER_CRITICAL(&streamMux);
-        size_t   len = streamFrameLen;
-        uint8_t* buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
-        if (buf) memcpy(buf, streamFrameBuf, len);
-        portEXIT_CRITICAL(&streamMux);
+        uint8_t* buf = nullptr;
+        size_t   len = 0;
+
+        if (xSemaphoreTake(streamMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+          len = streamFrameLen;
+          buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
+          if (buf) memcpy(buf, streamFrameBuf, len);
+          xSemaphoreGive(streamMux);
+        }
 
         if (buf && len > 0) {
           String partHeader =
@@ -336,11 +372,12 @@ void handleStream() {
           c->print("\r\n");
           free(buf);
         } else {
-          delay(10);
+          vTaskDelay(pdMS_TO_TICKS(10));
         }
       }
       Serial.println("[CAM] Stream client disconnected");
       delete c;
+      streamClientActive = false;
       vTaskDelete(NULL);
     },
     "stream_task", 4096, clientPtr,
@@ -385,23 +422,29 @@ void handleStatus() {
 //  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
 //  Reads sharedGrayBuf (written by snap_task) — no fb_get calls.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
+//
+//  StaticJsonDocument<1024> used — stack-allocated, no heap churn per cycle.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
   uint8_t* grayBuf = nullptr;
   size_t   grayLen = 0;
   int      W = 0, H = 0;
 
-  portENTER_CRITICAL(&grayMux);
-  if (sharedGrayBuf && sharedGrayLen > 0) {
-    grayBuf = (uint8_t*)malloc(sharedGrayLen);
-    if (grayBuf) {
-      memcpy(grayBuf, sharedGrayBuf, sharedGrayLen);
-      grayLen = sharedGrayLen;
-      W       = sharedGrayW;
-      H       = sharedGrayH;
+  if (xSemaphoreTake(grayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (sharedGrayBuf && sharedGrayLen > 0) {
+      grayBuf = (uint8_t*)malloc(sharedGrayLen);
+      if (grayBuf) {
+        memcpy(grayBuf, sharedGrayBuf, sharedGrayLen);
+        grayLen = sharedGrayLen;
+        W       = sharedGrayW;
+        H       = sharedGrayH;
+      }
     }
+    xSemaphoreGive(grayMux);
+  } else {
+    Serial.println("[DET] grayMux timeout — skipping detection cycle");
+    return;
   }
-  portEXIT_CRITICAL(&grayMux);
 
   if (!grayBuf || grayLen == 0 || W == 0 || H == 0) {
     Serial.println("[DET] No frame available yet");
@@ -444,7 +487,8 @@ void runDetectionAndPush() {
   apriltag_detections_destroy(results);
   free(grayBuf);
 
-  DynamicJsonDocument doc(1024);
+  // StaticJsonDocument — stack-allocated, no heap alloc per detection cycle
+  StaticJsonDocument<1024> doc;
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
     JsonObject o = arr.createNestedObject();
@@ -497,6 +541,15 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
   pinMode(PIN_PUMP, INPUT);
+
+  // Create mutexes before any task that uses them
+  grayMux   = xSemaphoreCreateMutex();
+  streamMux = xSemaphoreCreateMutex();
+  if (!grayMux || !streamMux) {
+    Serial.println("[BOOT] Mutex creation failed — halting");
+    while (true) delay(1000);
+  }
+
   if (!initCamera()) {
     Serial.println("[BOOT] Camera init failed — halting");
     while (true) delay(1000);
