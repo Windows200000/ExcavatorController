@@ -160,17 +160,6 @@ bool autoEnabled = false;  // toggled via /auto?set=on|off; off by default on st
 enum AutoStatus_t { AUTO_WAITING, AUTO_BUSY };
 AutoStatus_t autoStatus = AUTO_WAITING;
 
-// ─────────────────────────────────────────────
-//  Persistent state for processDetection() — survives between calls.
-//  Add more fields here for additional state (e.g. int phase, uint32_t lastActionMs).
-// ─────────────────────────────────────────────
-struct AutoState {
-  int32_t turretPos = 0;   // estimated turntable position; increment/decrement as turn_left/right are issued
-  int32_t armPos = 2000;     //from Bottom
-  int32_t last_det = 0;
-  // int phase = 0;    // example: add a phase/step counter like this
-} autoState;
-
 struct AutoAction {
   const char* button;      // button name from PIN_TABLE / buttonToHeldPins()
   uint32_t    durationMs;  // how long to hold this action (independent per action)
@@ -179,12 +168,24 @@ struct AutoAction {
 // ─────────────────────────────────────────────
 //  Auto tuning constants — visible in all three auto sub-functions
 // ─────────────────────────────────────────────
-const int AUTO_TURRET_MAX = 3000; // both directions
-const int AUTO_ARM_MAX    = 2000; // starts down, arm fwd = arm up
-const int AUTO_ARM_RESET  = 1000; // target for armPos
-const int AUTO_DEADZONE   = 15;
+const int AUTO_TURRET_MAX       = 3000; // both directions
+const int AUTO_ARM_MAX          = 2000; // starts down, arm fwd = arm up
+const int AUTO_ARM_RESET_POS    = 1000; // target for armPos
+const int AUTO_ARM_DEFAULT_POS  = 2000; // target for armPos
+const int AUTO_DEADZONE         = 15;
 const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
-const uint32_t AUTO_TIMEOUT_MS = 20000;   // return arm to defualt position after 20s
+const uint32_t AUTO_TIMEOUT_MS          = 20000;   // return arm to defualt position after 20s
+
+// ─────────────────────────────────────────────
+//  Persistent state for processDetection() — survives between calls.
+//  Add more fields here for additional state (e.g. int phase, uint32_t lastActionMs).
+// ─────────────────────────────────────────────
+struct AutoState {
+  int32_t turretPos = 0;   // estimated turntable position; increment/decrement as turn_left/right are issued
+  int32_t armPos = AUTO_ARM_DEFAULT_POS;     //from Bottom
+  int32_t last_det = 0;
+  // int phase = 0;    // example: add a phase/step counter like this
+} autoState;
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
@@ -352,24 +353,24 @@ void runActionSync(const char* button, uint32_t durationMs) {
 
 void autoDefaultPosition() {
   // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
-  // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
-  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
+  // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET_POS position
+  if (autoState.armPos != AUTO_ARM_RESET_POS && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
     Serial.println("[AUTO] Moving back to default height");
-    int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
-    if (autoState.armPos > AUTO_ARM_RESET) {
+    int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET_POS);
+    if (autoState.armPos > AUTO_ARM_RESET_POS) {
       runActionSync("arm_dwn", resetDuration);
     } else {
       runActionSync("arm_up", resetDuration);
     }
     autoState.last_det = millis();
-    autoState.armPos = AUTO_ARM_RESET;
+    autoState.armPos = AUTO_ARM_RESET_POS;
   }
 }
 
 // ─────────────────────────────────────────────
 //  autoAlways — runs every processDetection() call, before detection check.
 //  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
-//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+//  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
 // ─────────────────────────────────────────────
 void autoAlways(int offsetX, int offsetY) {
   // ── USER CODE AREA 1 — runs every frame ──────────────────
@@ -380,7 +381,7 @@ void autoAlways(int offsetX, int offsetY) {
 // ─────────────────────────────────────────────
 //  autoNoDetection — runs when target label is not found in frame.
 //  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
-//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+//  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
 // ─────────────────────────────────────────────
 void autoNoDetection() {
 
@@ -392,7 +393,7 @@ void autoNoDetection() {
 // ─────────────────────────────────────────────
 //  autoOnDetection — runs when target label is found in frame.
 //  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
-//  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+//  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
 //
 //  offsetX: 0=centre, positive=right, negative=left
 //  offsetY: 0=centre, positive=above centre, negative=below centre
@@ -691,6 +692,7 @@ void handleAutoSet() {
     String val = server.arg("set");
     if (val == "on") {
       autoEnabled = true;
+      autoState.armPos = 
       Serial.println("[AUTO] Enabled");
     }
     if (val == "off") {
