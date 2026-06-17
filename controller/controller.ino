@@ -374,7 +374,7 @@ void autoNoDetection() {
 
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
   if (autoState.armPos > AUTO_ARM_RESET && autoState.last_det >= 20) {
-    //Serial.println("[AUTO] Moving back to default height");
+    Serial.println("[AUTO] Moving back to default height");
     int resetDuration = autoState.armPos - AUTO_ARM_RESET;
     runActionSync("arm_back", resetDuration);
     autoState.armPos = AUTO_ARM_RESET;
@@ -501,7 +501,7 @@ void processDetection(const String& json) {
     autoStatus = AUTO_WAITING; return;
   }
   JsonArray detections = doc["detections"].as<JsonArray>();
-  Serial.printf("[AUTO] Detection count: %d\n", detections.size());
+  // Serial.printf("[AUTO] Detection count: %d\n", detections.size());
 
   // ── 2. Choose which detection label to follow ──────────────────────────
   const char* TARGET_LABEL = "marker_0";
