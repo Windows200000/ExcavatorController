@@ -184,6 +184,7 @@ const int AUTO_ARM_MAX    = 2000; // starts down, arm fwd = arm up
 const int AUTO_ARM_RESET  = 1000; // target armPos after 20x no detection
 const int AUTO_DEADZONE   = 15;
 const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
+const uint32_t AUTO_TIMEOUT_MS = 20000;   // return arm to defualt position
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
@@ -349,6 +350,21 @@ void runActionSync(const char* button, uint32_t durationMs) {
   stopAction(String(button));
 }
 
+void autoDefaultPosition() {
+    // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
+  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det + AUTO_TIMEOUT_MS > millis() && autoEnabled && autoStatus == AUTO_WAITING) {
+    Serial.println("[AUTO] Moving back to default height");
+    int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
+    if (autoState.armPos > AUTO_ARM_RESET) {
+      runActionSync("arm_dwn", resetDuration);
+    } else {
+      runActionSync("arm_up", resetDuration);
+    }
+    autoState.last_det = millis();
+    autoState.armPos = AUTO_ARM_RESET;
+  }
+}
+
 // ─────────────────────────────────────────────
 //  autoAlways — runs every processDetection() call, before detection check.
 //  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
@@ -366,23 +382,10 @@ void autoAlways(int offsetX, int offsetY) {
 //  AUTO_ARM_RESET, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
 // ─────────────────────────────────────────────
 void autoNoDetection() {
-  autoState.last_det += 1;
 
   // ── USER CODE AREA 2 — runs on no detection ──────────────
 
   // ─────────────────────────────────────────────────────────
-
-  // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET position
-  if (autoState.armPos != AUTO_ARM_RESET && autoState.last_det >= 20) {
-    Serial.println("[AUTO] Moving back to default height");
-    int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
-    if (autoState.armPos > AUTO_ARM_RESET) {
-      runActionSync("arm_dwn", resetDuration);
-    } else {
-      runActionSync("arm_up", resetDuration);
-    }
-    autoState.armPos = AUTO_ARM_RESET;
-  }
 }
 
 // ─────────────────────────────────────────────
@@ -394,7 +397,7 @@ void autoNoDetection() {
 //  offsetY: 0=centre, positive=above centre, negative=below centre
 // ─────────────────────────────────────────────
 void autoOnDetection(int offsetX, int offsetY) {
-  autoState.last_det = 0;
+  autoState.last_det = millis();
 
   // ── USER CODE AREA 3 — runs on detection ─────────────────
   // Call runActionSync("button", ms) here for any synchronous blocking action.
@@ -771,6 +774,7 @@ void loop() {
       heldActions[i].active = false;
     }
   }
+  autoDefaultPosition();
 }
 
 
