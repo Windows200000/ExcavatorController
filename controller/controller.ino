@@ -785,7 +785,6 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Excavator Control</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap');
   :root {
     --bg:#0a0e14; --panel:#111720; --border:#1e2d3d;
     --accent:#f0a500; --accent2:#e05c00; --danger:#e03030;
