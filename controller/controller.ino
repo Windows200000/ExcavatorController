@@ -183,6 +183,7 @@ const int AUTO_TURRET_MAX = 3000; // both directions
 const int AUTO_ARM_MAX    = 2000; // starts down, arm fwd = arm up
 const int AUTO_ARM_RESET  = 1000; // target armPos after 20x no detection
 const int AUTO_DEADZONE   = 15;
+const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
 
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
@@ -474,6 +475,12 @@ void autoOnDetection(int offsetX, int offsetY) {
     // stop any that reached maxDuration exactly
     for (int i = 0; i < actionCount; i++)
       if (!stopped[i]) stopAction(String(actions[i].button));
+  }
+  // Post-correction delay — let machine settle before next detection cycle
+  uint32_t delayStart = millis();
+  while (millis() - delayStart < AUTO_CORRECTION_DELAY_MS) {
+    server.handleClient();
+    delay(10);
   }
 }
 
