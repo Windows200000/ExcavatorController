@@ -363,7 +363,7 @@ void autoDefaultPosition() {
 // ─────────────────────────────────────────────
 void autoAlways(int offsetX, int offsetY) {
   // ── USER CODE AREA 1 — runs every frame ──────────────────
-  Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
+  // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET_POS position
   if (autoState.armPos != AUTO_ARM_RESET_POS && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
     Serial.println("[AUTO] Moving back to default height");
@@ -378,19 +378,19 @@ void autoAlways(int offsetX, int offsetY) {
   }
 
   if (abs(offsetX) > AUTO_DEADZONE || abs(offsetY) > AUTO_DEADZONE) {
-    Serial.printl("[AUTO] Stopped firing.");
+    Serial.println("[AUTO] Stopped firing.");
     autoState.center_strk = 0;
-    autoState.is_firing = true;
-    // Stop firing
+    autoState.is_firing = false;
+    relayCamCmd("/pump?action=release");
   }
 
   if (autoState.center_strk > 5) {
     if (autoState.is_firing == true) {
-      // Continue firing
+    relayCamCmd("/pump?action=hold");
     } else {
     autoState.is_firing = true;
-    Serial.printl("[AUTO] FIREEE");
-    // Start firing
+    Serial.println  ("[AUTO] FIREEE");
+    relayCamCmd("/pump?action=press");
     }
   }
 
