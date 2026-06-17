@@ -421,8 +421,9 @@ void handleStream() {
 
 void handlePump() {
   String action = server.hasArg("action") ? server.arg("action") : "press";
-  if (action == "press" || action == "hold") pumpOn();
-  else if (action == "release") pumpOff();
+  if (action == "press")         pumpOn();
+  else if (action == "hold")   { if (pumpActive) pumpLastSeen = millis(); }  // ignore if not active — prevents stale queued hold re-firing pump after release
+  else if (action == "release")  pumpOff();
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "text/plain", pumpActive ? "on" : "off");
 }
