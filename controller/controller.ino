@@ -1094,8 +1094,8 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   <div class="control-group">
     <div class="group-label">Arm</div>
     <div class="btn-row">
-      <button class="ctrl" data-action="arm_dwn"><span class="icon">&#11014;</span><span class="label">FORWARD</span><span class="key">&#8593;</span></button>
-      <button class="ctrl" data-action="arm_up"><span class="icon">&#11015;</span><span class="label">BACKWARD</span><span class="key">&#8595;</span></button>
+      <button class="ctrl" data-action="arm_up"><span class="icon">&#11014;</span><span class="label">FORWARD</span><span class="key">&#8593;</span></button>
+      <button class="ctrl" data-action="arm_down"><span class="icon">&#11015;</span><span class="label">BACKWARD</span><span class="key">&#8595;</span></button>
     </div>
   </div>
 
