@@ -84,7 +84,8 @@ const float    MARKER_CONFIDENCE_CUTOFF = 50.0f;
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-const int      PIN_PUMP             = 4;
+const int      PIN_PUMP             = 13;
+const int      PIN_LED              = 4;
 const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;  // 640x480 (sensor outputs 640x477)
@@ -219,7 +220,8 @@ void printTopCpuTasks() {
 void pumpOn() {
   if (camMode == MODE_SAFE) { Serial.println("[PUMP] Blocked — SAFE mode"); return; }
   if (!pumpActive) {
-    pinMode(PIN_PUMP, OUTPUT);
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, HIGH);
     digitalWrite(PIN_PUMP, HIGH);
     pumpActive = true;
     Serial.println("[PUMP] ON");
@@ -229,7 +231,8 @@ void pumpOn() {
 
 void pumpOff() {
   if (pumpActive) {
-    pinMode(PIN_PUMP, INPUT);
+    pinMode(PIN_LED, INPUT);
+    digitalWrite(PIN_PUMP, LOW);   // LOW → gate off → pump stops
     pumpActive = false;
     Serial.println("[PUMP] OFF");
   }
@@ -571,7 +574,8 @@ void registerWithController() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
-  pinMode(PIN_PUMP, INPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  digitalWrite(PIN_PUMP, LOW);
 
   // Create mutexes before any task that uses them
   grayMux   = xSemaphoreCreateMutex();
