@@ -4,14 +4,18 @@
  * AprilTag detection: raspiduino/apriltag-esp32 (ZIP install), family tag16h5.
  *
  * Pixel format: PIXFORMAT_GRAYSCALE — no JPEG decode needed for detection.
- * Stream: snapshot-based MJPEG. Snapshots taken at DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR.
+ * Stream: free-running snap_task captures frames as fast as sensor+encode allows.
  * Detection runs every DETECTION_INTERVAL_MS on the latest grayscale frame.
  *
  * Camera fb ownership: snap_task is the SOLE caller of esp_camera_fb_get/return.
- *   It copies raw grayscale pixels into sharedGrayBuf (protected by grayMux),
- *   then JPEG-encodes for streaming. det_task reads sharedGrayBuf — no fb_get.
- *   This prevents concurrent fb_get from two tasks on core 0 causing partial
- *   DMA frame splits and cam_hal FB-SIZE mismatch errors.
+ *   Runs free-running (no notify needed). Copies raw grayscale pixels into
+ *   sharedGrayBuf (protected by grayMux), then JPEG-encodes for streaming.
+ *   det_task reads sharedGrayBuf — no fb_get calls ever.
+ *
+ * OV2640 grayscale quirk: sensor outputs 477 active lines at VGA instead of 480
+ *   (305280 bytes instead of 307200). Frame is accepted if
+ *   fb->len >= fb->width * (fb->height - 4). Actual fb->height passed into
+ *   sharedGrayH so AprilTag always sees correct dimensions.
  *
  * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
  *   Uses uxTaskGetSystemState() — reports runtime % and core for 5 hardcoded tasks:
@@ -65,14 +69,15 @@ const float    MARKER_CONFIDENCE_CUTOFF = 50.0f;
 const int      PIN_PUMP             = 4;
 const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
-const framesize_t FRAME_SIZE           = FRAMESIZE_VGA;  // 640x480
-const uint8_t     JPEG_QUALITY         = 12;
+const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;  // 640x480 (sensor outputs 640x477)
+const uint8_t     JPEG_QUALITY          = 12;
 const uint32_t    DETECTION_INTERVAL_MS = 500;
-const uint32_t    SNAPSHOT_FACTOR       = 4;  // snapshots per detection cycle
-// Snapshot fires every DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR ms
-const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
+// SNAPSHOT_FACTOR kept for reference: snap_task is free-running, not timer-driven.
+// At ~8fps the sensor+encode cycle self-paces to ~125ms per frame naturally.
+// const uint32_t SNAPSHOT_FACTOR      = 4;
+// const uint32_t SNAPSHOT_INTERVAL_MS = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;
 
-const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;  // print CPU stats every 10 s
+const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;
 
 WebServer server(80);
 
@@ -80,7 +85,6 @@ apriltag_detector_t* atDetector = nullptr;
 apriltag_family_t*   atFamily   = nullptr;
 
 uint32_t lastDetectionMs  = 0;
-uint32_t lastSnapshotMs   = 0;
 uint32_t lastCpuReportMs  = 0;
 
 enum CamMode { MODE_SAFE, MODE_ARMED };
@@ -89,7 +93,7 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-// ── Stashed JPEG for /stream — written by snapshot task, read by stream task ──
+// ── Stashed JPEG for /stream — written by snap_task, read by stream_task ──
 static uint8_t*     streamFrameBuf = nullptr;
 static size_t       streamFrameLen = 0;
 static portMUX_TYPE streamMux      = portMUX_INITIALIZER_UNLOCKED;
@@ -109,21 +113,8 @@ TaskHandle_t snapshotTaskHandle  = NULL;
 
 // ════════════════════════════════════════════════════════════
 //  CPU profiling — top-5 hardcoded tasks
-//
-//  Uses uxTaskGetSystemState() to get per-task runtime counters.
-//  Hardcoded task names (analyzed from sketch + ESP32 Arduino runtime):
-//    det_task    — Core 0, prio 2 — AprilTag detect + HTTP POST (heaviest)
-//    snap_task   — Core 0, prio 1 — frame2jpg encode
-//    stream_task — Core 1, prio 1 — MJPEG write per client (first instance only)
-//    loopTask    — Core 1, prio 1 — Arduino loop() / handleClient
-//    tiT         — Core 0, prio 18 — lwIP / WiFi TCP stack
-//
-//  % values are cumulative since boot, not a rolling window.
-//  stream_task: only first matching task reported if multiple stream clients active.
 // ════════════════════════════════════════════════════════════
-struct CpuWatchTask {
-  const char* exactName;
-};
+struct CpuWatchTask { const char* exactName; };
 
 static const CpuWatchTask CPU_WATCH_TOP5[5] = {
   { "det_task"    },
@@ -171,12 +162,9 @@ void printTopCpuTasks() {
         break;
       }
     }
-    if (!found) {
-      Serial.printf("[CPU]  %-12s  not found\n", CPU_WATCH_TOP5[i].exactName);
-    }
+    if (!found) Serial.printf("[CPU]  %-12s  not found\n", CPU_WATCH_TOP5[i].exactName);
   }
   Serial.println("[CPU] ════════════════════════════");
-
   free(taskStatus);
 }
 
@@ -224,7 +212,7 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_GRAYSCALE;  // raw gray pixels — no decode needed
   config.frame_size   = FRAME_SIZE;
-  config.fb_count     = 1;
+  config.fb_count     = 1;  // grayscale: fb_count=2 causes partial DMA frames on OV2640
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("[CAM] Init failed: 0x%x\n", err); return false; }
@@ -234,7 +222,7 @@ bool initCamera() {
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
 
-  Serial.printf("[CAM] Camera ready — 640x480 GRAYSCALE, fb_count=%d\n", config.fb_count);
+  Serial.printf("[CAM] Camera ready — 640x480 GRAYSCALE (sensor outputs 477 lines), fb_count=%d\n", config.fb_count);
   return true;
 }
 
@@ -245,32 +233,44 @@ void initAprilTag() {
   atFamily   = tag16h5_create();
   atDetector = apriltag_detector_create();
   apriltag_detector_add_family(atDetector, atFamily);
-  atDetector->quad_decimate = 4.0f;  // downsample 4x — processes 160x120, significantly faster
-  atDetector->quad_sigma    = 0.0f;  // no blur
+  atDetector->quad_decimate = 4.0f;
+  atDetector->quad_sigma    = 0.0f;
   atDetector->nthreads      = 1;
   atDetector->debug         = 0;
-  atDetector->refine_edges  = 1;     // sub-pixel edge refinement
+  atDetector->refine_edges  = 1;
   Serial.println("[AT] AprilTag detector ready — tag16h5, quad_decimate=4.0");
 }
 
 // ════════════════════════════════════════════════════════════
-//  Snapshot task — Core 0, priority 1
+//  Snapshot task — Core 0, priority 1 — FREE-RUNNING
 //  SOLE owner of esp_camera_fb_get / esp_camera_fb_return.
-//  On each frame:
-//    1. Copies raw grayscale pixels into sharedGrayBuf (grayMux protected)
-//       so det_task can read without touching the camera HAL.
-//    2. JPEG-encodes the frame and stashes in streamFrameBuf for /stream.
-//  Fires every SNAPSHOT_INTERVAL_MS via xTaskNotifyGive() from loop().
+//  Runs as fast as sensor + frame2jpg allows (~8fps at VGA grayscale).
+//  No xTaskNotifyGive needed — loop() does NOT notify this task.
+//
+//  Frame acceptance: fb->len >= fb->width * (fb->height - 4)
+//  Tolerates OV2640 grayscale quirk of 477 active lines (305280 bytes).
+//  Actual fb->width/height stored in sharedGrayW/H for correct AprilTag dims.
+//
+//  On each valid frame:
+//    1. Copies raw grayscale into sharedGrayBuf (grayMux) for det_task.
+//    2. JPEG-encodes and stashes in streamFrameBuf (streamMux) for /stream.
 // ════════════════════════════════════════════════════════════
 void snapshotTask(void*) {
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { Serial.println("[SNAP] fb_get failed"); continue; }
-    if (fb->format != PIXFORMAT_GRAYSCALE || fb->len == 0) {
-      Serial.printf("[SNAP] Bad frame: format=%d len=%d\n", fb->format, fb->len);
+    if (!fb) {
+      Serial.println("[SNAP] fb_get failed");
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Accept frames within 4 lines of expected — tolerates OV2640 477-line output
+    if (fb->format != PIXFORMAT_GRAYSCALE ||
+        fb->len < (size_t)(fb->width * (fb->height - 4))) {
+      Serial.printf("[SNAP] Bad frame: format=%d len=%u w=%d h=%d\n",
+                    fb->format, fb->len, fb->width, fb->height);
       esp_camera_fb_return(fb);
+      vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
 
@@ -307,9 +307,6 @@ void snapshotTask(void*) {
 //  HTTP handlers
 // ════════════════════════════════════════════════════════════
 
-// /stream — MJPEG multipart, serves latest stashed snapshot frame.
-// Stream task runs on Core 1 at priority 1 — below det_task (2), above handleClient (0).
-// No esp_camera_fb_get() calls here — reads only from streamFrameBuf under mutex.
 void handleStream() {
   WiFiClient client = server.client();
   String header =
@@ -339,7 +336,7 @@ void handleStream() {
           c->print("\r\n");
           free(buf);
         } else {
-          delay(10);  // no frame yet — wait briefly
+          delay(10);
         }
       }
       Serial.println("[CAM] Stream client disconnected");
@@ -347,8 +344,7 @@ void handleStream() {
       vTaskDelete(NULL);
     },
     "stream_task", 4096, clientPtr,
-    1,    // priority 1: below det_task (2), above loop/handleClient (0)
-    NULL, 1
+    1, NULL, 1
   );
 }
 
@@ -387,16 +383,10 @@ void handleStatus() {
 //
 //  Runs on Core 0 via det_task at priority 2 (highest).
 //  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-//
-//  Does NOT call esp_camera_fb_get(). Instead copies sharedGrayBuf
-//  (written by snap_task) under grayMux into a local buffer, then
-//  runs AprilTag detection on that local copy.
-//
+//  Reads sharedGrayBuf (written by snap_task) — no fb_get calls.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
-//  Skip log: only printed when confidence > 5.0 (tag visible but weak).
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
-  // Copy shared grayscale frame locally — snap_task owns fb_get/return
   uint8_t* grayBuf = nullptr;
   size_t   grayLen = 0;
   int      W = 0, H = 0;
@@ -419,7 +409,6 @@ void runDetectionAndPush() {
     return;
   }
 
-  // Direct grayscale buffer — no decode, no conversion
   image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = grayBuf };
   zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
 
@@ -455,7 +444,6 @@ void runDetectionAndPush() {
   apriltag_detections_destroy(results);
   free(grayBuf);
 
-  // POST to controller /overlay
   DynamicJsonDocument doc(1024);
   JsonArray arr = doc.createNestedArray("detections");
   for (auto& d : detections) {
@@ -528,19 +516,17 @@ void setup() {
       }
     },
     "det_task", 8192, NULL,
-    2,    // highest priority
-    &detectionTaskHandle, 0
+    2, &detectionTaskHandle, 0
   );
 
-  // snap_task — Core 0, priority 1.
-  // Triggered via xTaskNotifyGive() from loop() every SNAPSHOT_INTERVAL_MS.
-  // SOLE owner of esp_camera_fb_get/return.
+  // snap_task — Core 0, priority 1 — FREE-RUNNING.
+  // SOLE owner of esp_camera_fb_get/return. No notify from loop().
   // Writes sharedGrayBuf for det_task and streamFrameBuf for /stream.
+  // Stack 6144: free-running frame2jpg allocs need headroom.
   xTaskCreatePinnedToCore(
     snapshotTask,
-    "snap_task", 4096, NULL,
-    1,    // below det_task
-    &snapshotTaskHandle, 0
+    "snap_task", 6144, NULL,
+    1, &snapshotTaskHandle, 0
   );
 
   server.on("/stream", HTTP_GET, handleStream);
@@ -553,8 +539,7 @@ void setup() {
   Serial.println("[BOOT] HTTP server started");
   Serial.printf("[BOOT] Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode    : SAFE (boots safe, pump blocked)\n");
-  Serial.printf("[BOOT] Snapshot interval: %dms  Detection interval: %dms\n",
-                SNAPSHOT_INTERVAL_MS, DETECTION_INTERVAL_MS);
+  Serial.printf("[BOOT] Detection interval: %dms\n", DETECTION_INTERVAL_MS);
 }
 
 void loop() {
@@ -570,11 +555,6 @@ void loop() {
   if ((now - lastCpuReportMs) >= CPU_REPORT_INTERVAL_MS) {
     lastCpuReportMs = now;
     printTopCpuTasks();
-  }
-
-  if ((now - lastSnapshotMs) >= SNAPSHOT_INTERVAL_MS) {
-    lastSnapshotMs = now;
-    if (snapshotTaskHandle) xTaskNotifyGive(snapshotTaskHandle);
   }
 
   if ((now - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
