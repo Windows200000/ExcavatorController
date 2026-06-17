@@ -80,10 +80,10 @@ const PinDef PIN_TABLE[] = {
 // gpio   idle   actionHigh     actionHiZ        actionLow
   { 12 , _LOW  , "left_fwd"   ,  nullptr     ,  nullptr      },
   { 26 , _LOW  , "right_fwd"  ,  nullptr     ,  nullptr      },
-  { 33 , _LOW  , "arm_fwd"    ,  nullptr     ,  nullptr      },
+  { 33 , _LOW  , "arm_dwn"    ,  nullptr     ,  nullptr      }, //arm fwd = arm down
   { 14 , _HiZ  ,  nullptr     ,  nullptr     , "left_back"   },
   { 25 , _HiZ  ,  nullptr     ,  nullptr     , "right_back"  },
-  { 32 , _HiZ  ,  nullptr     ,  nullptr     , "arm_back"    },
+  { 32 , _HiZ  ,  nullptr     ,  nullptr     , "arm_up"      },  //arm back = arm up
   { 16 , _LOW  , "turn_left"  ,  nullptr     ,  nullptr      },
   { 17 , _HiZ  ,  nullptr     ,  nullptr     , "turn_right"  },
   { 18 , _LOW  , "light_on"   ,  nullptr     ,  nullptr      },
@@ -91,7 +91,7 @@ const PinDef PIN_TABLE[] = {
 //{ 13 , _HIGH ,  nullptr     , "left_fwd"   , "left_back"   },
 //{ 14 , _HIGH ,  nullptr     , "right_fwd"  , "right_back"  },
 //{ 26 , _HIGH ,  nullptr     , "turn_left"  , "turn_right"  },
-//{ 33 , _HIGH ,  nullptr     , "arm_fwd"    , "arm_back"    },
+//{ 33 , _HIGH ,  nullptr     , "arm_dwn"    , "arm_up"    },
 //{ 15 , _HIGH ,  nullptr     , "light_on"   , "light_off"   },
   {  4 , _HiZ  ,  nullptr     , nullptr      , "test"        },
 };
@@ -333,7 +333,7 @@ const PinDef* findPinByActionLow(const char* actionName) {
 //    Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
 //    Composite: "fwd"  "back"  "spin_left"  "spin_right"
 //    Turntable: "turn_left"  "turn_right"
-//    Arm:       "arm_fwd"(up)  "arm_back"(down)
+//    Arm:       "arm_dwn"(up)  "arm_up"(down)
 //    Aux:       "light"  "test"
 // ─────────────────────────────────────────────
 void runActionSync(const char* button, uint32_t durationMs) {
@@ -377,7 +377,7 @@ void autoNoDetection() {
     Serial.println("[AUTO] Moving back to default height");
     int resetDuration = abs(autoState.armPos - AUTO_ARM_RESET);
     if (autoState.armPos > AUTO_ARM_RESET) {
-      runActionSync("arm_back", resetDuration);
+      runActionSync("arm_up", resetDuration);
     } else {
       runActionSync("arm_forward", resetDuration);
     }
@@ -406,7 +406,7 @@ void autoOnDetection(int offsetX, int offsetY) {
   //   Tracks:    "left_fwd"  "left_back"  "right_fwd"  "right_back"
   //   Composite: "fwd"  "back"  "spin_left"  "spin_right"
   //   Turntable: "turn_left"  "turn_right"
-  //   Arm:       "arm_fwd"(up)  "arm_back"(down)
+  //   Arm:       "arm_dwn"(up)  "arm_up"(down)
   //   Aux:       "light"  "test"
   // AUTO_TURRET_MAX = 3000, AUTO_ARM_MAX = 2000
   // turretPos = 0, armPos 2000
@@ -415,12 +415,12 @@ void autoOnDetection(int offsetX, int offsetY) {
   // Vertical — offsetY drives arm
   if (abs(offsetY) > AUTO_DEADZONE) {
     if (offsetY > 0 && autoState.armPos > 0) {
-      Serial.printf("[AUTO] offsetY=%d → arm_back (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
-      actions.push_back({ "arm_back", 300 });
+      Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
+      actions.push_back({ "arm_up", 300 });
       autoState.armPos -= 300;
     } else if (autoState.armPos < AUTO_ARM_MAX) {
-      Serial.printf("[AUTO] offsetY=%d → arm_fwd (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
-      actions.push_back({ "arm_fwd", 300 });
+      Serial.printf("[AUTO] offsetY=%d → arm_dwn (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
+      actions.push_back({ "arm_dwn", 300 });
       autoState.armPos += 300;
     } else {
       Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
@@ -1095,8 +1095,8 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   <div class="control-group">
     <div class="group-label">Arm</div>
     <div class="btn-row">
-      <button class="ctrl" data-action="arm_fwd"><span class="icon">&#11014;</span><span class="label">FORWARD</span><span class="key">&#8593;</span></button>
-      <button class="ctrl" data-action="arm_back"><span class="icon">&#11015;</span><span class="label">BACKWARD</span><span class="key">&#8595;</span></button>
+      <button class="ctrl" data-action="arm_dwn"><span class="icon">&#11014;</span><span class="label">FORWARD</span><span class="key">&#8593;</span></button>
+      <button class="ctrl" data-action="arm_up"><span class="icon">&#11015;</span><span class="label">BACKWARD</span><span class="key">&#8595;</span></button>
     </div>
   </div>
 
@@ -1146,8 +1146,8 @@ const ACTION_SVG = {
   right_back: ['rt-fill','rt-arrow-back'],
   turn_left:  ['svg-turntable','tt-arrow-left'],
   turn_right: ['svg-turntable','tt-arrow-right'],
-  arm_fwd:    ['svg-boom','svg-stick','svg-bucket','arm-arrow-up'],
-  arm_back:   ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
+  arm_dwn:    ['svg-boom','svg-stick','svg-bucket','arm-arrow-up'],
+  arm_up:   ['svg-boom','svg-stick','svg-bucket','arm-arrow-down'],
   test:       ['svg-test'],
   light:      ['svg-light'],
   pump:       ['svg-pump-body','pump-spray-1','pump-spray-2','pump-spray-3'],
@@ -1354,7 +1354,7 @@ safetyBadge.addEventListener('click', () => {
 const KEY_MAP = {
   'w':'fwd','s':'back','a':'spin_left','d':'spin_right',
   'ArrowLeft':'turn_left','ArrowRight':'turn_right',
-  'ArrowUp':'arm_fwd','ArrowDown':'arm_back',
+  'ArrowUp':'arm_dwn','ArrowDown':'arm_up',
 };
 const TOGGLE_KEYS = new Set(['l', 't']);
 const CAM_KEYS    = new Set([' ']);
