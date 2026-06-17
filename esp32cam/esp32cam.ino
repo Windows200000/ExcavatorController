@@ -7,6 +7,12 @@
  * Stream: snapshot-based MJPEG. Snapshots taken at DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR.
  * Detection runs every DETECTION_INTERVAL_MS on the latest grayscale frame.
  *
+ * Camera fb ownership: snap_task is the SOLE caller of esp_camera_fb_get/return.
+ *   It copies raw grayscale pixels into sharedGrayBuf (protected by grayMux),
+ *   then JPEG-encodes for streaming. det_task reads sharedGrayBuf — no fb_get.
+ *   This prevents concurrent fb_get from two tasks on core 0 causing partial
+ *   DMA frame splits and cam_hal FB-SIZE mismatch errors.
+ *
  * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
  *   Uses uxTaskGetSystemState() — reports runtime % and core for 5 hardcoded tasks:
  *   det_task, snap_task, stream_task, loopTask, tiT.
@@ -87,6 +93,15 @@ uint32_t pumpLastSeen = 0;
 static uint8_t*     streamFrameBuf = nullptr;
 static size_t       streamFrameLen = 0;
 static portMUX_TYPE streamMux      = portMUX_INITIALIZER_UNLOCKED;
+
+// ── Shared grayscale frame — written by snap_task, read by det_task ──
+// snap_task is the SOLE owner of esp_camera_fb_get/return.
+// det_task copies sharedGrayBuf under grayMux, then works on local copy.
+static uint8_t*     sharedGrayBuf = nullptr;
+static size_t       sharedGrayLen = 0;
+static int          sharedGrayW   = 0;
+static int          sharedGrayH   = 0;
+static portMUX_TYPE grayMux       = portMUX_INITIALIZER_UNLOCKED;
 
 // ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
@@ -240,7 +255,11 @@ void initAprilTag() {
 
 // ════════════════════════════════════════════════════════════
 //  Snapshot task — Core 0, priority 1
-//  Captures grayscale frame, JPEG-encodes it, stashes in streamFrameBuf.
+//  SOLE owner of esp_camera_fb_get / esp_camera_fb_return.
+//  On each frame:
+//    1. Copies raw grayscale pixels into sharedGrayBuf (grayMux protected)
+//       so det_task can read without touching the camera HAL.
+//    2. JPEG-encodes the frame and stashes in streamFrameBuf for /stream.
 //  Fires every SNAPSHOT_INTERVAL_MS via xTaskNotifyGive() from loop().
 // ════════════════════════════════════════════════════════════
 void snapshotTask(void*) {
@@ -255,6 +274,21 @@ void snapshotTask(void*) {
       continue;
     }
 
+    // ── 1. Stash raw grayscale for det_task ──
+    portENTER_CRITICAL(&grayMux);
+    if (sharedGrayLen != fb->len) {
+      free(sharedGrayBuf);
+      sharedGrayBuf = (uint8_t*)malloc(fb->len);
+    }
+    if (sharedGrayBuf) {
+      memcpy(sharedGrayBuf, fb->buf, fb->len);
+      sharedGrayLen = fb->len;
+      sharedGrayW   = fb->width;
+      sharedGrayH   = fb->height;
+    }
+    portEXIT_CRITICAL(&grayMux);
+
+    // ── 2. JPEG encode for /stream ──
     uint8_t* jBuf = nullptr;
     size_t   jLen = 0;
     if (frame2jpg(fb, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
@@ -264,6 +298,7 @@ void snapshotTask(void*) {
       streamFrameLen = jLen;
       portEXIT_CRITICAL(&streamMux);
     }
+
     esp_camera_fb_return(fb);
   }
 }
@@ -352,26 +387,40 @@ void handleStatus() {
 //
 //  Runs on Core 0 via det_task at priority 2 (highest).
 //  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-//  PIXFORMAT_GRAYSCALE: fb->buf is raw grayscale bytes — passed directly to
-//  image_u8_t. No fmt2rgb888 decode. No red dot detection.
-//  quad_decimate=4.0: AprilTag processes 160x120 internally.
 //
-//  Skip log: only printed when confidence > 5.0 (i.e. tag visible but weak).
-//  Sub-5% detections are noise — not logged to avoid serial spam.
+//  Does NOT call esp_camera_fb_get(). Instead copies sharedGrayBuf
+//  (written by snap_task) under grayMux into a local buffer, then
+//  runs AprilTag detection on that local copy.
+//
+//  quad_decimate=4.0: AprilTag processes 160x120 internally.
+//  Skip log: only printed when confidence > 5.0 (tag visible but weak).
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { Serial.println("[DET] fb_get failed"); return; }
-  if (fb->format != PIXFORMAT_GRAYSCALE || fb->len == 0) {
-    Serial.printf("[DET] Bad frame: format=%d len=%d\n", fb->format, fb->len);
-    esp_camera_fb_return(fb);
+  // Copy shared grayscale frame locally — snap_task owns fb_get/return
+  uint8_t* grayBuf = nullptr;
+  size_t   grayLen = 0;
+  int      W = 0, H = 0;
+
+  portENTER_CRITICAL(&grayMux);
+  if (sharedGrayBuf && sharedGrayLen > 0) {
+    grayBuf = (uint8_t*)malloc(sharedGrayLen);
+    if (grayBuf) {
+      memcpy(grayBuf, sharedGrayBuf, sharedGrayLen);
+      grayLen = sharedGrayLen;
+      W       = sharedGrayW;
+      H       = sharedGrayH;
+    }
+  }
+  portEXIT_CRITICAL(&grayMux);
+
+  if (!grayBuf || grayLen == 0 || W == 0 || H == 0) {
+    Serial.println("[DET] No frame available yet");
+    free(grayBuf);
     return;
   }
 
-  int W = fb->width, H = fb->height;
-
   // Direct grayscale buffer — no decode, no conversion
-  image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = fb->buf };
+  image_u8_t aprilImg = { .width = W, .height = H, .stride = W, .buf = grayBuf };
   zarray_t* results = apriltag_detector_detect(atDetector, &aprilImg);
 
   std::vector<Detection> detections;
@@ -388,7 +437,6 @@ void runDetectionAndPush() {
     }
     float confidence = det->decision_margin;
     if (confidence < MARKER_CONFIDENCE_CUTOFF) {
-      // Only log skip if confidence is meaningfully above noise floor (>5%)
       if (confidence > 5.0f) {
         Serial.printf("[AT] SKIPPING ID %d confidence=%.1f%% CUTOFF=%.1f\n",
                       det->id, confidence, MARKER_CONFIDENCE_CUTOFF);
@@ -405,7 +453,7 @@ void runDetectionAndPush() {
     }
   }
   apriltag_detections_destroy(results);
-  esp_camera_fb_return(fb);
+  free(grayBuf);
 
   // POST to controller /overlay
   DynamicJsonDocument doc(1024);
@@ -471,7 +519,7 @@ void setup() {
 
   // det_task — Core 0, priority 2 (highest).
   // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-  // Reads grayscale fb directly into AprilTag — no decode step.
+  // Reads from sharedGrayBuf — no esp_camera_fb_get() calls.
   xTaskCreatePinnedToCore(
     [](void* arg) {
       for (;;) {
@@ -484,9 +532,10 @@ void setup() {
     &detectionTaskHandle, 0
   );
 
-  // snapshot_task — Core 0, priority 1.
+  // snap_task — Core 0, priority 1.
   // Triggered via xTaskNotifyGive() from loop() every SNAPSHOT_INTERVAL_MS.
-  // Encodes grayscale frame as JPEG, stashes in streamFrameBuf for /stream.
+  // SOLE owner of esp_camera_fb_get/return.
+  // Writes sharedGrayBuf for det_task and streamFrameBuf for /stream.
   xTaskCreatePinnedToCore(
     snapshotTask,
     "snap_task", 4096, NULL,
