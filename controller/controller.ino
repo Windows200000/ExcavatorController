@@ -565,7 +565,7 @@ void handleOverlayPost() {
       processDetection(overlayJson);
     } else {
       // Serial.printf("[OVERLAY] Skipped: autoEnabled=%d autoStatus=%s\n",
-        autoEnabled, autoStatus == AUTO_BUSY ? "BUSY" : "WAITING");
+      //  autoEnabled, autoStatus == AUTO_BUSY ? "BUSY" : "WAITING");
     }
   }
   server.send(200, "text/plain", "OK");
