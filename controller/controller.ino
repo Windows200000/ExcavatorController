@@ -184,6 +184,8 @@ struct AutoState {
   int32_t turretPos = 0;   // estimated turntable position; increment/decrement as turn_left/right are issued
   int32_t armPos = AUTO_ARM_DEFAULT_POS;     //from Bottom
   int32_t last_det = 0;
+  int32_t center_strk = 0;
+  bool    is_firing = false;
   // int phase = 0;    // example: add a phase/step counter like this
 } autoState;
 
@@ -352,6 +354,15 @@ void runActionSync(const char* button, uint32_t durationMs) {
 }
 
 void autoDefaultPosition() {
+}
+
+// ─────────────────────────────────────────────
+//  autoAlways — runs every processDetection() call, before detection check.
+//  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
+//  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
+// ─────────────────────────────────────────────
+void autoAlways(int offsetX, int offsetY) {
+  // ── USER CODE AREA 1 — runs every frame ──────────────────
   // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET_POS position
   if (autoState.armPos != AUTO_ARM_RESET_POS && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
@@ -365,15 +376,11 @@ void autoDefaultPosition() {
     autoState.last_det = millis();
     autoState.armPos = AUTO_ARM_RESET_POS;
   }
-}
 
-// ─────────────────────────────────────────────
-//  autoAlways — runs every processDetection() call, before detection check.
-//  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
-//  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
-// ─────────────────────────────────────────────
-void autoAlways(int offsetX, int offsetY) {
-  // ── USER CODE AREA 1 — runs every frame ──────────────────
+  if (autoState.center_strk > 5) {
+    autoState.is_firing = true
+    // Start firing
+  }
 
   // ─────────────────────────────────────────────────────────
 }
@@ -400,6 +407,7 @@ void autoNoDetection() {
 // ─────────────────────────────────────────────
 void autoOnDetection(int offsetX, int offsetY) {
   autoState.last_det = millis();
+  bool centered = 1;
 
   // ── USER CODE AREA 3 — runs on detection ─────────────────
   // Call runActionSync("button", ms) here for any synchronous blocking action.
@@ -419,6 +427,7 @@ void autoOnDetection(int offsetX, int offsetY) {
 
   // Vertical — offsetY drives arm
   if (abs(offsetY) > AUTO_DEADZONE) {
+    centered = false;
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
       actions.push_back({ "arm_dwn", 300 });
@@ -436,6 +445,7 @@ void autoOnDetection(int offsetX, int offsetY) {
 
   // Horizontal — offsetX drives turret/track
   if (abs(offsetX) > AUTO_DEADZONE) {
+    centered = false;
     if (offsetX < 0 && autoState.turretPos > -AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
       actions.push_back({ "right_fwd", 400 });
@@ -453,6 +463,9 @@ void autoOnDetection(int offsetX, int offsetY) {
     Serial.printf("[AUTO] offsetX=%d in deadzone — no turret action\n", offsetX);
   }
 
+  if (centered == true) {
+   autoState.center_strk += 1;
+  }
   int actionCount = actions.size();
   // Serial.printf("[AUTO] Total actions queued: %d\n", actionCount);
 
@@ -692,7 +705,7 @@ void handleAutoSet() {
     String val = server.arg("set");
     if (val == "on") {
       autoEnabled = true;
-      autoState.armPos = 
+      autoState.armPos = AUTO_ARM_DEFAULT_POS;
       Serial.println("[AUTO] Enabled");
     }
     if (val == "off") {
