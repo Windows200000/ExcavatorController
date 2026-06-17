@@ -363,7 +363,7 @@ void autoDefaultPosition() {
 // ─────────────────────────────────────────────
 void autoAlways(int offsetX, int offsetY) {
   // ── USER CODE AREA 1 — runs every frame ──────────────────
-  // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
+  Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET_POS position
   if (autoState.armPos != AUTO_ARM_RESET_POS && autoState.last_det + AUTO_TIMEOUT_MS < millis() && autoEnabled && autoStatus == AUTO_WAITING) {
     Serial.println("[AUTO] Moving back to default height");
@@ -377,9 +377,21 @@ void autoAlways(int offsetX, int offsetY) {
     autoState.armPos = AUTO_ARM_RESET_POS;
   }
 
+  if (abs(offsetX) > AUTO_DEADZONE || abs(offsetY) > AUTO_DEADZONE) {
+    Serial.printl("[AUTO] Stopped firing.");
+    autoState.center_strk = 0;
+    autoState.is_firing = true;
+    // Stop firing
+  }
+
   if (autoState.center_strk > 5) {
-    autoState.is_firing = true
+    if (autoState.is_firing == true) {
+      // Continue firing
+    } else {
+    autoState.is_firing = true;
+    Serial.printl("[AUTO] FIREEE");
     // Start firing
+    }
   }
 
   // ─────────────────────────────────────────────────────────
@@ -464,8 +476,9 @@ void autoOnDetection(int offsetX, int offsetY) {
   }
 
   if (centered == true) {
-   autoState.center_strk += 1;
+    autoState.center_strk += 1;
   }
+
   int actionCount = actions.size();
   // Serial.printf("[AUTO] Total actions queued: %d\n", actionCount);
 
