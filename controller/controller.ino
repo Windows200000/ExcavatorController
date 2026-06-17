@@ -477,10 +477,12 @@ void autoOnDetection(int offsetX, int offsetY) {
       if (!stopped[i]) stopAction(String(actions[i].button));
   }
   // Post-correction delay — let machine settle before next detection cycle
-  uint32_t delayStart = millis();
-  while (millis() - delayStart < AUTO_CORRECTION_DELAY_MS) {
-    server.handleClient();
-    delay(10);
+  if (actionCount > 0) {
+    uint32_t delayStart = millis();
+    while (millis() - delayStart < AUTO_CORRECTION_DELAY_MS) {
+      server.handleClient();
+      delay(10);
+    }
   }
 }
 
