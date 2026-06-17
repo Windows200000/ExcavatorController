@@ -224,7 +224,7 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_GRAYSCALE;  // raw gray pixels — no decode needed
   config.frame_size   = FRAME_SIZE;
-  config.fb_count     = psramFound() ? 2 : 1;
+  config.fb_count     = 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("[CAM] Init failed: 0x%x\n", err); return false; }
