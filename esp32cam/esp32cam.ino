@@ -23,9 +23,17 @@
  *   scheduler to yield instead. Timeout 10-20ms; on timeout the frame is skipped
  *   for that consumer but fb is still returned — no stall.
  *
+ * Core layout:
+ *   Core 0: snap_task (prio 2, highest) — free-running capture+encode
+ *           tiT (prio 18, lwIP/WiFi — preempts briefly but yields quickly)
+ *   Core 1: det_task (prio 2, highest) — AprilTag detect + POST
+ *           stream_task (prio 1) — MJPEG write per connected client
+ *           loopTask (prio 1) — Arduino loop()/handleClient()
+ *
  * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
- *   Uses uxTaskGetSystemState() — reports runtime % and core for 5 hardcoded tasks:
- *   det_task, snap_task, stream_task, loopTask, tiT.
+ *   Uses uxTaskGetSystemState(). Per-core totals computed by summing ulRunTimeCounter
+ *   across ALL tasks on each core — percentages reflect % of that core's capacity.
+ *   tskNO_AFFINITY tasks are split half/half across both core totals.
  *   Percentages are cumulative since boot (not rolling window).
  *
  * Stream: max 1 concurrent client enforced via streamClientActive flag.
@@ -102,14 +110,13 @@ bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
 // ── Stashed JPEG for /stream — written by snap_task, read by stream_task ──
-// Protected by FreeRTOS mutex (not spinlock) — memcpy of JPEG can be >10KB,
-// too long to hold a spinlock across cores.
+// Protected by FreeRTOS mutex (not spinlock) — JPEG memcpy too long for spinlock.
 static uint8_t*          streamFrameBuf    = nullptr;
 static size_t            streamFrameLen    = 0;
 static SemaphoreHandle_t streamMux         = nullptr;
 
 // ── Shared grayscale frame — written by snap_task, read by det_task ──
-// Protected by FreeRTOS mutex — memcpy of ~305KB must not spinlock-stall Core 1.
+// Protected by FreeRTOS mutex — memcpy of ~305KB must not spinlock-stall other core.
 // snap_task is the SOLE owner of esp_camera_fb_get/return.
 // det_task copies sharedGrayBuf under grayMux, then works on local copy.
 static uint8_t*          sharedGrayBuf     = nullptr;
@@ -126,7 +133,14 @@ TaskHandle_t detectionTaskHandle = NULL;
 TaskHandle_t snapshotTaskHandle  = NULL;
 
 // ════════════════════════════════════════════════════════════
-//  CPU profiling — top-5 hardcoded tasks
+//  CPU profiling — top-5 hardcoded tasks, per-core percentages
+//
+//  Algorithm:
+//    Pass 1: iterate ALL tasks, accumulate per-core total ticks.
+//            tskNO_AFFINITY tasks: add half their ticks to each core.
+//    Pass 2: for each watched task, find it and compute
+//            pct = taskTicks * 1000 / coreTotalTicks  (tenths of %)
+//  This yields true % of that core's capacity, not % of combined runtime.
 // ════════════════════════════════════════════════════════════
 struct CpuWatchTask { const char* exactName; };
 
@@ -153,25 +167,42 @@ void printTopCpuTasks() {
     return;
   }
 
-  Serial.println("[CPU] ══ Top-5 Task CPU Report ══");
+  // Pass 1: sum ticks per core
+  uint64_t coreTicks[2] = { 0, 0 };
+  for (UBaseType_t j = 0; j < actualCount; j++) {
+    BaseType_t core = taskStatus[j].xCoreID;
+    uint32_t   t    = taskStatus[j].ulRunTimeCounter;
+    if (core == 0)               coreTicks[0] += t;
+    else if (core == 1)          coreTicks[1] += t;
+    else {                        // tskNO_AFFINITY — split half/half
+      coreTicks[0] += t / 2;
+      coreTicks[1] += t / 2;
+    }
+  }
+
+  Serial.println("[CPU] ══ Per-Core CPU Report ══");
+  Serial.printf("[CPU]  Core 0 total ticks: %llu\n", coreTicks[0]);
+  Serial.printf("[CPU]  Core 1 total ticks: %llu\n", coreTicks[1]);
+
+  // Pass 2: report watched tasks
   for (int i = 0; i < 5; i++) {
     bool found = false;
     for (UBaseType_t j = 0; j < actualCount; j++) {
       if (strcmp(taskStatus[j].pcTaskName, CPU_WATCH_TOP5[i].exactName) == 0) {
-        uint32_t pct10 = (uint32_t)(((uint64_t)taskStatus[j].ulRunTimeCounter * 1000ULL) / totalRunTime);
-        BaseType_t core = taskStatus[j].xCoreID;
-        if (core == tskNO_AFFINITY) {
-          Serial.printf("[CPU]  %-12s  core=any  %2lu.%lu%%  ticks=%lu\n",
-            CPU_WATCH_TOP5[i].exactName,
-            (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
-            (unsigned long)taskStatus[j].ulRunTimeCounter);
-        } else {
-          Serial.printf("[CPU]  %-12s  core=%ld    %2lu.%lu%%  ticks=%lu\n",
-            CPU_WATCH_TOP5[i].exactName,
-            (long)core,
-            (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
-            (unsigned long)taskStatus[j].ulRunTimeCounter);
-        }
+        BaseType_t core    = taskStatus[j].xCoreID;
+        uint32_t   ticks   = taskStatus[j].ulRunTimeCounter;
+        uint64_t   coreTotal = (core == 0) ? coreTicks[0]
+                             : (core == 1) ? coreTicks[1]
+                             : (coreTicks[0] + coreTicks[1]); // affinity=any: use combined
+        uint32_t pct10 = (coreTotal > 0)
+                       ? (uint32_t)(((uint64_t)ticks * 1000ULL) / coreTotal)
+                       : 0;
+        const char* coreStr = (core == 0) ? "core=0" : (core == 1) ? "core=1" : "core=any";
+        Serial.printf("[CPU]  %-12s  %s  %3lu.%lu%%/core   ticks=%lu\n",
+          CPU_WATCH_TOP5[i].exactName,
+          coreStr,
+          (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
+          (unsigned long)ticks);
         found = true;
         break;
       }
@@ -256,7 +287,7 @@ void initAprilTag() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  Snapshot task — Core 0, priority 1 — FREE-RUNNING
+//  Snapshot task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING
 //  SOLE owner of esp_camera_fb_get / esp_camera_fb_return.
 //  Runs as fast as sensor + frame2jpg allows (~8fps at VGA grayscale).
 //  No xTaskNotifyGive needed — loop() does NOT notify this task.
@@ -418,9 +449,9 @@ void handleStatus() {
 // ════════════════════════════════════════════════════════════
 //  Detection + overlay push
 //
-//  Runs on Core 0 via det_task at priority 2 (highest).
+//  Runs on Core 1 via det_task at priority 2 (highest on Core 1).
 //  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-//  Reads sharedGrayBuf (written by snap_task) — no fb_get calls.
+//  Reads sharedGrayBuf (written by snap_task on Core 0) — no fb_get calls.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
 //
 //  StaticJsonDocument<1024> used — stack-allocated, no heap churn per cycle.
@@ -558,9 +589,9 @@ void setup() {
   connectWiFi();
   registerWithController();
 
-  // det_task — Core 0, priority 2 (highest).
+  // det_task — Core 1, priority 2 (highest on Core 1).
   // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-  // Reads from sharedGrayBuf — no esp_camera_fb_get() calls.
+  // Reads from sharedGrayBuf written by snap_task on Core 0 — no fb_get calls.
   xTaskCreatePinnedToCore(
     [](void* arg) {
       for (;;) {
@@ -569,17 +600,17 @@ void setup() {
       }
     },
     "det_task", 8192, NULL,
-    2, &detectionTaskHandle, 0
+    2, &detectionTaskHandle, 1
   );
 
-  // snap_task — Core 0, priority 1 — FREE-RUNNING.
+  // snap_task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING.
   // SOLE owner of esp_camera_fb_get/return. No notify from loop().
   // Writes sharedGrayBuf for det_task and streamFrameBuf for /stream.
   // Stack 6144: free-running frame2jpg allocs need headroom.
   xTaskCreatePinnedToCore(
     snapshotTask,
     "snap_task", 6144, NULL,
-    1, &snapshotTaskHandle, 0
+    2, &snapshotTaskHandle, 0
   );
 
   server.on("/stream", HTTP_GET, handleStream);
@@ -593,6 +624,7 @@ void setup() {
   Serial.printf("[BOOT] Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode    : SAFE (boots safe, pump blocked)\n");
   Serial.printf("[BOOT] Detection interval: %dms\n", DETECTION_INTERVAL_MS);
+  Serial.println("[BOOT] Core layout: Core0=snap_task(p2) | Core1=det_task(p2)+stream_task(p1)+loopTask(p1)");
 }
 
 void loop() {
