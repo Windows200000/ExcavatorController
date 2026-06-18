@@ -396,11 +396,12 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     relayCamCmd("/pump?action=press");
     }
   }
-  int time1 = 300;
-  int time2 = 200;
-  int time3 = 100;
-  int delayms = 500;
+  int time1 = 150;
+  int time2 = 150;
+  int time3 = 150;
+  int delayms = 200;
   // debugDropdown, sebugFlag1
+  // all 140-145
   // min arm dwn
   // min arm up
   // min left fwd
@@ -411,7 +412,7 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     runActionSync("arm_dwn", time2);
     delay(delayms);
     runActionSync("arm_dwn", time3);
-    delay(delayms);
+    delay(delayms*2);
   }
   if (debugFlag2) {
     runActionSync("arm_up", time1);
@@ -419,7 +420,7 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     runActionSync("arm_up", time2);
     delay(delayms);
     runActionSync("arm_up", time3);
-    delay(delayms);
+    delay(delayms*2);
   }
   if (debugFlag3) {
     runActionSync("left_fwd", time1);
@@ -427,7 +428,7 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     runActionSync("left_fwd", time2);
     delay(delayms);
     runActionSync("left_fwd", time3);
-    delay(delayms);
+    delay(delayms*2);
   }
   if (debugFlag4) {
     runActionSync("left_back", time1);
@@ -435,7 +436,7 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     runActionSync("left_back", time2);
     delay(delayms);
     runActionSync("left_back", time3);
-    delay(delayms);
+    delay(delayms*2);
   }
   // ─────────────────────────────────────────────────────────
 }
