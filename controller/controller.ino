@@ -191,6 +191,15 @@ struct AutoState {
   // int phase = 0;    // example: add a phase/step counter like this
 } autoState;
 
+// ─────────────────────────────────────────────
+//  Pump heartbeat — keeps cam pump alive during blocking auto actions.
+//  loop() sends /pump?action=hold every PUMP_HB_INTERVAL_MS while
+//  autoState.is_firing is true, independent of detection cadence.
+//  Cam PUMP_HOLD_TIMEOUT_MS = 800ms; beat at 200ms for safe margin.
+// ─────────────────────────────────────────────
+const uint32_t PUMP_HB_INTERVAL_MS = 200;
+static uint32_t lastPumpHbMs = 0;
+
 // ════════════════════════════════════════════════════════════
 //  Pin helpers
 // ════════════════════════════════════════════════════════════
@@ -388,16 +397,12 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
     relayCamCmd("/pump?action=release");
   }
 
-  if (autoState.center_strk > 5) {
-    if (autoState.is_firing == true) {
-    relayCamCmd("/pump?action=press");
-    relayCamCmd("/pump?action=hold");
-    } else {
+  if (autoState.center_strk > 5 && !autoState.is_firing) {
     autoState.is_firing = true;
-    Serial.println  ("[AUTO] FIREEE");
+    Serial.println("[AUTO] FIREEE");
     relayCamCmd("/pump?action=press");
-    }
   }
+
   int time1 = 150;
   int time2 = 150;
   int time3 = 150;
@@ -856,6 +861,16 @@ void loop() {
     }
   }
   autoDefaultPosition();
+
+  // ── Pump hold heartbeat ─────────────────────────────────────────────────
+  // Keeps cam pump relay alive when auto is firing, independent of detection
+  // cadence. Cam times out pump at PUMP_HOLD_TIMEOUT_MS=800ms; we beat at 200ms.
+  if (autoState.is_firing) {
+    if (now - lastPumpHbMs >= PUMP_HB_INTERVAL_MS) {
+      relayCamCmd("/pump?action=hold");
+      lastPumpHbMs = now;
+    }
+  }
 }
 
 
