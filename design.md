@@ -247,7 +247,7 @@ Because both controls are **pulse-based** (the hardware toggle is a momentary GP
 ### Button Behaviour
 
 | Button | Type | Behaviour |
-|--------|------|-----------|
+|--------|------|-----------| 
 | `left_fwd` | Hold | Left track forward (GPIO 12 HIGH) |
 | `left_back` | Hold | Left track back (GPIO 14 LOW) |
 | `right_fwd` | Hold | Right track forward (GPIO 26 HIGH) |
@@ -518,7 +518,7 @@ Frame drops were caused by several compounding issues identified by analysis of 
 #### Root causes (original design)
 
 1. **`snap_task` JPEG encode on every frame** — `frame2jpg` took ~30–50ms on Core 0, blocking `fb_return` and idling the sensor even with no stream client connected.
-2. **`streamMux` contention** — `snap_task` held `streamMux` while writing the JPEG stash; `stream_task` held it during `c->write()` TCP send (unbounded latency). If TCP stalled 50ms on congested WiFi, `snap_task` hit its 10ms timeout and dropped the frame.
+2. **`streamMux` contention** — `snap_task` held `streamMux` while writing the JPEG stash; `stream_task` held it during `c->write()` TCP send (unbounded latency). If TCP stalled 50ms on congested WiFi, `snap_task` hit its timeout and dropped the frame.
 3. **`grayMux` contention** — every 500ms `det_task` held `grayMux` for a full 305KB memcpy. If this overlapped with `snap_task`'s gray write, `snap_task` blocked and sensor DMA stalled.
 4. **`fb_count=1`** — sensor DMA had only one buffer. Any `snap_task` block (mutex wait or encode time) idled the sensor entirely.
 
@@ -539,17 +539,23 @@ Frame drops were caused by several compounding issues identified by analysis of 
 
 This eliminates all cross-consumer contention. `det_task` holding `detGrayMux` during a 200ms detection cycle has zero effect on `stream_task`, and vice versa.
 
-A shared double-buffer with consumer tracking was considered but rejected: it requires knowing when both consumers are done reading before swapping, which effectively reinvents a mutex. Separate buffers are simpler and the RAM cost (2 × 305KB in PSRAM) is acceptable.
+#### Decision: `snap_task` waits up to 150ms per consumer
 
-A per-consumer local copy (2×2 buffers) was also considered but rejected: 4 × 305KB = ~1.2MB just for gray buffers, with marginal benefit since the mutex hold time is already short with try-lock.
+Both `streamGrayMux` and `detGrayMux` are taken with `xSemaphoreTake(..., pdMS_TO_TICKS(150))` in `snap_task`. If a consumer is still holding the mutex, `snap_task` blocks for up to 150ms before giving up. This ensures frames are not silently dropped under normal load — consumers finish their memcpy well within 150ms. `fb_return` still happens after both consumers are served (or timed out).
 
-#### Decision: `snap_task` never blocks — try-lock only
+Previously, zero-timeout try-locks were used and frames were silently skipped if a consumer was busy. This caused silent frame drops under load.
 
-Both `streamGrayMux` and `detGrayMux` are taken with `xSemaphoreTake(..., 0)` (zero timeout) in `snap_task`. If a consumer is still reading, the frame is silently skipped for that consumer. `fb_return` always happens immediately — the sensor never idles waiting for application logic.
+Consumers (`stream_task`, `det_task`) also use 150ms timeout when copying out their local working buffer, up from the previous 20ms. This accommodates the ~60–100ms memcpy time for a 305KB PSRAM buffer at ~3–5 MB/s PSRAM bandwidth.
 
-This replaces the previous 10ms timeout approach, which still caused `snap_task` to block and stall the sensor DMA under load.
+#### Decision: `det_task` notified directly by `snap_task`
 
-`det_task` and `stream_task` still use a 20ms timeout when copying out their local working buffer — this is safe because their copy is fast (~2–5ms) and they never hold the lock during slow operations (detection, TCP write).
+`det_task` is triggered via `xTaskNotifyGive()` from `snap_task` every `DETECTION_INTERVAL_MS`, **not** from `loop()`. This ensures det_task is always triggered at the exact moment a fresh frame is available in `grayDetBuf`, rather than on a separate timer that could drift.
+
+A `detBusy` flag prevents queuing multiple notifies while `det_task` is mid-cycle (running AprilTag detect + HTTP POST). `snap_task` checks `detBusy` before calling `xTaskNotifyGive`; `det_task` clears `detBusy` at the end of `runDetectionAndPush()`. `loop()` no longer notifies `det_task`.
+
+#### Decision: detection has priority over stream in `snap_task`
+
+On each frame, `snap_task` checks the det interval **first** — if elapsed, it copies into `grayDetBuf` and notifies `det_task` before touching `grayStreamBuf`. This ensures `det_task` always gets the freshest possible frame with minimal latency.
 
 #### Decision: `fb_count=2`
 
@@ -557,29 +563,29 @@ Re-enabled after being forced to 1 due to a suspected OV2640 partial-frame bug w
 
 #### Decision: gray buffers in PSRAM
 
-`grayStreamBuf` and `grayDetBuf` are allocated with `ps_malloc()` (PSRAM). At 305KB each, they will not fit in internal SRAM (ESP32 has ~320KB usable internal RAM after FreeRTOS and WiFi stack). The ESP32-CAM AI-Thinker has 4MB PSRAM; the camera driver already uses it automatically for the DMA framebuffer. Switching explicit allocations to `ps_malloc` is a correctness fix — the previous `malloc` calls for `sharedGrayBuf` were almost certainly already hitting PSRAM or causing internal heap exhaustion.
-
-`localGray` in `stream_task` (the short-lived encode buffer) uses plain `malloc` — it is allocated and freed within one loop iteration (~50ms) so internal RAM is fine.
-
-Boot log and `/status` endpoint report both `ESP.getFreeHeap()` and `ESP.getFreePsram()` to verify PSRAM is active at runtime.
+`grayStreamBuf` and `grayDetBuf` are allocated with `ps_malloc()` (PSRAM). At 305KB each, they will not fit in internal SRAM (ESP32 has ~320KB usable internal RAM after FreeRTOS and WiFi stack). The ESP32-CAM AI-Thinker has 4MB PSRAM; the camera driver already uses it automatically for the DMA framebuffer.
 
 ### Snapshot-Based MJPEG Stream
 
-`snap_task` (Core 0, priority 2) runs **free-running** — no notify from `loop()`. It captures frames as fast as the sensor allows (~8 fps at VGA grayscale). `snap_task` never blocks — both mutex takes are zero-timeout try-locks:
+`snap_task` (Core 0, priority 2) runs **free-running** — no notify from `loop()`. It captures frames as fast as the sensor allows (~5 fps at VGA grayscale, self-paced by `esp_camera_fb_get` blocking until the sensor delivers a frame).
 
-1. `esp_camera_fb_get()` — grayscale frame from DMA
-2. Validate frame (size check, OV2640 477-line quirk tolerance)
-3. **Try-lock `streamGrayMux` (no wait):** copy raw gray into `grayStreamBuf`; notify `stream_task` via `xTaskNotifyGive`. Skip silently if `stream_task` still reading.
-4. **Every `DETECTION_INTERVAL_MS`, try-lock `detGrayMux` (no wait):** copy raw gray into `grayDetBuf`. Skip silently if `det_task` still reading. `det_task` is triggered by `loop()` separately.
-5. `esp_camera_fb_return(fb)` — always immediate, never delayed by application logic
+On each frame, `snap_task` follows this sequence:
+
+1. `esp_camera_fb_get()` — blocks until sensor delivers a grayscale frame. A stall watchdog logs if this takes >50ms: `[SNP] fb_get stalled Xms`. OV2640 occasionally drops a VSYNC causing stalls of 500–1200ms; these are surfaced by the watchdog but are a sensor-level quirk.
+2. Validate frame (size check, OV2640 477-line quirk tolerance: `fb->len >= fb->width * (fb->height - 4)`)
+3. **Detection first (highest priority) — every `DETECTION_INTERVAL_MS`:** wait up to 150ms for `detGrayMux`, copy raw gray into `grayDetBuf`, release `detGrayMux`, notify `det_task` (if `!detBusy`).
+4. **Stream — every frame:** wait up to 150ms for `streamGrayMux`, copy raw gray into `grayStreamBuf`, release `streamGrayMux`, notify `stream_task` via `xTaskNotifyGive(streamTaskHandle)`.
+5. `esp_camera_fb_return(fb)` — always called after both consumers are served or timed out.
 
 `snap_task` is the **sole** caller of `esp_camera_fb_get` / `esp_camera_fb_return`. Neither `det_task` nor `stream_task` ever calls these.
 
-A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It blocks on `ulTaskNotifyTake` (200ms watchdog) waiting for `snap_task` to signal a new frame, then:
-1. Copies `grayStreamBuf` into a local buffer under `streamGrayMux` (20ms timeout)
+A **stream serve task** (`stream_task`, Core **0**, priority 1) is spawned per client connection on `/stream`. It blocks on `ulTaskNotifyTake` (200ms watchdog) waiting for `snap_task` to signal a new frame, then:
+1. Copies `grayStreamBuf` into a local buffer under `streamGrayMux` (150ms timeout)
 2. Releases `streamGrayMux` immediately
 3. Calls `fmt2jpg(localGray, ...)` outside the lock — encode takes 30–50ms but holds no mutex
 4. Writes the resulting JPEG as an MJPEG multipart frame via `c->write()`
+
+> **Note:** `stream_task` runs on Core **0** (same as `snap_task`). This is intentional — `snap_task` is priority 2 and `stream_task` is priority 1, so `snap_task` preempts `stream_task` freely whenever a new frame is ready. Keeping both on Core 0 leaves Core 1 entirely free for `det_task` (heavy AprilTag compute).
 
 The MJPEG multipart format (`multipart/x-mixed-replace; boundary=frame`) is unchanged — no changes required in the controller or browser.
 
@@ -596,26 +602,48 @@ Previously `fb_count=1` due to a suspected OV2640 partial-frame bug with graysca
 
 ```
 Sensor DMA (fb_count=2)
-    └── snap_task (Core 0) — sole fb_get/return owner, never blocks
+    └── snap_task (Core 0, p2) — sole fb_get/return owner
+            │  fb_get stall watchdog: logs if >50ms
             │
-            ├── try-lock streamGrayMux (timeout=0)
-            │       └── grayStreamBuf [PSRAM, 305KB]
-            │               └── stream_task: copy under lock → fmt2jpg outside lock → TCP write
+            ├── [DET FIRST] wait detGrayMux (150ms) every DETECTION_INTERVAL_MS
+            │       └── grayDetBuf [PSRAM, 305KB]
+            │               └── notify det_task (if !detBusy → set detBusy=true)
+            │                       └── det_task: copy under lock (150ms) → AprilTag → POST
+            │                               └── detBusy = false on completion
             │
-            └── try-lock detGrayMux (timeout=0, every 500ms)
-                    └── grayDetBuf [PSRAM, 305KB]
-                            └── det_task: copy under lock → AprilTag detect outside lock → POST
+            └── [STREAM] wait streamGrayMux (150ms) every frame
+                    └── grayStreamBuf [PSRAM, 305KB]
+                            └── notify stream_task
+                                    └── stream_task: copy under lock (150ms) → fmt2jpg → TCP write
 ```
 
 ### Task Priorities
 
 | Task | Core | Priority | Role |
 |------|------|----------|------|
-| `snap_task` | 0 | 2 (highest) | Free-running grayscale capture + gray memcpy; sole fb_get/return owner; never blocks |
-| `det_task` | 1 | 2 (highest) | AprilTag detection + POST to controller |
-| `stream_task` | 1 | 1 | JPEG encode (fmt2jpg) + MJPEG frame serve per connected client |
-| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` |
+| `snap_task` | 0 | 2 (highest on Core 0) | Free-running grayscale capture + gray memcpy; sole fb_get/return owner; waits up to 150ms per consumer |
 | `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker (preempts briefly, yields quickly) |
+| `stream_task` | 0 | 1 | JPEG encode (fmt2jpg) + MJPEG frame serve per connected client — preempted by snap_task |
+| `det_task` | 1 | 2 (highest on Core 1) | AprilTag detection + POST to controller; notified by snap_task |
+| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` |
+
+> `tiT` has nominal priority 18 but yields to the lwIP stack quickly; effective CPU usage is ~0.5–2% of Core 0.
+
+### Diagnostics — Watchdogs
+
+Two watchdogs are active for pipeline visibility:
+
+**fb_get stall watchdog** — in `snap_task`, logs if `esp_camera_fb_get()` takes >50ms:
+```
+[SNP] fb_get stalled 283ms
+```
+Typical frame period at VGA grayscale is ~200–290ms (~4–5 fps). Spikes of 500–1200ms indicate OV2640 VSYNC drops — a known sensor quirk, not a firmware bug.
+
+**POST duration watchdog** — in `runDetectionAndPush()`, logs if HTTP POST to `/overlay` takes >100ms:
+```
+[DET] POST took 247ms
+```
+Typical POST over the local WiFi AP is 150–350ms. No hung POSTs observed; the HTTPClient default timeout (5 s) acts as the hard ceiling.
 
 ### CPU Run-Time Stats
 
@@ -628,16 +656,14 @@ Sensor DMA (fb_count=2)
 - Save current snapshot for next report.
 - First report after boot prints `(warming up — no delta yet)` instead of percentages.
 
-Percentages reflect the **last 10 s rolling window** (delta between snapshots), not cumulative since boot.
-
-Hardcoded watched tasks (top 5 most demanding, analyzed from sketch + ESP32 Arduino runtime):
+Hardcoded watched tasks:
 
 | Task name | Core | Priority | Why watched |
 |-----------|------|----------|-------------|
 | `det_task` | 1 | 2 | AprilTag detect + HTTP POST — heaviest compute |
-| `snap_task` | 0 | 2 | Free-running gray memcpy only; no encode |
-| `stream_task` | 1 | 1 | fmt2jpg encode + MJPEG write per connected client |
-| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` (ESP32 Arduino runtime name) |
+| `snap_task` | 0 | 2 | Free-running gray memcpy; no encode |
+| `stream_task` | 0 | 1 | fmt2jpg encode + MJPEG write per connected client |
+| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` |
 | `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker |
 
 Serial output format (one line per task, printed every 10 s):
@@ -648,7 +674,7 @@ Serial output format (one line per task, printed every 10 s):
 [CPU]  Core 1 total ticks: NNNN
 [CPU]  det_task      core=1     X.X%/core   ticks=NNNN
 [CPU]  snap_task     core=0     X.X%/core   ticks=NNNN
-[CPU]  stream_task   core=1     X.X%/core   ticks=NNNN
+[CPU]  stream_task   core=0     X.X%/core   ticks=NNNN
 [CPU]  loopTask      core=1     X.X%/core   ticks=NNNN
 [CPU]  tiT           core=0     X.X%/core   ticks=NNNN
 [CPU] ════════════════════════════
@@ -656,11 +682,11 @@ Serial output format (one line per task, printed every 10 s):
 
 If a task is not running (e.g. no stream client connected), the line prints `not found`.
 
-> **Note:** `stream_task` is spawned per client — if multiple stream clients connect simultaneously, only the first matching task name is reported. Percentages are per-core: each task's ticks are measured against its own pinned core's total delta ticks, so Core 0 and Core 1 percentages are independent. `tskNO_AFFINITY` tasks in Pass 2 use combined delta as denominator — none of the 5 watched tasks use `tskNO_AFFINITY`.
+> **Note:** `stream_task` is spawned per client — if no stream client is connected, it prints `not found`. Percentages are per-core: each task's ticks are measured against its own pinned core's total delta ticks. `tskNO_AFFINITY` tasks in Pass 2 use combined delta as denominator — none of the 5 watched tasks use `tskNO_AFFINITY`.
 
 ### AprilTag Detection
 
-Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JSON to the controller's `/overlay` endpoint.
+Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JSON to the controller's `/overlay` endpoint. `det_task` is triggered via `xTaskNotifyGive()` from `snap_task` (not `loop()`) immediately after a fresh frame is written to `grayDetBuf`.
 
 **Detector configuration** (set once in `initAprilTag()`):
 
@@ -673,12 +699,13 @@ Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JS
 | `debug` | 0 | No debug image output |
 
 **Processing steps:**
-1. Copy `grayDetBuf` under `detGrayMux` mutex into local buffer — `det_task` never calls `esp_camera_fb_get`
+1. Copy `grayDetBuf` under `detGrayMux` mutex (150ms timeout) into local buffer — `det_task` never calls `esp_camera_fb_get`
 2. Wrap in `image_u8_t { .width=W, .height=H, .stride=W, .buf=localBuf }` — no decode needed
 3. `apriltag_detector_detect()` — AprilTag runs its own adaptive binarization internally
 4. For each result: extract bounding box from four corner points, populate `Detection` with label `"marker_<id>"`, normalised coords, `decision_margin / 100.0` as confidence
 5. `apriltag_detections_destroy()`, `free(localBuf)`
-6. POST `detections` JSON to `/overlay`
+6. POST `detections` JSON to `/overlay`; POST duration watchdog logs if >100ms
+7. `detBusy = false` — allows `snap_task` to queue the next detection notify
 
 Detection result JSON schema:
 
@@ -721,11 +748,10 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/stream` | Snapshot-based MJPEG multipart stream (~8 fps) |
+| `GET` | `/stream` | Snapshot-based MJPEG multipart stream (~5 fps) |
 | `GET` | `/status` | JSON: `{ ip, uptime, heap, psram, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
-| `GET` | `/detection_status` | JSON: `{ marker_detected, marker_id, ts }` — latched for `MARKER_CLEAR_MS` |
 
 ### Main Loop
 
@@ -735,16 +761,16 @@ setup():
   initAprilTag()        <- tag16h5 family, quad_decimate=4.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
-  start det_task        <- Core 1, priority 2; notified every DETECTION_INTERVAL_MS from loop()
-  start snap_task       <- Core 0, priority 2; free-running, never blocks
+  start det_task        <- Core 1, priority 2; notified by snap_task every DETECTION_INTERVAL_MS
+  start snap_task       <- Core 0, priority 2; free-running, waits up to 150ms per consumer
   register HTTP routes
   server.begin()
 
 loop() [Core 1, priority 1]:
   server.handleClient()
   if pumpActive and timeout: pumpOff()
-  if millis() - lastCpuReportMs  >= CPU_REPORT_INTERVAL_MS: printTopCpuTasks()
-  if millis() - lastDetectionMs  >= DETECTION_INTERVAL_MS:  notify det_task
+  if millis() - lastCpuReportMs >= CPU_REPORT_INTERVAL_MS: printTopCpuTasks()
+  // det_task is notified directly by snap_task — loop() does NOT notify det_task
 ```
 
 ---
