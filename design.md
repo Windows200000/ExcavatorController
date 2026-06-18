@@ -509,36 +509,111 @@ const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;           // CPU task stats pr
 
 ### Pixel Format
 
-The camera is initialised with `PIXFORMAT_GRAYSCALE`. The camera driver outputs raw single-byte-per-pixel grayscale data directly in `fb->buf`. No JPEG decode step (`fmt2rgb888`) is needed — the buffer is passed directly to AprilTag's `image_u8_t`. JPEG encoding happens only at snapshot time (`frame2jpg`) to produce frames for the MJPEG stream.
+The camera is initialised with `PIXFORMAT_GRAYSCALE`. The camera driver outputs raw single-byte-per-pixel grayscale data directly in `fb->buf`. No JPEG decode step (`fmt2rgb888`) is needed — the buffer is passed directly to AprilTag's `image_u8_t`. JPEG encoding happens in `stream_task` via `fmt2jpg()` (raw buffer variant) only when a stream client is connected — never in `snap_task`.
+
+### Frame Drop Prevention — Architectural Decisions
+
+Frame drops were caused by several compounding issues identified by analysis of the original code:
+
+#### Root causes (original design)
+
+1. **`snap_task` JPEG encode on every frame** — `frame2jpg` took ~30–50ms on Core 0, blocking `fb_return` and idling the sensor even with no stream client connected.
+2. **`streamMux` contention** — `snap_task` held `streamMux` while writing the JPEG stash; `stream_task` held it during `c->write()` TCP send (unbounded latency). If TCP stalled 50ms on congested WiFi, `snap_task` hit its 10ms timeout and dropped the frame.
+3. **`grayMux` contention** — every 500ms `det_task` held `grayMux` for a full 305KB memcpy. If this overlapped with `snap_task`'s gray write, `snap_task` blocked and sensor DMA stalled.
+4. **`fb_count=1`** — sensor DMA had only one buffer. Any `snap_task` block (mutex wait or encode time) idled the sensor entirely.
+
+#### Decision: JPEG encode moved to `stream_task`
+
+`snap_task` no longer calls `frame2jpg` or `fmt2jpg` at all. `stream_task` calls `fmt2jpg()` on a local gray copy after releasing `streamGrayMux`. This means:
+- JPEG encode only happens when a client is connected
+- `snap_task` loop time drops to just DMA grab + memcpy + `fb_return`
+- `stream_task` stack increased 4096 → 8192 to accommodate `fmt2jpg` stack usage
+
+`fmt2jpg()` (raw buffer variant) is used instead of `frame2jpg()` (which requires `camera_fb_t*`) since `stream_task` works from a gray buffer copy, not the DMA framebuffer.
+
+#### Decision: separate gray buffers per consumer
+
+`det_task` and `stream_task` have independent gray buffers:
+- `grayStreamBuf` — written by `snap_task` every frame for `stream_task`
+- `grayDetBuf` — written by `snap_task` every `DETECTION_INTERVAL_MS` for `det_task`
+
+This eliminates all cross-consumer contention. `det_task` holding `detGrayMux` during a 200ms detection cycle has zero effect on `stream_task`, and vice versa.
+
+A shared double-buffer with consumer tracking was considered but rejected: it requires knowing when both consumers are done reading before swapping, which effectively reinvents a mutex. Separate buffers are simpler and the RAM cost (2 × 305KB in PSRAM) is acceptable.
+
+A per-consumer local copy (2×2 buffers) was also considered but rejected: 4 × 305KB = ~1.2MB just for gray buffers, with marginal benefit since the mutex hold time is already short with try-lock.
+
+#### Decision: `snap_task` never blocks — try-lock only
+
+Both `streamGrayMux` and `detGrayMux` are taken with `xSemaphoreTake(..., 0)` (zero timeout) in `snap_task`. If a consumer is still reading, the frame is silently skipped for that consumer. `fb_return` always happens immediately — the sensor never idles waiting for application logic.
+
+This replaces the previous 10ms timeout approach, which still caused `snap_task` to block and stall the sensor DMA under load.
+
+`det_task` and `stream_task` still use a 20ms timeout when copying out their local working buffer — this is safe because their copy is fast (~2–5ms) and they never hold the lock during slow operations (detection, TCP write).
+
+#### Decision: `fb_count=2`
+
+Re-enabled after being forced to 1 due to a suspected OV2640 partial-frame bug with grayscale + `fb_count=2`. The partial-frame bug is already tolerated by the `fb->len >= w*(h-4)` frame acceptance check, so `fb_count=2` is safe. This is DMA-level double-buffering — the sensor fills buf[1] while the CPU processes buf[0] — completely independent of the application-level gray buffers above.
+
+#### Decision: gray buffers in PSRAM
+
+`grayStreamBuf` and `grayDetBuf` are allocated with `ps_malloc()` (PSRAM). At 305KB each, they will not fit in internal SRAM (ESP32 has ~320KB usable internal RAM after FreeRTOS and WiFi stack). The ESP32-CAM AI-Thinker has 4MB PSRAM; the camera driver already uses it automatically for the DMA framebuffer. Switching explicit allocations to `ps_malloc` is a correctness fix — the previous `malloc` calls for `sharedGrayBuf` were almost certainly already hitting PSRAM or causing internal heap exhaustion.
+
+`localGray` in `stream_task` (the short-lived encode buffer) uses plain `malloc` — it is allocated and freed within one loop iteration (~50ms) so internal RAM is fine.
+
+Boot log and `/status` endpoint report both `ESP.getFreeHeap()` and `ESP.getFreePsram()` to verify PSRAM is active at runtime.
 
 ### Snapshot-Based MJPEG Stream
 
-`snap_task` (Core 0, priority 2) runs **free-running** — no notify from `loop()`. It captures frames as fast as the sensor and `frame2jpg` allow (~8 fps at VGA grayscale):
+`snap_task` (Core 0, priority 2) runs **free-running** — no notify from `loop()`. It captures frames as fast as the sensor allows (~8 fps at VGA grayscale). `snap_task` never blocks — both mutex takes are zero-timeout try-locks:
 
-1. `esp_camera_fb_get()` — grayscale frame
-2. Copy raw grayscale into `sharedGrayBuf` under `grayMux` mutex for `det_task`
-3. `frame2jpg()` → stash JPEG in `streamFrameBuf` under `streamMux` mutex; notify `stream_task` via `xTaskNotifyGive`
-4. `esp_camera_fb_return(fb)`
+1. `esp_camera_fb_get()` — grayscale frame from DMA
+2. Validate frame (size check, OV2640 477-line quirk tolerance)
+3. **Try-lock `streamGrayMux` (no wait):** copy raw gray into `grayStreamBuf`; notify `stream_task` via `xTaskNotifyGive`. Skip silently if `stream_task` still reading.
+4. **Every `DETECTION_INTERVAL_MS`, try-lock `detGrayMux` (no wait):** copy raw gray into `grayDetBuf`. Skip silently if `det_task` still reading. `det_task` is triggered by `loop()` separately.
+5. `esp_camera_fb_return(fb)` — always immediate, never delayed by application logic
 
-`snap_task` is the **sole** caller of `esp_camera_fb_get` / `esp_camera_fb_return`. `det_task` never calls these.
+`snap_task` is the **sole** caller of `esp_camera_fb_get` / `esp_camera_fb_return`. Neither `det_task` nor `stream_task` ever calls these.
 
-A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It blocks on `ulTaskNotifyTake` (200 ms watchdog) waiting for `snap_task` to signal a new frame, then copies `streamFrameBuf` under the mutex and sends it as an MJPEG multipart frame.
+A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It blocks on `ulTaskNotifyTake` (200ms watchdog) waiting for `snap_task` to signal a new frame, then:
+1. Copies `grayStreamBuf` into a local buffer under `streamGrayMux` (20ms timeout)
+2. Releases `streamGrayMux` immediately
+3. Calls `fmt2jpg(localGray, ...)` outside the lock — encode takes 30–50ms but holds no mutex
+4. Writes the resulting JPEG as an MJPEG multipart frame via `c->write()`
 
 The MJPEG multipart format (`multipart/x-mixed-replace; boundary=frame`) is unchanged — no changes required in the controller or browser.
 
 ### fb_count
 
 ```cpp
-config.fb_count = 1;  // grayscale: fb_count=2 causes partial DMA frames on OV2640
+config.fb_count = 2;  // DMA double-buffer: sensor fills buf[1] while CPU processes buf[0]
+                      // Partial frames already tolerated via fb->len >= w*(h-4) check
+```
+
+Previously `fb_count=1` due to a suspected OV2640 partial-frame bug with grayscale. Re-enabled because the partial-frame acceptance check already handles this case.
+
+### Shared Buffer Architecture
+
+```
+Sensor DMA (fb_count=2)
+    └── snap_task (Core 0) — sole fb_get/return owner, never blocks
+            │
+            ├── try-lock streamGrayMux (timeout=0)
+            │       └── grayStreamBuf [PSRAM, 305KB]
+            │               └── stream_task: copy under lock → fmt2jpg outside lock → TCP write
+            │
+            └── try-lock detGrayMux (timeout=0, every 500ms)
+                    └── grayDetBuf [PSRAM, 305KB]
+                            └── det_task: copy under lock → AprilTag detect outside lock → POST
 ```
 
 ### Task Priorities
 
 | Task | Core | Priority | Role |
 |------|------|----------|------|
-| `snap_task` | 0 | 2 (highest) | Free-running grayscale capture + JPEG encode; sole fb_get/return owner |
+| `snap_task` | 0 | 2 (highest) | Free-running grayscale capture + gray memcpy; sole fb_get/return owner; never blocks |
 | `det_task` | 1 | 2 (highest) | AprilTag detection + POST to controller |
-| `stream_task` | 1 | 1 | MJPEG frame serve per connected client |
+| `stream_task` | 1 | 1 | JPEG encode (fmt2jpg) + MJPEG frame serve per connected client |
 | `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` |
 | `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker (preempts briefly, yields quickly) |
 
@@ -560,8 +635,8 @@ Hardcoded watched tasks (top 5 most demanding, analyzed from sketch + ESP32 Ardu
 | Task name | Core | Priority | Why watched |
 |-----------|------|----------|-------------|
 | `det_task` | 1 | 2 | AprilTag detect + HTTP POST — heaviest compute |
-| `snap_task` | 0 | 2 | Free-running `frame2jpg` encode + grayscale copy |
-| `stream_task` | 1 | 1 | MJPEG write per connected client |
+| `snap_task` | 0 | 2 | Free-running gray memcpy only; no encode |
+| `stream_task` | 1 | 1 | fmt2jpg encode + MJPEG write per connected client |
 | `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` (ESP32 Arduino runtime name) |
 | `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker |
 
@@ -598,7 +673,7 @@ Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JS
 | `debug` | 0 | No debug image output |
 
 **Processing steps:**
-1. Copy `sharedGrayBuf` under `grayMux` mutex into local buffer — `det_task` never calls `esp_camera_fb_get`
+1. Copy `grayDetBuf` under `detGrayMux` mutex into local buffer — `det_task` never calls `esp_camera_fb_get`
 2. Wrap in `image_u8_t { .width=W, .height=H, .stride=W, .buf=localBuf }` — no decode needed
 3. `apriltag_detector_detect()` — AprilTag runs its own adaptive binarization internally
 4. For each result: extract bounding box from four corner points, populate `Detection` with label `"marker_<id>"`, normalised coords, `decision_margin / 100.0` as confidence
@@ -647,7 +722,7 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/stream` | Snapshot-based MJPEG multipart stream (~8 fps) |
-| `GET` | `/status` | JSON: `{ ip, uptime, heap, mode, pumpActive }` |
+| `GET` | `/status` | JSON: `{ ip, uptime, heap, psram, mode, pumpActive }` |
 | `GET` | `/pump?action=press\|hold\|release` | Controls pump relay |
 | `GET` | `/mode?set=safe\|armed` | Switches operating mode |
 | `GET` | `/detection_status` | JSON: `{ marker_detected, marker_id, ts }` — latched for `MARKER_CLEAR_MS` |
@@ -656,12 +731,12 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 ```
 setup():
-  initCamera()          <- PIXFORMAT_GRAYSCALE, fb_count=1
+  initCamera()          <- PIXFORMAT_GRAYSCALE, fb_count=2
   initAprilTag()        <- tag16h5 family, quad_decimate=4.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
   start det_task        <- Core 1, priority 2; notified every DETECTION_INTERVAL_MS from loop()
-  start snap_task       <- Core 0, priority 2; free-running (no notify)
+  start snap_task       <- Core 0, priority 2; free-running, never blocks
   register HTTP routes
   server.begin()
 
