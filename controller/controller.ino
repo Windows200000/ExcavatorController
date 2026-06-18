@@ -1219,7 +1219,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
 
 // ── Constants ──────────────────────────────────────────────
 const HEARTBEAT_MS   = 150;
-const OVERLAY_POLL   = 500;
+const OVERLAY_POLL   = 200;
 const CAM_POLL       = 2000;
 const MODE_POLL      = 300;  // poll cam /status for armed/safe
 const AUTO_POLL      = 500;  // poll /auto_status
