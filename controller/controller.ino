@@ -534,8 +534,17 @@ void autoOnDetection(int offsetX, int offsetY) {
 
   uint32_t maxDuration = 0;
   for (int i = 0; i < actionCount; i++) {
+    // clamp
     if (actions[i].durationMs < AUTO_MIN_MOVE) actions[i].durationMs = AUTO_MIN_MOVE;
     if (actions[i].durationMs > AUTO_MAX_MOVE) actions[i].durationMs = AUTO_MAX_MOVE;
+    // Update pos trackers
+    const char* b = actions[i].button;
+    int32_t d = (int32_t)actions[i].durationMs;
+    if      (strcmp(b, "arm_dwn")   == 0) autoState.armPos    -= d;
+    else if (strcmp(b, "arm_up")    == 0) autoState.armPos    += d;
+    else if (strcmp(b, "turn_left") == 0) autoState.turretPos -= d;
+    else if (strcmp(b, "turn_right")== 0) autoState.turretPos += d;
+    // Determine max duration
     if (actions[i].durationMs > maxDuration) maxDuration = actions[i].durationMs;
   }
 
