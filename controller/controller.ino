@@ -484,11 +484,11 @@ void autoOnDetection(int offsetX, int offsetY) {
     centered = false;
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
-      actions.push_back({ "arm_dwn", AUTO_MAX_MOVE * offsetY});
+      actions.push_back({ "arm_dwn", AUTO_MAX_MOVE * abs(offsetY)});
       autoState.armPos -= 300;
     } else if (autoState.armPos < AUTO_ARM_MAX) {
       Serial.printf("[AUTO] offsetY=%d → arm_dwn (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
-      actions.push_back({ "arm_up", AUTO_MAX_MOVE * offsetY});
+      actions.push_back({ "arm_up", AUTO_MAX_MOVE * abs(offsetY)});
       autoState.armPos += 300;
     } else {
       Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
@@ -502,13 +502,13 @@ void autoOnDetection(int offsetX, int offsetY) {
     centered = false;
     if (offsetX < 0 && autoState.turretPos > -AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
-      actions.push_back({ "right_fwd", AUTO_MAX_MOVE * offsetX});
-      actions.push_back({ "left_back", AUTO_MAX_MOVE * offsetX});
+      actions.push_back({ "right_fwd", AUTO_MAX_MOVE * abs(offsetX)});
+      actions.push_back({ "left_back", AUTO_MAX_MOVE * abs(offsetX)});
       //autoState.turretPos -= 300;
     } else if (autoState.turretPos < AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
-      actions.push_back({ "right_back", AUTO_MAX_MOVE * offsetX});
-      actions.push_back({ "left_fwd", AUTO_MAX_MOVE * offsetX});
+      actions.push_back({ "right_back", AUTO_MAX_MOVE * abs(offsetX)});
+      actions.push_back({ "left_fwd", AUTO_MAX_MOVE * abs(offsetX)});
       //autoState.turretPos += 300;
     } else {
       Serial.printf("[AUTO] offsetX=%d but turret at limit (%d)\n", offsetX, autoState.turretPos);
@@ -533,10 +533,11 @@ void autoOnDetection(int offsetX, int offsetY) {
   }
 
   uint32_t maxDuration = 0;
-  for (int i = 0; i < actionCount; i++)
+  for (int i = 0; i < actionCount; i++) {
     if (actions[i].durationMs < AUTO_MIN_MOVE) actions[i].durationMs = AUTO_MIN_MOVE;
     if (actions[i].durationMs > AUTO_MAX_MOVE) actions[i].durationMs = AUTO_MAX_MOVE;
     if (actions[i].durationMs > maxDuration) maxDuration = actions[i].durationMs;
+  }
 
   if (maxDuration > 0) {
     uint32_t actionStart = millis();
