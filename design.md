@@ -501,13 +501,10 @@ To put the device into flash mode: connect **IO0 to GND** before power-on. Remov
 ### Timing Constants
 
 ```cpp
-const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;   // 640×480
-const uint8_t     JPEG_QUALITY          = 12;              // 0=best … 63=worst
-const uint32_t    DETECTION_INTERVAL_MS = 500;             // AprilTag detection cycle
-const uint32_t    SNAPSHOT_FACTOR       = 4;               // snapshots per detection cycle
-// Derived — do not change directly:
-const uint32_t    SNAPSHOT_INTERVAL_MS  = DETECTION_INTERVAL_MS / SNAPSHOT_FACTOR;  // 125 ms → ~8 fps
-const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;          // CPU task stats printed every 10 s
+const framesize_t FRAME_SIZE             = FRAMESIZE_VGA;   // 640×480
+const uint8_t     JPEG_QUALITY           = 12;              // 0=best … 63=worst
+const uint32_t    DETECTION_INTERVAL_MS  = 500;             // AprilTag detection cycle
+const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;           // CPU task stats printed every 10 s
 ```
 
 ### Pixel Format
@@ -516,44 +513,54 @@ The camera is initialised with `PIXFORMAT_GRAYSCALE`. The camera driver outputs 
 
 ### Snapshot-Based MJPEG Stream
 
-There is no continuous stream task grabbing frames. Instead:
+`snap_task` (Core 0, priority 2) runs **free-running** — no notify from `loop()`. It captures frames as fast as the sensor and `frame2jpg` allow (~8 fps at VGA grayscale):
 
-1. A **snapshot task** (`snap_task`, Core 0, priority 1) is notified every `SNAPSHOT_INTERVAL_MS` from `loop()`.
-2. Each notification: `esp_camera_fb_get()` → `frame2jpg()` → result stored in `streamFrameBuf` under a mutex → `esp_camera_fb_return()`.
-3. A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It copies `streamFrameBuf` under the mutex and sends it as an MJPEG multipart frame. If no frame is stashed yet, it waits 10 ms and retries.
-4. The MJPEG multipart format (`multipart/x-mixed-replace; boundary=frame`) is unchanged — no changes required in the controller or browser.
+1. `esp_camera_fb_get()` — grayscale frame
+2. Copy raw grayscale into `sharedGrayBuf` under `grayMux` mutex for `det_task`
+3. `frame2jpg()` → stash JPEG in `streamFrameBuf` under `streamMux` mutex; notify `stream_task` via `xTaskNotifyGive`
+4. `esp_camera_fb_return(fb)`
 
-At `SNAPSHOT_INTERVAL_MS = 125 ms` the stream delivers approximately **8 fps** to the browser.
+`snap_task` is the **sole** caller of `esp_camera_fb_get` / `esp_camera_fb_return`. `det_task` never calls these.
+
+A **stream serve task** (`stream_task`, Core 1, priority 1) is spawned per client connection on `/stream`. It blocks on `ulTaskNotifyTake` (200 ms watchdog) waiting for `snap_task` to signal a new frame, then copies `streamFrameBuf` under the mutex and sends it as an MJPEG multipart frame.
+
+The MJPEG multipart format (`multipart/x-mixed-replace; boundary=frame`) is unchanged — no changes required in the controller or browser.
 
 ### fb_count
 
 ```cpp
-config.fb_count = psramFound() ? 2 : 1;
+config.fb_count = 1;  // grayscale: fb_count=2 causes partial DMA frames on OV2640
 ```
-
-With `PIXFORMAT_GRAYSCALE` and no concurrent stream task grabbing frames, two slots are sufficient. The snapshot task and detection task both run on Core 0 and are notified sequentially from `loop()`, so they do not compete for slots simultaneously.
 
 ### Task Priorities
 
 | Task | Core | Priority | Role |
 |------|------|----------|------|
-| `det_task` | 0 | 2 (highest) | AprilTag detection + POST to controller |
-| `snap_task` | 0 | 1 | Grayscale capture + JPEG encode for stream |
+| `snap_task` | 0 | 2 (highest) | Free-running grayscale capture + JPEG encode; sole fb_get/return owner |
+| `det_task` | 1 | 2 (highest) | AprilTag detection + POST to controller |
 | `stream_task` | 1 | 1 | MJPEG frame serve per connected client |
-| `loop()` / `handleClient()` | 1 | 0 | HTTP request handling, timer dispatch |
-
-Detection always preempts snapshot capture on Core 0. Stream serving and HTTP handling run independently on Core 1.
+| `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` |
+| `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker (preempts briefly, yields quickly) |
 
 ### CPU Run-Time Stats
 
-`printTopCpuTasks()` runs every `CPU_REPORT_INTERVAL_MS` (10 s) from `loop()`. Uses `uxTaskGetSystemState()` + `TaskStatus_t.xCoreID` — no `vTaskGetRunTimeStats()` string parsing. Percentages are **cumulative since boot**, not a rolling window.
+`printTopCpuTasks()` runs every `CPU_REPORT_INTERVAL_MS` (10 s) from `loop()`. Uses `uxTaskGetSystemState()` — no `vTaskGetRunTimeStats()` string parsing.
+
+**Algorithm (rolling window):**
+- Pass 1: iterate ALL tasks, accumulate per-core total ticks. `tskNO_AFFINITY` tasks add half their ticks to each core total.
+- Compute delta against previous snapshot (`lastSnapshotCoreTicks`, `lastSnapshotTaskTicks`).
+- Pass 2: for each watched task, `pct = deltaTaskTicks * 1000 / deltaCoreTicks` — true % of that core's capacity over the last 10 s window.
+- Save current snapshot for next report.
+- First report after boot prints `(warming up — no delta yet)` instead of percentages.
+
+Percentages reflect the **last 10 s rolling window** (delta between snapshots), not cumulative since boot.
 
 Hardcoded watched tasks (top 5 most demanding, analyzed from sketch + ESP32 Arduino runtime):
 
 | Task name | Core | Priority | Why watched |
 |-----------|------|----------|-------------|
-| `det_task` | 0 | 2 | AprilTag detect + HTTP POST — heaviest compute |
-| `snap_task` | 0 | 1 | `frame2jpg` encode each snapshot |
+| `det_task` | 1 | 2 | AprilTag detect + HTTP POST — heaviest compute |
+| `snap_task` | 0 | 2 | Free-running `frame2jpg` encode + grayscale copy |
 | `stream_task` | 1 | 1 | MJPEG write per connected client |
 | `loopTask` | 1 | 1 | Arduino `loop()` / `handleClient()` (ESP32 Arduino runtime name) |
 | `tiT` | 0 | 18 | lwIP / WiFi TCP stack worker |
@@ -561,18 +568,20 @@ Hardcoded watched tasks (top 5 most demanding, analyzed from sketch + ESP32 Ardu
 Serial output format (one line per task, printed every 10 s):
 
 ```
-[CPU] ══ Top-5 Task CPU Report ══
-[CPU]  det_task      core=0     X.X%  ticks=NNNN
-[CPU]  snap_task     core=0     X.X%  ticks=NNNN
-[CPU]  stream_task   core=1     X.X%  ticks=NNNN
-[CPU]  loopTask      core=1     X.X%  ticks=NNNN
-[CPU]  tiT           core=0     X.X%  ticks=NNNN
+[CPU] ══ Per-Core CPU Report ══
+[CPU]  Core 0 total ticks: NNNN
+[CPU]  Core 1 total ticks: NNNN
+[CPU]  det_task      core=1     X.X%/core   ticks=NNNN
+[CPU]  snap_task     core=0     X.X%/core   ticks=NNNN
+[CPU]  stream_task   core=1     X.X%/core   ticks=NNNN
+[CPU]  loopTask      core=1     X.X%/core   ticks=NNNN
+[CPU]  tiT           core=0     X.X%/core   ticks=NNNN
 [CPU] ════════════════════════════
 ```
 
 If a task is not running (e.g. no stream client connected), the line prints `not found`.
 
-> **Note:** `stream_task` is spawned per client — if multiple stream clients connect simultaneously, only the first matching task name is reported, not a sum. `totalRunTime` covers both cores combined on ESP32 FreeRTOS, so per-core % values may not sum to 100%.
+> **Note:** `stream_task` is spawned per client — if multiple stream clients connect simultaneously, only the first matching task name is reported. Percentages are per-core: each task's ticks are measured against its own pinned core's total delta ticks, so Core 0 and Core 1 percentages are independent. `tskNO_AFFINITY` tasks in Pass 2 use combined delta as denominator — none of the 5 watched tasks use `tskNO_AFFINITY`.
 
 ### AprilTag Detection
 
@@ -589,11 +598,11 @@ Detection runs on-device every `DETECTION_INTERVAL_MS`. Results are POSTed as JS
 | `debug` | 0 | No debug image output |
 
 **Processing steps:**
-1. `esp_camera_fb_get()` — grayscale frame, `fb->buf` is raw bytes, one per pixel
-2. Wrap directly in `image_u8_t { .width=W, .height=H, .stride=W, .buf=fb->buf }` — no decode needed
+1. Copy `sharedGrayBuf` under `grayMux` mutex into local buffer — `det_task` never calls `esp_camera_fb_get`
+2. Wrap in `image_u8_t { .width=W, .height=H, .stride=W, .buf=localBuf }` — no decode needed
 3. `apriltag_detector_detect()` — AprilTag runs its own adaptive binarization internally
 4. For each result: extract bounding box from four corner points, populate `Detection` with label `"marker_<id>"`, normalised coords, `decision_margin / 100.0` as confidence
-5. `apriltag_detections_destroy()`, `esp_camera_fb_return(fb)`
+5. `apriltag_detections_destroy()`, `free(localBuf)`
 6. POST `detections` JSON to `/overlay`
 
 Detection result JSON schema:
@@ -647,21 +656,20 @@ const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
 
 ```
 setup():
-  initCamera()          <- PIXFORMAT_GRAYSCALE, fb_count=2 (PSRAM)
+  initCamera()          <- PIXFORMAT_GRAYSCALE, fb_count=1
   initAprilTag()        <- tag16h5 family, quad_decimate=4.0, refine_edges=1
   connectWiFi()         <- 15 s timeout then ESP.restart()
   registerWithController()
-  start det_task        <- Core 0, priority 2; notified every DETECTION_INTERVAL_MS
-  start snap_task       <- Core 0, priority 1; notified every SNAPSHOT_INTERVAL_MS
+  start det_task        <- Core 1, priority 2; notified every DETECTION_INTERVAL_MS from loop()
+  start snap_task       <- Core 0, priority 2; free-running (no notify)
   register HTTP routes
   server.begin()
 
-loop() [Core 1, priority 0]:
+loop() [Core 1, priority 1]:
   server.handleClient()
   if pumpActive and timeout: pumpOff()
   if millis() - lastCpuReportMs  >= CPU_REPORT_INTERVAL_MS: printTopCpuTasks()
-  if millis() - lastSnapshotMs   >= SNAPSHOT_INTERVAL_MS:  notify snap_task
-  if millis() - lastDetectionMs  >= DETECTION_INTERVAL_MS: notify det_task
+  if millis() - lastDetectionMs  >= DETECTION_INTERVAL_MS:  notify det_task
 ```
 
 ---
