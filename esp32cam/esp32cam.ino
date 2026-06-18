@@ -389,6 +389,7 @@ void snapshotTask(void*) {
 
     // ── 1. Try-lock streamGrayMux — skip frame for stream if busy ──
     if (xSemaphoreTake(streamGrayMux, 0) == pdTRUE) {
+        Serial.println("[SNP] Pushing Stream frame");
       if (grayStreamLen != fb->len) {
         free(grayStreamBuf);
         grayStreamBuf = (uint8_t*)ps_malloc(fb->len);
@@ -403,12 +404,13 @@ void snapshotTask(void*) {
       // Notify stream_task — new frame ready
       TaskHandle_t sh = streamTaskHandle;
       if (sh) xTaskNotifyGive(sh);
-    }
+    } else Serial.println("[SNP] Streambusy - skipping");
 
     // ── 2. Every DETECTION_INTERVAL_MS: try-lock detGrayMux — skip if det_task busy ──
     uint32_t now = millis();
     if ((now - lastDetGrayWriteMs) >= DETECTION_INTERVAL_MS) {
       if (xSemaphoreTake(detGrayMux, 0) == pdTRUE) {
+        Serial.println("[SNP] Pushing det frame");
         if (grayDetLen != fb->len) {
           free(grayDetBuf);
           grayDetBuf = (uint8_t*)ps_malloc(fb->len);
@@ -421,7 +423,7 @@ void snapshotTask(void*) {
         }
         xSemaphoreGive(detGrayMux);
         lastDetGrayWriteMs = now;
-      }
+      } else Serial.println("[SNP]Det Busy - skipping");
       // If lock busy: det_task still running — skip this detection frame silently.
       // loop() will still call xTaskNotifyGive(detectionTaskHandle) on schedule;
       // det_task will use the previously written grayDetBuf on next wake.
@@ -503,7 +505,7 @@ void handleStream() {
       vTaskDelete(NULL);
     },
     "stream_task", 8192, clientPtr,  // 8192: fmt2jpg needs stack headroom
-    1, NULL, 1
+    1, NULL, 0
   );
 }
 
