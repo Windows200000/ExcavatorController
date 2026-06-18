@@ -172,7 +172,9 @@ const int AUTO_TURRET_MAX       = 3000; // both directions
 const int AUTO_ARM_MAX          = 2000; // starts down, arm fwd = arm up
 const int AUTO_ARM_RESET_POS    = 1000; // target for armPos
 const int AUTO_ARM_DEFAULT_POS  = 2000; // target for armPos
-const int AUTO_DEADZONE         = 15;
+const int AUTO_DEADZONE         = 10;
+const int AUTO_MIN_MOVE         = 150;
+const int AUTO_MAX_MOVE         = 350;
 const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
 const uint32_t AUTO_TIMEOUT_MS          = 20000;   // return arm to defualt position after 20s
 
@@ -400,12 +402,8 @@ void autoAlways(int offsetX, int offsetY, bool codeDetected) {
   int time2 = 150;
   int time3 = 150;
   int delayms = 200;
-  // debugDropdown, sebugFlag1
-  // all 140-145
-  // min arm dwn
-  // min arm up
-  // min left fwd
-  // min left back
+  // debugDropdown, debugFlag1
+  // all 150
   if (debugFlag1) {
     runActionSync("arm_dwn", time1);
     delay(delayms);
@@ -480,17 +478,17 @@ void autoOnDetection(int offsetX, int offsetY) {
   // AUTO_TURRET_MAX = 3000, AUTO_ARM_MAX = 2000
   // turretPos = 0, armPos 2000
   std::vector<AutoAction> actions;
-
+  
   // Vertical — offsetY drives arm
   if (abs(offsetY) > AUTO_DEADZONE) {
     centered = false;
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
-      actions.push_back({ "arm_dwn", 300 });
+      actions.push_back({ "arm_dwn", AUTO_MAX_MOVE * offsetY});
       autoState.armPos -= 300;
     } else if (autoState.armPos < AUTO_ARM_MAX) {
       Serial.printf("[AUTO] offsetY=%d → arm_dwn (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
-      actions.push_back({ "arm_up", 300 });
+      actions.push_back({ "arm_up", AUTO_MAX_MOVE * offsetY});
       autoState.armPos += 300;
     } else {
       Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
@@ -504,13 +502,13 @@ void autoOnDetection(int offsetX, int offsetY) {
     centered = false;
     if (offsetX < 0 && autoState.turretPos > -AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
-      actions.push_back({ "right_fwd", 400 });
-      actions.push_back({ "left_back", 300 });
+      actions.push_back({ "right_fwd", AUTO_MAX_MOVE * offsetX});
+      actions.push_back({ "left_back", AUTO_MAX_MOVE * offsetX});
       //autoState.turretPos -= 300;
     } else if (autoState.turretPos < AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
-      actions.push_back({ "right_back", 300 });
-      actions.push_back({ "left_fwd", 400 });
+      actions.push_back({ "right_back", AUTO_MAX_MOVE * offsetX});
+      actions.push_back({ "left_fwd", AUTO_MAX_MOVE * offsetX});
       //autoState.turretPos += 300;
     } else {
       Serial.printf("[AUTO] offsetX=%d but turret at limit (%d)\n", offsetX, autoState.turretPos);
@@ -536,6 +534,8 @@ void autoOnDetection(int offsetX, int offsetY) {
 
   uint32_t maxDuration = 0;
   for (int i = 0; i < actionCount; i++)
+    if (actions[i].durationMs < AUTO_MIN_MOVE) actions[i].durationMs = AUTO_MIN_MOVE;
+    if (actions[i].durationMs > AUTO_MAX_MOVE) actions[i].durationMs = AUTO_MAX_MOVE;
     if (actions[i].durationMs > maxDuration) maxDuration = actions[i].durationMs;
 
   if (maxDuration > 0) {
