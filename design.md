@@ -205,14 +205,14 @@ All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactl
 |------|------|------------|-----------|-----------|-------|
 | 12 | LOW | `left_fwd` | — | — | Left track forward |
 | 26 | LOW | `right_fwd` | — | — | Right track forward |
-| 33 | LOW | `arm_fwd` | — | — | Arm forward (up) |
+| 33 | LOW | `arm_dwn` | — | — | Arm forward (up) |
 | 14 | HiZ | — | — | `left_back` | Left track back |
 | 25 | HiZ | — | — | `right_back` | Right track back |
-| 32 | HiZ | — | — | `arm_back` | Arm back (down) |
+| 32 | HiZ | — | — | `arm_up` | Arm back (down) |
 | 16 | LOW | `turn_left` | — | — | Turntable left |
 | 17 | HiZ | — | — | `turn_right` | Turntable right |
-| 18 | LOW | `light_off` | — | — | Light off pulse |
-| 19 | HiZ | — | — | `light_on` | Light on pulse |
+| 18 | LOW | `light_on` | — | — | Light on pulse |
+| 19 | HiZ | — | — | `light_of` | Light off pulse |
 | 4 | HiZ | — | — | `test` | Test pin (active LOW pulse) |
 
 > **Note:** The classic single-MOSFET-per-axis wiring (GPIOs 13, 14, 26, 33, 15) is preserved as commented-out entries in the source for reference.
@@ -220,9 +220,12 @@ All physical GPIOs are declared in a single `PIN_TABLE[]` array. There is exactl
 ### Timing Constants
 
 ```cpp
-const uint32_t PULSE_DURATION_MS = 150;   // Duration of light/test pulse
-const uint32_t HOLD_TIMEOUT_MS   = 300;   // Auto-release timeout when heartbeat stops
+const uint32_t PULSE_DURATION_MS    = 300;   // Duration of light/test pulse
+const uint32_t HOLD_TIMEOUT_MS      = 300;   // Auto-release timeout when heartbeat stops
+const uint32_t PUMP_HB_INTERVAL_MS  = 200;   // Pump hold heartbeat sent from loop() while firing
 ```
+
+`PUMP_HB_INTERVAL_MS` is independent of the detection cadence. `loop()` sends `/pump?action=hold` to the cam every 200 ms while `autoState.is_firing` is true, preventing the cam's `PUMP_HOLD_TIMEOUT_MS = 800 ms` watchdog from releasing the pump between detection frames.
 
 ### Control Characteristics
 
@@ -255,9 +258,9 @@ Because both controls are **pulse-based** (the hardware toggle is a momentary GP
 | `spin_right` | Hold | Left forward + Right back (clockwise) |
 | `turn_left` | Hold | Turntable rotate left (GPIO 16 HIGH) |
 | `turn_right` | Hold | Turntable rotate right (GPIO 17 LOW) |
-| `arm_fwd` | Hold | Arm forward / up (GPIO 33 HIGH) |
-| `arm_back` | Hold | Arm back / down (GPIO 32 LOW) |
-| `light` | Toggle/Pulse | Pulses `light_on` (GPIO 19 LOW) or `light_off` (GPIO 18 HIGH) depending on tracked `lightOn` state |
+| `arm_dwn` | Hold | Arm forward / up (GPIO 33 HIGH) |
+| `arm_up` | Hold | Arm back / down (GPIO 32 LOW) |
+| `light` | Toggle/Pulse | Pulses `light_on` (GPIO 18 HIGH) or `light_of` (GPIO 19 LOW) depending on tracked `lightOn` state |
 | `test` | Toggle/Pulse | Pulses GPIO 4 LOW for `PULSE_DURATION_MS`; flips tracked `testOn` state each press |
 
 Up to `MAX_HELD = 6` simultaneous held actions are supported.
@@ -370,8 +373,8 @@ The HTML console is stored in flash as `INDEX_HTML[]` (`PROGMEM`). It includes:
 | `D` | Spin right (clockwise) | Hold |
 | `←` Arrow Left | Turntable rotate left | Hold |
 | `→` Arrow Right | Turntable rotate right | Hold |
-| `↑` Arrow Up | Arm forward (`arm_fwd`) | Hold |
-| `↓` Arrow Down | Arm backward (`arm_back`) | Hold |
+| `↑` Arrow Up | Arm up (`arm_dwn`) | Hold |
+| `↓` Arrow Down | Arm down (`arm_up`) | Hold |
 | `L` | Light toggle (pulse) | Toggle |
 | `T` | Test toggle (pulse) | Toggle |
 | `Space` | Pump hold (relayed to cam via `/camcmd`) | Hold |
@@ -409,6 +412,11 @@ loop():
     if (millis() - lastSeen) > HOLD_TIMEOUT_MS:
       auto-release all pins for that action via setPinIdle()
       heldActions[i].active = false
+  autoDefaultPosition()
+  // Pump hold heartbeat — keeps cam pump relay alive during blocking auto actions
+  if autoState.is_firing and (millis() - lastPumpHbMs) >= PUMP_HB_INTERVAL_MS:
+    relayCamCmd("/pump?action=hold")
+    lastPumpHbMs = millis()
 ```
 
 ---
