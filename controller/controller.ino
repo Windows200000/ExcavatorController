@@ -914,7 +914,6 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     padding:2px 8px;white-space:nowrap;
   }
   #auto-status{
-    position:absolute;top:10px;right:100px;
     font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--dim);
     background:#0d1520;border:1px solid var(--border);border-radius:20px;
     padding:2px 8px;cursor:pointer;user-select:none;
@@ -1059,11 +1058,13 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
 
   <!-- Excavator model -->
   <div id="model-panel">
-    <div id="model-title">Live Status</div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <div id="model-title">Live Status</div>
+      <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
+    </div>
 
     <!-- Safety badge — driven live from cam module -->
     <div id="safety-badge" class="safe" title="Click to toggle arm/safe on cam module">&#128274; SAFE</div>
-    <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
 
     <div id="model-svg-wrap">
       <!-- Isometric-ish top-down excavator SVG -->
