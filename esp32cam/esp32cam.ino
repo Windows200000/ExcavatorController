@@ -4,30 +4,36 @@
  * AprilTag detection: raspiduino/apriltag-esp32 (ZIP install), family tag16h5.
  *
  * Pixel format: PIXFORMAT_GRAYSCALE — no JPEG decode needed for detection.
- * Stream: free-running snap_task captures frames as fast as sensor+encode allows.
+ * Stream: free-running snap_task captures frames as fast as sensor allows.
  * Detection runs every DETECTION_INTERVAL_MS on the latest grayscale frame.
  *
  * Camera fb ownership: snap_task is the SOLE caller of esp_camera_fb_get/return.
- *   Runs free-running (no notify needed). Copies raw grayscale pixels into
- *   sharedGrayBuf (protected by grayMux), then JPEG-encodes for streaming.
- *   det_task reads sharedGrayBuf — no fb_get calls ever.
+ *   Runs free-running. On each frame:
+ *     - Try-locks streamGrayMux (no wait): copies gray into grayStreamBuf for stream_task.
+ *     - Every DETECTION_INTERVAL_MS, try-locks detGrayMux (no wait): copies gray into
+ *       grayDetBuf for det_task.
+ *   snap_task NEVER blocks — both locks are try-only. Skips consumer if busy.
+ *   det_task and stream_task read independent buffers — zero cross-consumer contention.
  *
  * OV2640 grayscale quirk: sensor outputs 477 active lines at VGA instead of 480
  *   (305280 bytes instead of 307200). Frame is accepted if
  *   fb->len >= fb->width * (fb->height - 4). Actual fb->height passed into
- *   sharedGrayH so AprilTag always sees correct dimensions.
+ *   grayDetH / grayStreamH so consumers always see correct dimensions.
  *
- * Shared buffer locking: grayMux and streamMux are FreeRTOS mutexes (not spinlocks).
- *   portENTER_CRITICAL spinlocks were replaced because memcpy of ~305KB under a
- *   spinlock busy-waits the other core for 1-3ms per frame. Mutexes allow the
- *   scheduler to yield instead. Timeout 10-20ms; on timeout the frame is skipped
- *   for that consumer but fb is still returned — no stall.
+ * Shared buffer locking: streamGrayMux and detGrayMux are FreeRTOS mutexes.
+ *   snap_task uses try-lock (timeout=0) — never blocks, skips frame for that
+ *   consumer if busy. Consumers (stream_task, det_task) use 20ms timeout to
+ *   copy out their local working buffer, then release immediately.
+ *
+ * Gray bufs (grayStreamBuf, grayDetBuf) allocated in PSRAM via ps_malloc.
+ *   305KB each — won't fit internal SRAM. ESP32-CAM AI-Thinker has 4MB PSRAM;
+ *   camera driver already uses it for DMA framebuffer automatically.
  *
  * Core layout:
- *   Core 0: snap_task (prio 2, highest) — free-running capture+encode
+ *   Core 0: snap_task (prio 2, highest) — free-running capture, gray memcpy only
  *           tiT (prio 18, lwIP/WiFi — preempts briefly but yields quickly)
  *   Core 1: det_task (prio 2, highest) — AprilTag detect + POST
- *           stream_task (prio 1) — MJPEG write per connected client
+ *           stream_task (prio 1) — JPEG encode + MJPEG write per connected client
  *           loopTask (prio 1) — Arduino loop()/handleClient()
  *
  * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
@@ -40,8 +46,13 @@
  * Stream: max 1 concurrent client enforced via streamClientActive flag.
  *   A second /stream request is rejected with 503 while a client is connected.
  *   stream_task is notify-driven: snap_task calls xTaskNotifyGive(streamTaskHandle)
- *   after stashing each JPEG. stream_task blocks on ulTaskNotifyTake (200ms watchdog)
- *   instead of polling. streamTaskHandle set on task start, cleared on disconnect.
+ *   after each successful grayStreamBuf write. stream_task wakes, copies gray buf,
+ *   JPEG-encodes locally via fmt2jpg(), writes TCP.
+ *   streamTaskHandle set on task start, cleared on disconnect.
+ *
+ * fb_count=2: sensor DMA double-buffered — sensor fills buf[1] while CPU processes buf[0].
+ *   Previously forced to 1 due to suspected OV2640 partial-frame bug with grayscale+fb_count=2.
+ *   Re-enabled: partial frames are already tolerated (fb->len >= w*(h-4) check).
  */
 
 #include "esp_camera.h"
@@ -96,7 +107,7 @@ const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;  // 640x480 (sensor out
 const uint8_t     JPEG_QUALITY          = 12;
 const uint32_t    DETECTION_INTERVAL_MS = 500;
 // snap_task is free-running, not timer-driven.
-// At ~8fps the sensor+encode cycle self-paces to ~125ms per frame naturally.
+// At ~8fps the sensor cycle self-paces to ~125ms per frame naturally.
 
 const uint32_t    CPU_REPORT_INTERVAL_MS = 10000;
 
@@ -114,21 +125,22 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-// ── Stashed JPEG for /stream — written by snap_task, read by stream_task ──
-// Protected by FreeRTOS mutex (not spinlock) — JPEG memcpy too long for spinlock.
-static uint8_t*          streamFrameBuf    = nullptr;
-static size_t            streamFrameLen    = 0;
-static SemaphoreHandle_t streamMux         = nullptr;
+// ── Gray buf for stream_task — written by snap_task (try-lock), read by stream_task ──
+// Allocated in PSRAM (ps_malloc) — 305KB won't fit internal SRAM.
+// stream_task copies out under streamGrayMux, then fmt2jpg encodes outside lock.
+static uint8_t*          grayStreamBuf     = nullptr;
+static size_t            grayStreamLen     = 0;
+static int               grayStreamW       = 0;
+static int               grayStreamH       = 0;
+static SemaphoreHandle_t streamGrayMux     = nullptr;
 
-// ── Shared grayscale frame — written by snap_task, read by det_task ──
-// Protected by FreeRTOS mutex — memcpy of ~305KB must not spinlock-stall other core.
-// snap_task is the SOLE owner of esp_camera_fb_get/return.
-// det_task copies sharedGrayBuf under grayMux, then works on local copy.
-static uint8_t*          sharedGrayBuf     = nullptr;
-static size_t            sharedGrayLen     = 0;
-static int               sharedGrayW       = 0;
-static int               sharedGrayH       = 0;
-static SemaphoreHandle_t grayMux           = nullptr;
+// ── Gray buf for det_task — written by snap_task (try-lock) every DETECTION_INTERVAL_MS ──
+// Allocated in PSRAM (ps_malloc). det_task copies out under detGrayMux, works on local copy.
+static uint8_t*          grayDetBuf        = nullptr;
+static size_t            grayDetLen        = 0;
+static int               grayDetW          = 0;
+static int               grayDetH          = 0;
+static SemaphoreHandle_t detGrayMux        = nullptr;
 
 // ── Stream client guard — only 1 concurrent stream client allowed ──
 static volatile bool     streamClientActive = false;
@@ -137,6 +149,9 @@ static volatile bool     streamClientActive = false;
 TaskHandle_t detectionTaskHandle = NULL;
 TaskHandle_t snapshotTaskHandle  = NULL;
 TaskHandle_t streamTaskHandle    = NULL;  // set by stream_task on start, cleared on disconnect
+
+// ── Tracks when snap_task last wrote grayDetBuf ──
+static uint32_t lastDetGrayWriteMs = 0;
 
 // ── Rolling-window CPU state — delta between snapshots every 10s ──
 static uint64_t lastSnapshotCoreTicks[2] = { 0, 0 };
@@ -227,7 +242,7 @@ void printTopCpuTasks() {
         uint32_t   deltaTicks = taskStatus[j].ulRunTimeCounter - lastSnapshotTaskTicks[i];
         uint64_t   coreTotal  = (core == 0) ? deltaCoreTicks[0]
                               : (core == 1) ? deltaCoreTicks[1]
-                              : (deltaCoreTicks[0] + deltaCoreTicks[1]); // affinity=any: use combined
+                              : (deltaCoreTicks[0] + deltaCoreTicks[1]);
         uint32_t pct10 = (coreTotal > 0)
                        ? (uint32_t)(((uint64_t)deltaTicks * 1000ULL) / coreTotal)
                        : 0;
@@ -305,7 +320,8 @@ bool initCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_GRAYSCALE;  // raw gray pixels — no decode needed
   config.frame_size   = FRAME_SIZE;
-  config.fb_count     = 1;  // grayscale: fb_count=2 causes partial DMA frames on OV2640
+  config.fb_count     = 2;  // DMA double-buffer: sensor fills buf[1] while CPU processes buf[0]
+                            // Partial frames already tolerated via fb->len >= w*(h-4) check
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("[CAM] Init failed: 0x%x\n", err); return false; }
@@ -337,20 +353,20 @@ void initAprilTag() {
 // ════════════════════════════════════════════════════════════
 //  Snapshot task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING
 //  SOLE owner of esp_camera_fb_get / esp_camera_fb_return.
-//  Runs as fast as sensor + frame2jpg allows (~8fps at VGA grayscale).
+//  Runs as fast as sensor allows (~8fps at VGA grayscale).
 //  No xTaskNotifyGive needed — loop() does NOT notify this task.
 //
 //  Frame acceptance: fb->len >= fb->width * (fb->height - 4)
 //  Tolerates OV2640 grayscale quirk of 477 active lines (305280 bytes).
-//  Actual fb->width/height stored in sharedGrayW/H for correct AprilTag dims.
+//  Dimensions stored in grayStreamW/H and grayDetW/H for consumers.
 //
 //  On each valid frame:
-//    1. Copies raw grayscale into sharedGrayBuf (grayMux mutex) for det_task.
-//    2. JPEG-encodes and stashes in streamFrameBuf (streamMux mutex) for /stream.
-//    3. Notifies stream_task via xTaskNotifyGive(streamTaskHandle) if connected.
+//    1. Try-lock streamGrayMux (no wait): copy gray → grayStreamBuf, notify stream_task.
+//       Skip silently if stream_task still reading (lock busy).
+//    2. Every DETECTION_INTERVAL_MS: try-lock detGrayMux (no wait): copy gray → grayDetBuf.
+//       Skip silently if det_task still reading. det_task triggered by loop() separately.
 //
-//  Mutex timeouts: 10ms. If lock not acquired in time, frame is skipped for
-//  that consumer (gray or stream) but fb is still returned — no stall.
+//  snap_task NEVER blocks. fb_return always happens immediately.
 // ════════════════════════════════════════════════════════════
 void snapshotTask(void*) {
   for (;;) {
@@ -371,39 +387,44 @@ void snapshotTask(void*) {
       continue;
     }
 
-    // ── 1. Stash raw grayscale for det_task (mutex, not spinlock) ──
-    if (xSemaphoreTake(grayMux, pdMS_TO_TICKS(10)) == pdTRUE) {
-      if (sharedGrayLen != fb->len) {
-        free(sharedGrayBuf);
-        sharedGrayBuf = (uint8_t*)malloc(fb->len);
+    // ── 1. Try-lock streamGrayMux — skip frame for stream if busy ──
+    if (xSemaphoreTake(streamGrayMux, 0) == pdTRUE) {
+      if (grayStreamLen != fb->len) {
+        free(grayStreamBuf);
+        grayStreamBuf = (uint8_t*)ps_malloc(fb->len);
       }
-      if (sharedGrayBuf) {
-        memcpy(sharedGrayBuf, fb->buf, fb->len);
-        sharedGrayLen = fb->len;
-        sharedGrayW   = fb->width;
-        sharedGrayH   = fb->height;
+      if (grayStreamBuf) {
+        memcpy(grayStreamBuf, fb->buf, fb->len);
+        grayStreamLen = fb->len;
+        grayStreamW   = fb->width;
+        grayStreamH   = fb->height;
       }
-      xSemaphoreGive(grayMux);
-    } else {
-      Serial.println("[SNAP] grayMux timeout — skipping gray update");
+      xSemaphoreGive(streamGrayMux);
+      // Notify stream_task — new frame ready
+      TaskHandle_t sh = streamTaskHandle;
+      if (sh) xTaskNotifyGive(sh);
     }
 
-    // ── 2. JPEG encode for /stream ──
-    uint8_t* jBuf = nullptr;
-    size_t   jLen = 0;
-    if (frame2jpg(fb, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
-      if (xSemaphoreTake(streamMux, pdMS_TO_TICKS(10)) == pdTRUE) {
-        free(streamFrameBuf);
-        streamFrameBuf = jBuf;
-        streamFrameLen = jLen;
-        xSemaphoreGive(streamMux);
-        // ── 3. Notify stream_task — new frame ready, stop sleeping ──
-        TaskHandle_t sh = streamTaskHandle;
-        if (sh) xTaskNotifyGive(sh);
-      } else {
-        Serial.println("[SNAP] streamMux timeout — dropping JPEG frame");
-        free(jBuf);
+    // ── 2. Every DETECTION_INTERVAL_MS: try-lock detGrayMux — skip if det_task busy ──
+    uint32_t now = millis();
+    if ((now - lastDetGrayWriteMs) >= DETECTION_INTERVAL_MS) {
+      if (xSemaphoreTake(detGrayMux, 0) == pdTRUE) {
+        if (grayDetLen != fb->len) {
+          free(grayDetBuf);
+          grayDetBuf = (uint8_t*)ps_malloc(fb->len);
+        }
+        if (grayDetBuf) {
+          memcpy(grayDetBuf, fb->buf, fb->len);
+          grayDetLen = fb->len;
+          grayDetW   = fb->width;
+          grayDetH   = fb->height;
+        }
+        xSemaphoreGive(detGrayMux);
+        lastDetGrayWriteMs = now;
       }
+      // If lock busy: det_task still running — skip this detection frame silently.
+      // loop() will still call xTaskNotifyGive(detectionTaskHandle) on schedule;
+      // det_task will use the previously written grayDetBuf on next wake.
     }
 
     esp_camera_fb_return(fb);
@@ -441,24 +462,38 @@ void handleStream() {
         // Block until snap_task signals a new frame (200ms watchdog for disconnect detection)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
 
-        uint8_t* buf = nullptr;
-        size_t   len = 0;
-
-        if (xSemaphoreTake(streamMux, pdMS_TO_TICKS(20)) == pdTRUE) {
-          len = streamFrameLen;
-          buf = (len > 0) ? (uint8_t*)malloc(len) : nullptr;
-          if (buf) memcpy(buf, streamFrameBuf, len);
-          xSemaphoreGive(streamMux);
+        // Copy gray buf locally under lock, then encode outside lock
+        uint8_t* localGray = nullptr;
+        size_t   localLen  = 0;
+        int      localW    = 0, localH = 0;
+        if (xSemaphoreTake(streamGrayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+          if (grayStreamBuf && grayStreamLen > 0) {
+            localGray = (uint8_t*)malloc(grayStreamLen);
+            if (localGray) {
+              memcpy(localGray, grayStreamBuf, grayStreamLen);
+              localLen = grayStreamLen;
+              localW   = grayStreamW;
+              localH   = grayStreamH;
+            }
+          }
+          xSemaphoreGive(streamGrayMux);
         }
 
-        if (buf && len > 0) {
-          String partHeader =
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-            + String(len) + "\r\n\r\n";
-          c->print(partHeader);
-          c->write(buf, len);
-          c->print("\r\n");
-          free(buf);
+        // JPEG encode outside lock — fmt2jpg on raw gray buf, can take 30-50ms
+        if (localGray && localLen > 0 && localW > 0 && localH > 0) {
+          uint8_t* jBuf = nullptr;
+          size_t   jLen = 0;
+          if (fmt2jpg(localGray, localLen, localW, localH,
+                      PIXFORMAT_GRAYSCALE, JPEG_QUALITY, &jBuf, &jLen) && jLen > 0) {
+            String partHeader =
+              "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+              + String(jLen) + "\r\n\r\n";
+            c->print(partHeader);
+            c->write(jBuf, jLen);
+            c->print("\r\n");
+            free(jBuf);
+          }
+          free(localGray);
         }
       }
       Serial.println("[CAM] Stream client disconnected");
@@ -467,7 +502,7 @@ void handleStream() {
       streamClientActive = false;
       vTaskDelete(NULL);
     },
-    "stream_task", 4096, clientPtr,
+    "stream_task", 8192, clientPtr,  // 8192: fmt2jpg needs stack headroom
     1, NULL, 1
   );
 }
@@ -492,10 +527,11 @@ void handleMode() {
 }
 
 void handleStatus() {
-  StaticJsonDocument<192> doc;
+  StaticJsonDocument<256> doc;
   doc["ip"]         = WiFi.localIP().toString();
   doc["uptime"]     = millis() / 1000;
   doc["heap"]       = ESP.getFreeHeap();
+  doc["psram"]      = ESP.getFreePsram();
   doc["mode"]       = (camMode == MODE_ARMED) ? "armed" : "safe";
   doc["pumpActive"] = pumpActive;
   String out; serializeJson(doc, out);
@@ -508,7 +544,7 @@ void handleStatus() {
 //
 //  Runs on Core 1 via det_task at priority 2 (highest on Core 1).
 //  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-//  Reads sharedGrayBuf (written by snap_task on Core 0) — no fb_get calls.
+//  Reads grayDetBuf (written by snap_task on Core 0) — no fb_get calls.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
 //
 //  StaticJsonDocument<1024> used — stack-allocated, no heap churn per cycle.
@@ -518,19 +554,19 @@ void runDetectionAndPush() {
   size_t   grayLen = 0;
   int      W = 0, H = 0;
 
-  if (xSemaphoreTake(grayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
-    if (sharedGrayBuf && sharedGrayLen > 0) {
-      grayBuf = (uint8_t*)malloc(sharedGrayLen);
+  if (xSemaphoreTake(detGrayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (grayDetBuf && grayDetLen > 0) {
+      grayBuf = (uint8_t*)malloc(grayDetLen);
       if (grayBuf) {
-        memcpy(grayBuf, sharedGrayBuf, sharedGrayLen);
-        grayLen = sharedGrayLen;
-        W       = sharedGrayW;
-        H       = sharedGrayH;
+        memcpy(grayBuf, grayDetBuf, grayDetLen);
+        grayLen = grayDetLen;
+        W       = grayDetW;
+        H       = grayDetH;
       }
     }
-    xSemaphoreGive(grayMux);
+    xSemaphoreGive(detGrayMux);
   } else {
-    Serial.println("[DET] grayMux timeout — skipping detection cycle");
+    Serial.println("[DET] detGrayMux timeout — skipping detection cycle");
     return;
   }
 
@@ -632,9 +668,9 @@ void setup() {
   digitalWrite(PIN_PUMP, LOW);
 
   // Create mutexes before any task that uses them
-  grayMux   = xSemaphoreCreateMutex();
-  streamMux = xSemaphoreCreateMutex();
-  if (!grayMux || !streamMux) {
+  streamGrayMux = xSemaphoreCreateMutex();
+  detGrayMux    = xSemaphoreCreateMutex();
+  if (!streamGrayMux || !detGrayMux) {
     Serial.println("[BOOT] Mutex creation failed — halting");
     while (true) delay(1000);
   }
@@ -649,7 +685,7 @@ void setup() {
 
   // det_task — Core 1, priority 2 (highest on Core 1).
   // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
-  // Reads from sharedGrayBuf written by snap_task on Core 0 — no fb_get calls.
+  // Reads from grayDetBuf written by snap_task on Core 0 — no fb_get calls.
   xTaskCreatePinnedToCore(
     [](void* arg) {
       for (;;) {
@@ -662,13 +698,13 @@ void setup() {
   );
 
   // snap_task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING.
-  // SOLE owner of esp_camera_fb_get/return. No notify from loop().
-  // Writes sharedGrayBuf for det_task and streamFrameBuf for /stream.
-  // Notifies streamTaskHandle after each successful JPEG stash.
-  // Stack 6144: free-running frame2jpg allocs need headroom.
+  // SOLE owner of esp_camera_fb_get/return. Never blocks — try-lock only.
+  // Writes grayStreamBuf (every frame) and grayDetBuf (every 500ms).
+  // Notifies streamTaskHandle after each grayStreamBuf write.
+  // Stack 4096: gray memcpy only, no frame2jpg.
   xTaskCreatePinnedToCore(
     snapshotTask,
-    "snap_task", 6144, NULL,
+    "snap_task", 4096, NULL,
     2, &snapshotTaskHandle, 0
   );
 
@@ -683,6 +719,7 @@ void setup() {
   Serial.printf("[BOOT] Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode    : SAFE (boots safe, pump blocked)\n");
   Serial.printf("[BOOT] Detection interval: %dms\n", DETECTION_INTERVAL_MS);
+  Serial.printf("[BOOT] Free heap: %u  Free PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
   Serial.println("[BOOT] Core layout: Core0=snap_task(p2) | Core1=det_task(p2)+stream_task(p1)+loopTask(p1)");
 }
 
