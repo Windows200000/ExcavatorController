@@ -39,6 +39,9 @@
  *
  * Stream: max 1 concurrent client enforced via streamClientActive flag.
  *   A second /stream request is rejected with 503 while a client is connected.
+ *   stream_task is notify-driven: snap_task calls xTaskNotifyGive(streamTaskHandle)
+ *   after stashing each JPEG. stream_task blocks on ulTaskNotifyTake (200ms watchdog)
+ *   instead of polling. streamTaskHandle set on task start, cleared on disconnect.
  */
 
 #include "esp_camera.h"
@@ -133,6 +136,7 @@ static volatile bool     streamClientActive = false;
 // ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
 TaskHandle_t snapshotTaskHandle  = NULL;
+TaskHandle_t streamTaskHandle    = NULL;  // set by stream_task on start, cleared on disconnect
 
 // ── Rolling-window CPU state — delta between snapshots every 10s ──
 static uint64_t lastSnapshotCoreTicks[2] = { 0, 0 };
@@ -343,6 +347,7 @@ void initAprilTag() {
 //  On each valid frame:
 //    1. Copies raw grayscale into sharedGrayBuf (grayMux mutex) for det_task.
 //    2. JPEG-encodes and stashes in streamFrameBuf (streamMux mutex) for /stream.
+//    3. Notifies stream_task via xTaskNotifyGive(streamTaskHandle) if connected.
 //
 //  Mutex timeouts: 10ms. If lock not acquired in time, frame is skipped for
 //  that consumer (gray or stream) but fb is still returned — no stall.
@@ -392,6 +397,9 @@ void snapshotTask(void*) {
         streamFrameBuf = jBuf;
         streamFrameLen = jLen;
         xSemaphoreGive(streamMux);
+        // ── 3. Notify stream_task — new frame ready, stop sleeping ──
+        TaskHandle_t sh = streamTaskHandle;
+        if (sh) xTaskNotifyGive(sh);
       } else {
         Serial.println("[SNAP] streamMux timeout — dropping JPEG frame");
         free(jBuf);
@@ -427,7 +435,12 @@ void handleStream() {
   xTaskCreatePinnedToCore(
     [](void* arg) {
       WiFiClient* c = (WiFiClient*)arg;
+      // Register handle so snap_task can notify us
+      streamTaskHandle = xTaskGetCurrentTaskHandle();
       while (c->connected()) {
+        // Block until snap_task signals a new frame (200ms watchdog for disconnect detection)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+
         uint8_t* buf = nullptr;
         size_t   len = 0;
 
@@ -446,11 +459,10 @@ void handleStream() {
           c->write(buf, len);
           c->print("\r\n");
           free(buf);
-        } else {
-          vTaskDelay(pdMS_TO_TICKS(10));
         }
       }
       Serial.println("[CAM] Stream client disconnected");
+      streamTaskHandle = NULL;
       delete c;
       streamClientActive = false;
       vTaskDelete(NULL);
@@ -652,6 +664,7 @@ void setup() {
   // snap_task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING.
   // SOLE owner of esp_camera_fb_get/return. No notify from loop().
   // Writes sharedGrayBuf for det_task and streamFrameBuf for /stream.
+  // Notifies streamTaskHandle after each successful JPEG stash.
   // Stack 6144: free-running frame2jpg allocs need headroom.
   xTaskCreatePinnedToCore(
     snapshotTask,
