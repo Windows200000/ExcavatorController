@@ -160,6 +160,13 @@ bool autoEnabled = false;  // toggled via /auto?set=on|off; off by default on st
 enum AutoStatus_t { AUTO_WAITING, AUTO_BUSY };
 AutoStatus_t autoStatus = AUTO_WAITING;
 
+// ─────────────────────────────────────────────
+//  Pending detection flag — set by handleOverlayPost(), consumed by loop().
+//  Decouples processDetection() from the HTTP request so the cam's POST
+//  returns immediately instead of blocking for the full action duration.
+// ─────────────────────────────────────────────
+bool pendingDetection = false;
+
 struct AutoAction {
   const char* button;      // button name from PIN_TABLE / buttonToHeldPins()
   uint32_t    durationMs;  // how long to hold this action (independent per action)
@@ -665,13 +672,13 @@ void handleOverlayPost() {
     //Serial.printf("[OVERLAY] Recv len=%d autoEnabled=%d autoStatus=%d\n",
     //  overlayJson.length(), autoEnabled, (int)autoStatus);
     if (autoEnabled && autoStatus == AUTO_WAITING) {
-      processDetection(overlayJson);
+      pendingDetection = true;  // signal loop() to run processDetection() — don't block here
     } else {
       // Serial.printf("[OVERLAY] Skipped: autoEnabled=%d autoStatus=%s\n",
       //  autoEnabled, autoStatus == AUTO_BUSY ? "BUSY" : "WAITING");
     }
   }
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/plain", "OK");  // return immediately; cam POST unblocked
 }
 
 void handleOverlayGet() {
@@ -861,6 +868,12 @@ void loop() {
     }
   }
   autoDefaultPosition();
+
+  // ── Pending detection — process outside HTTP handler so cam POST returns instantly ──
+  if (pendingDetection && autoEnabled && autoStatus == AUTO_WAITING) {
+    pendingDetection = false;
+    processDetection(overlayJson);
+  }
 
   // ── Pump hold heartbeat ─────────────────────────────────────────────────
   // Keeps cam pump relay alive when auto is firing, independent of detection
