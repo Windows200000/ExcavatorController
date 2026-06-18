@@ -9,11 +9,15 @@
  *
  * Camera fb ownership: snap_task is the SOLE caller of esp_camera_fb_get/return.
  *   Runs free-running. On each frame:
- *     - Try-locks streamGrayMux (no wait): copies gray into grayStreamBuf for stream_task.
- *     - Every DETECTION_INTERVAL_MS, try-locks detGrayMux (no wait): copies gray into
- *       grayDetBuf for det_task.
- *   snap_task NEVER blocks — both locks are try-only. Skips consumer if busy.
+ *     - Every DETECTION_INTERVAL_MS (FIRST, highest priority): waits up to 150ms for
+ *       detGrayMux, copies gray into grayDetBuf, notifies det_task directly.
+ *     - Always: waits up to 150ms for streamGrayMux, copies gray into grayStreamBuf,
+ *       notifies stream_task.
+ *   snap_task waits up to 150ms per consumer — never skips unless lock truly stuck.
  *   det_task and stream_task read independent buffers — zero cross-consumer contention.
+ *
+ * det_task is notified directly by snap_task (not loop()) every DETECTION_INTERVAL_MS.
+ *   detBusy flag prevents queuing multiple notifies while det_task is mid-cycle.
  *
  * OV2640 grayscale quirk: sensor outputs 477 active lines at VGA instead of 480
  *   (305280 bytes instead of 307200). Frame is accepted if
@@ -21,9 +25,9 @@
  *   grayDetH / grayStreamH so consumers always see correct dimensions.
  *
  * Shared buffer locking: streamGrayMux and detGrayMux are FreeRTOS mutexes.
- *   snap_task uses try-lock (timeout=0) — never blocks, skips frame for that
- *   consumer if busy. Consumers (stream_task, det_task) use 20ms timeout to
- *   copy out their local working buffer, then release immediately.
+ *   snap_task uses 150ms wait — blocks until consumer releases, then pushes.
+ *   Consumers (stream_task, det_task) use 150ms timeout to copy out their local
+ *   working buffer, then release immediately.
  *
  * Gray bufs (grayStreamBuf, grayDetBuf) allocated in PSRAM via ps_malloc.
  *   305KB each — won't fit internal SRAM. ESP32-CAM AI-Thinker has 4MB PSRAM;
@@ -36,7 +40,7 @@
  *           stream_task (prio 1) — JPEG encode + MJPEG write per connected client
  *           loopTask (prio 1) — Arduino loop()/handleClient()
  *
- * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().
+ * CPU profiling: printTopCpuTasks() runs every CPU_REPORT_INTERVAL_MS from loop().\
  *   Uses uxTaskGetSystemState(). Per-core totals computed by summing ulRunTimeCounter
  *   across ALL tasks on each core — percentages reflect % of that core's capacity.
  *   tskNO_AFFINITY tasks are split half/half across both core totals.
@@ -125,7 +129,7 @@ CamMode camMode = MODE_SAFE;
 bool     pumpActive   = false;
 uint32_t pumpLastSeen = 0;
 
-// ── Gray buf for stream_task — written by snap_task (try-lock), read by stream_task ──
+// ── Gray buf for stream_task — written by snap_task (150ms wait), read by stream_task ──
 // Allocated in PSRAM (ps_malloc) — 305KB won't fit internal SRAM.
 // stream_task copies out under streamGrayMux, then fmt2jpg encodes outside lock.
 static uint8_t*          grayStreamBuf     = nullptr;
@@ -134,7 +138,7 @@ static int               grayStreamW       = 0;
 static int               grayStreamH       = 0;
 static SemaphoreHandle_t streamGrayMux     = nullptr;
 
-// ── Gray buf for det_task — written by snap_task (try-lock) every DETECTION_INTERVAL_MS ──
+// ── Gray buf for det_task — written by snap_task (150ms wait) every DETECTION_INTERVAL_MS ──
 // Allocated in PSRAM (ps_malloc). det_task copies out under detGrayMux, works on local copy.
 static uint8_t*          grayDetBuf        = nullptr;
 static size_t            grayDetLen        = 0;
@@ -144,6 +148,10 @@ static SemaphoreHandle_t detGrayMux        = nullptr;
 
 // ── Stream client guard — only 1 concurrent stream client allowed ──
 static volatile bool     streamClientActive = false;
+
+// ── detBusy: set by snap_task before notifying det_task, cleared by det_task when done ──
+// Prevents queuing multiple det notifies while det_task is mid-cycle (detect + POST).
+static volatile bool     detBusy           = false;
 
 // ── Task handles ──
 TaskHandle_t detectionTaskHandle = NULL;
@@ -354,23 +362,31 @@ void initAprilTag() {
 //  Snapshot task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING
 //  SOLE owner of esp_camera_fb_get / esp_camera_fb_return.
 //  Runs as fast as sensor allows (~8fps at VGA grayscale).
-//  No xTaskNotifyGive needed — loop() does NOT notify this task.
+//
+//  fb_get stall logging: if esp_camera_fb_get() takes >50ms, logs duration.
+//  This surfaces OV2640 sensor stalls (dropped VSYNC etc.) that cause serial freezes.
 //
 //  Frame acceptance: fb->len >= fb->width * (fb->height - 4)
 //  Tolerates OV2640 grayscale quirk of 477 active lines (305280 bytes).
 //  Dimensions stored in grayStreamW/H and grayDetW/H for consumers.
 //
-//  On each valid frame:
-//    1. Try-lock streamGrayMux (no wait): copy gray → grayStreamBuf, notify stream_task.
-//       Skip silently if stream_task still reading (lock busy).
-//    2. Every DETECTION_INTERVAL_MS: try-lock detGrayMux (no wait): copy gray → grayDetBuf.
-//       Skip silently if det_task still reading. det_task triggered by loop() separately.
+//  On each valid frame (det has priority — checked first):
+//    1. Every DETECTION_INTERVAL_MS: wait up to 150ms for detGrayMux,
+//       copy gray → grayDetBuf, notify det_task (if not detBusy).
+//    2. Wait up to 150ms for streamGrayMux: copy gray → grayStreamBuf,
+//       notify stream_task.
 //
-//  snap_task NEVER blocks. fb_return always happens immediately.
+//  snap_task waits up to 150ms per consumer before giving up.
+//  fb_return always happens after both consumers are served (or timed out).
 // ════════════════════════════════════════════════════════════
 void snapshotTask(void*) {
   for (;;) {
+    // ── fb_get with stall watchdog ──
+    uint32_t t0 = millis();
     camera_fb_t* fb = esp_camera_fb_get();
+    uint32_t fbDt = millis() - t0;
+    if (fbDt > 50) Serial.printf("[SNP] fb_get stalled %lums\n", (unsigned long)fbDt);
+
     if (!fb) {
       Serial.println("[SNAP] fb_get failed");
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -387,9 +403,36 @@ void snapshotTask(void*) {
       continue;
     }
 
-    // ── 1. Try-lock streamGrayMux — skip frame for stream if busy ──
-    if (xSemaphoreTake(streamGrayMux, 0) == pdTRUE) {
-        Serial.println("[SNP] Pushing Stream frame");
+    // ── 1. Detection first (priority) — every DETECTION_INTERVAL_MS ──
+    uint32_t now = millis();
+    if ((now - lastDetGrayWriteMs) >= DETECTION_INTERVAL_MS) {
+      if (xSemaphoreTake(detGrayMux, pdMS_TO_TICKS(150)) == pdTRUE) {
+        Serial.println("[SNP] Pushing det frame");
+        if (grayDetLen != fb->len) {
+          free(grayDetBuf);
+          grayDetBuf = (uint8_t*)ps_malloc(fb->len);
+        }
+        if (grayDetBuf) {
+          memcpy(grayDetBuf, fb->buf, fb->len);
+          grayDetLen = fb->len;
+          grayDetW   = fb->width;
+          grayDetH   = fb->height;
+        }
+        xSemaphoreGive(detGrayMux);
+        lastDetGrayWriteMs = now;
+        // Notify det_task only if not currently mid-cycle
+        if (!detBusy && detectionTaskHandle) {
+          detBusy = true;
+          xTaskNotifyGive(detectionTaskHandle);
+        }
+      } else {
+        Serial.println("[SNP] Det mutex timeout - skipping det frame");
+      }
+    }
+
+    // ── 2. Stream — every frame ──
+    if (xSemaphoreTake(streamGrayMux, pdMS_TO_TICKS(150)) == pdTRUE) {
+      Serial.println("[SNP] Pushing Stream frame");
       if (grayStreamLen != fb->len) {
         free(grayStreamBuf);
         grayStreamBuf = (uint8_t*)ps_malloc(fb->len);
@@ -404,29 +447,8 @@ void snapshotTask(void*) {
       // Notify stream_task — new frame ready
       TaskHandle_t sh = streamTaskHandle;
       if (sh) xTaskNotifyGive(sh);
-    } else Serial.println("[SNP] Streambusy - skipping");
-
-    // ── 2. Every DETECTION_INTERVAL_MS: try-lock detGrayMux — skip if det_task busy ──
-    uint32_t now = millis();
-    if ((now - lastDetGrayWriteMs) >= DETECTION_INTERVAL_MS) {
-      if (xSemaphoreTake(detGrayMux, 0) == pdTRUE) {
-        Serial.println("[SNP] Pushing det frame");
-        if (grayDetLen != fb->len) {
-          free(grayDetBuf);
-          grayDetBuf = (uint8_t*)ps_malloc(fb->len);
-        }
-        if (grayDetBuf) {
-          memcpy(grayDetBuf, fb->buf, fb->len);
-          grayDetLen = fb->len;
-          grayDetW   = fb->width;
-          grayDetH   = fb->height;
-        }
-        xSemaphoreGive(detGrayMux);
-        lastDetGrayWriteMs = now;
-      } else Serial.println("[SNP]Det Busy - skipping");
-      // If lock busy: det_task still running — skip this detection frame silently.
-      // loop() will still call xTaskNotifyGive(detectionTaskHandle) on schedule;
-      // det_task will use the previously written grayDetBuf on next wake.
+    } else {
+      Serial.println("[SNP] Stream mutex timeout - skipping stream frame");
     }
 
     esp_camera_fb_return(fb);
@@ -468,7 +490,7 @@ void handleStream() {
         uint8_t* localGray = nullptr;
         size_t   localLen  = 0;
         int      localW    = 0, localH = 0;
-        if (xSemaphoreTake(streamGrayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (xSemaphoreTake(streamGrayMux, pdMS_TO_TICKS(150)) == pdTRUE) {
           if (grayStreamBuf && grayStreamLen > 0) {
             localGray = (uint8_t*)malloc(grayStreamLen);
             if (localGray) {
@@ -545,10 +567,12 @@ void handleStatus() {
 //  Detection + overlay push
 //
 //  Runs on Core 1 via det_task at priority 2 (highest on Core 1).
-//  Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
+//  Triggered via xTaskNotifyGive() from snap_task every DETECTION_INTERVAL_MS.
+//  detBusy cleared at end — allows snap_task to queue next notify.
 //  Reads grayDetBuf (written by snap_task on Core 0) — no fb_get calls.
 //  quad_decimate=4.0: AprilTag processes 160x120 internally.
 //
+//  POST watchdog: logs if HTTP POST takes >100ms.
 //  StaticJsonDocument<1024> used — stack-allocated, no heap churn per cycle.
 // ════════════════════════════════════════════════════════════
 void runDetectionAndPush() {
@@ -556,7 +580,7 @@ void runDetectionAndPush() {
   size_t   grayLen = 0;
   int      W = 0, H = 0;
 
-  if (xSemaphoreTake(detGrayMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+  if (xSemaphoreTake(detGrayMux, pdMS_TO_TICKS(150)) == pdTRUE) {
     if (grayDetBuf && grayDetLen > 0) {
       grayBuf = (uint8_t*)malloc(grayDetLen);
       if (grayBuf) {
@@ -569,12 +593,14 @@ void runDetectionAndPush() {
     xSemaphoreGive(detGrayMux);
   } else {
     Serial.println("[DET] detGrayMux timeout — skipping detection cycle");
+    detBusy = false;
     return;
   }
 
   if (!grayBuf || grayLen == 0 || W == 0 || H == 0) {
     Serial.println("[DET] No frame available yet");
     free(grayBuf);
+    detBusy = false;
     return;
   }
 
@@ -625,9 +651,14 @@ void runDetectionAndPush() {
   HTTPClient http;
   http.begin("http://" + String(CONTROLLER_IP) + ":" + String(CONTROLLER_PORT) + "/overlay");
   http.addHeader("Content-Type", "application/json");
+  uint32_t postT0 = millis();
   int code = http.POST(body);
+  uint32_t postDt = millis() - postT0;
+  if (postDt > 100) Serial.printf("[DET] POST took %lums\n", (unsigned long)postDt);
   if (code < 0) Serial.printf("[DET] POST failed: %s\n", http.errorToString(code).c_str());
   http.end();
+
+  detBusy = false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -686,7 +717,8 @@ void setup() {
   registerWithController();
 
   // det_task — Core 1, priority 2 (highest on Core 1).
-  // Triggered via xTaskNotifyGive() from loop() every DETECTION_INTERVAL_MS.
+  // Triggered via xTaskNotifyGive() from snap_task every DETECTION_INTERVAL_MS.
+  // detBusy prevents queuing multiple notifies mid-cycle.
   // Reads from grayDetBuf written by snap_task on Core 0 — no fb_get calls.
   xTaskCreatePinnedToCore(
     [](void* arg) {
@@ -700,9 +732,9 @@ void setup() {
   );
 
   // snap_task — Core 0, priority 2 (highest on Core 0) — FREE-RUNNING.
-  // SOLE owner of esp_camera_fb_get/return. Never blocks — try-lock only.
-  // Writes grayStreamBuf (every frame) and grayDetBuf (every 500ms).
-  // Notifies streamTaskHandle after each grayStreamBuf write.
+  // SOLE owner of esp_camera_fb_get/return.
+  // Writes grayDetBuf (every 500ms, det first) and grayStreamBuf (every frame).
+  // Notifies det_task and streamTaskHandle after each respective write.
   // Stack 4096: gray memcpy only, no frame2jpg.
   xTaskCreatePinnedToCore(
     snapshotTask,
@@ -739,9 +771,5 @@ void loop() {
     lastCpuReportMs = now;
     printTopCpuTasks();
   }
-
-  if ((now - lastDetectionMs) >= DETECTION_INTERVAL_MS) {
-    lastDetectionMs = now;
-    if (detectionTaskHandle) xTaskNotifyGive(detectionTaskHandle);
-  }
+  // det_task is now notified directly by snap_task — no notify from loop()
 }
