@@ -361,7 +361,7 @@ void autoDefaultPosition() {
 //  Has full access to: autoState, AUTO_TURRET_MAX, AUTO_ARM_MAX,
 //  AUTO_ARM_RESET_POS, AUTO_DEADZONE, runActionSync(), startAction(), stopAction()
 // ─────────────────────────────────────────────
-void autoAlways(int offsetX, int offsetY) {
+void autoAlways(int offsetX, int offsetY, bool codeDetected) {
   // ── USER CODE AREA 1 — runs every frame ──────────────────
   // Serial.printf("[AUTO] time=%d autoEnabled=%d lastDet=%d armPos=%d\n", millis(), autoEnabled,  autoState.last_det, autoState.armPos);
   // On 20x consecutive no-detection: reset arm down to AUTO_ARM_RESET_POS position
@@ -377,8 +377,10 @@ void autoAlways(int offsetX, int offsetY) {
     autoState.armPos = AUTO_ARM_RESET_POS;
   }
 
-  if (abs(offsetX) > AUTO_DEADZONE || abs(offsetY) > AUTO_DEADZONE) {
-    Serial.println("[AUTO] Stopped firing.");
+  if (!codeDetected || abs(offsetX) > AUTO_DEADZONE || abs(offsetY) > AUTO_DEADZONE) {
+    if (autoState.is_firing == true) {
+      Serial.println("[AUTO] Stopped firing.");
+    }
     autoState.center_strk = 0;
     autoState.is_firing = false;
     relayCamCmd("/pump?action=release");
@@ -386,6 +388,7 @@ void autoAlways(int offsetX, int offsetY) {
 
   if (autoState.center_strk > 5) {
     if (autoState.is_firing == true) {
+    relayCamCmd("/pump?action=press");
     relayCamCmd("/pump?action=hold");
     } else {
     autoState.is_firing = true;
@@ -393,7 +396,47 @@ void autoAlways(int offsetX, int offsetY) {
     relayCamCmd("/pump?action=press");
     }
   }
-
+  int time1 = 300;
+  int time2 = 200;
+  int time3 = 100;
+  int delayms = 500;
+  // debugDropdown, sebugFlag1
+  // min arm dwn
+  // min arm up
+  // min left fwd
+  // min left back
+  if (debugFlag1) {
+    runActionSync("arm_dwn", time1);
+    delay(delayms);
+    runActionSync("arm_dwn", time2);
+    delay(delayms);
+    runActionSync("arm_dwn", time3);
+    delay(delayms);
+  }
+  if (debugFlag2) {
+    runActionSync("arm_up", time1);
+    delay(delayms);
+    runActionSync("arm_up", time2);
+    delay(delayms);
+    runActionSync("arm_up", time3);
+    delay(delayms);
+  }
+  if (debugFlag3) {
+    runActionSync("left_fwd", time1);
+    delay(delayms);
+    runActionSync("left_fwd", time2);
+    delay(delayms);
+    runActionSync("left_fwd", time3);
+    delay(delayms);
+  }
+  if (debugFlag4) {
+    runActionSync("left_back", time1);
+    delay(delayms);
+    runActionSync("left_back", time2);
+    delay(delayms);
+    runActionSync("left_back", time3);
+    delay(delayms);
+  }
   // ─────────────────────────────────────────────────────────
 }
 
@@ -556,7 +599,9 @@ void processDetection(const String& json) {
   //   offsetX: 0=centre, positive=right, negative=left
   //   offsetY: 0=centre, positive=above centre, negative=below centre
   int offsetX = 0, offsetY = 0;
-  if (bx >= 0) {
+  bool codeDetected = bx >= 0;
+  if (codeDetected) {
+    codeDetected = true;
     float cx = bx + bw / 2.0f;
     float cy = by + bh / 2.0f;
     offsetX = (int)((cx - 0.5f) * 2.0f * 100.0f * (AUTO_FRAME_W / AUTO_FRAME_H));
@@ -566,7 +611,7 @@ void processDetection(const String& json) {
   }
 
   // ── 4. Always runs ─────────────────────────────────────────────────────
-  autoAlways(offsetX, offsetY);
+  autoAlways(offsetX, offsetY, codeDetected);
 
   // ── 5. Branch on detection ─────────────────────────────────────────────
   if (bx < 0) {
@@ -847,6 +892,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
     padding:2px 8px;white-space:nowrap;
   }
   #auto-status{
+    position:absolute;top:10px;right:100px;
     font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--dim);
     background:#0d1520;border:1px solid var(--border);border-radius:20px;
     padding:2px 8px;cursor:pointer;user-select:none;
@@ -963,7 +1009,6 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
   <div id="header-right">
     <span id="kbd-hint">WASD=drive &nbsp; &#8592;&#8594;=turret &nbsp; &#8593;&#8595;=arm &nbsp; L=light &nbsp; T=test &nbsp; Space=pump</span>
     <span id="cam-status">CAM: searching&hellip;</span>
-    <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
     <!-- Debug controls -->
     <div id="debug-controls">
       <span class="dbg-label">DBG:</span>
@@ -996,6 +1041,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLEOF(
 
     <!-- Safety badge — driven live from cam module -->
     <div id="safety-badge" class="safe" title="Click to toggle arm/safe on cam module">&#128274; SAFE</div>
+    <span id="auto-status" title="Click to toggle autonomous mode">AUTO: OFF</span>
 
     <div id="model-svg-wrap">
       <!-- Isometric-ish top-down excavator SVG -->
