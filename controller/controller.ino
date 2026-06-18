@@ -485,11 +485,9 @@ void autoOnDetection(int offsetX, int offsetY) {
     if (offsetY > 0 && autoState.armPos > 0) {
       Serial.printf("[AUTO] offsetY=%d → arm_up (down), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos - 300);
       actions.push_back({ "arm_dwn", AUTO_MAX_MOVE * abs(offsetY)});
-      autoState.armPos -= AUTO_MAX_MOVE * abs(offsetY);
     } else if (autoState.armPos < AUTO_ARM_MAX) {
       Serial.printf("[AUTO] offsetY=%d → arm_dwn (up), armPos %d→%d\n", offsetY, autoState.armPos, autoState.armPos + 300);
       actions.push_back({ "arm_up", AUTO_MAX_MOVE * abs(offsetY)});
-      autoState.armPos += AUTO_MAX_MOVE * abs(offsetY);
     } else {
       Serial.printf("[AUTO] offsetY=%d but arm at limit (%d)\n", offsetY, autoState.armPos);
     }
@@ -504,12 +502,10 @@ void autoOnDetection(int offsetX, int offsetY) {
       Serial.printf("[AUTO] offsetX=%d → right_fwd, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos - 300);
       actions.push_back({ "right_fwd", AUTO_MAX_MOVE * abs(offsetX)});
       actions.push_back({ "left_back", AUTO_MAX_MOVE * abs(offsetX)});
-      //autoState.turretPos -= 300;
     } else if (autoState.turretPos < AUTO_TURRET_MAX) {
       Serial.printf("[AUTO] offsetX=%d → right_back, turretPos %d→%d\n", offsetX, autoState.turretPos, autoState.turretPos + 300);
       actions.push_back({ "right_back", AUTO_MAX_MOVE * abs(offsetX)});
       actions.push_back({ "left_fwd", AUTO_MAX_MOVE * abs(offsetX)});
-      //autoState.turretPos += 300;
     } else {
       Serial.printf("[AUTO] offsetX=%d but turret at limit (%d)\n", offsetX, autoState.turretPos);
     }
