@@ -34,7 +34,8 @@
  *   Uses uxTaskGetSystemState(). Per-core totals computed by summing ulRunTimeCounter
  *   across ALL tasks on each core — percentages reflect % of that core's capacity.
  *   tskNO_AFFINITY tasks are split half/half across both core totals.
- *   Percentages are cumulative since boot (not rolling window).
+ *   Percentages reflect last 10s window (delta between snapshots). First report
+ *   prints a warm-up notice instead of percentages.
  *
  * Stream: max 1 concurrent client enforced via streamClientActive flag.
  *   A second /stream request is rejected with 503 while a client is connected.
@@ -133,15 +134,21 @@ static volatile bool     streamClientActive = false;
 TaskHandle_t detectionTaskHandle = NULL;
 TaskHandle_t snapshotTaskHandle  = NULL;
 
+// ── Rolling-window CPU state — delta between snapshots every 10s ──
+static uint64_t lastSnapshotCoreTicks[2] = { 0, 0 };
+static uint32_t lastSnapshotTaskTicks[5] = { 0, 0, 0, 0, 0 };
+static bool     cpuSnapshotValid         = false;
+
 // ════════════════════════════════════════════════════════════
 //  CPU profiling — top-5 hardcoded tasks, per-core percentages
 //
 //  Algorithm:
 //    Pass 1: iterate ALL tasks, accumulate per-core total ticks.
 //            tskNO_AFFINITY tasks: add half their ticks to each core.
-//    Pass 2: for each watched task, find it and compute
-//            pct = taskTicks * 1000 / coreTotalTicks  (tenths of %)
-//  This yields true % of that core's capacity, not % of combined runtime.
+//    Pass 2: for each watched task, find it and compute delta ticks
+//            vs previous snapshot, then:
+//            pct = deltaTaskTicks * 1000 / deltaCoreTotal  (tenths of %)
+//  This yields true % of that core's capacity over the last 10s window.
 // ════════════════════════════════════════════════════════════
 struct CpuWatchTask { const char* exactName; };
 
@@ -185,25 +192,47 @@ void printTopCpuTasks() {
   Serial.printf("[CPU]  Core 0 total ticks: %llu\n", coreTicks[0]);
   Serial.printf("[CPU]  Core 1 total ticks: %llu\n", coreTicks[1]);
 
-  // Pass 2: report watched tasks
+  if (!cpuSnapshotValid) {
+    Serial.println("[CPU]  (warming up — no delta yet)");
+    lastSnapshotCoreTicks[0] = coreTicks[0];
+    lastSnapshotCoreTicks[1] = coreTicks[1];
+    for (int i = 0; i < 5; i++) {
+      for (UBaseType_t j = 0; j < actualCount; j++) {
+        if (strcmp(taskStatus[j].pcTaskName, CPU_WATCH_TOP5[i].exactName) == 0) {
+          lastSnapshotTaskTicks[i] = taskStatus[j].ulRunTimeCounter;
+          break;
+        }
+      }
+    }
+    cpuSnapshotValid = true;
+    free(taskStatus);
+    return;
+  }
+
+  uint64_t deltaCoreTicks[2] = {
+    coreTicks[0] - lastSnapshotCoreTicks[0],
+    coreTicks[1] - lastSnapshotCoreTicks[1]
+  };
+
+  // Pass 2: report watched tasks using delta ticks
   for (int i = 0; i < 5; i++) {
     bool found = false;
     for (UBaseType_t j = 0; j < actualCount; j++) {
       if (strcmp(taskStatus[j].pcTaskName, CPU_WATCH_TOP5[i].exactName) == 0) {
-        BaseType_t core    = taskStatus[j].xCoreID;
-        uint32_t   ticks   = taskStatus[j].ulRunTimeCounter;
-        uint64_t   coreTotal = (core == 0) ? coreTicks[0]
-                             : (core == 1) ? coreTicks[1]
-                             : (coreTicks[0] + coreTicks[1]); // affinity=any: use combined
+        BaseType_t core       = taskStatus[j].xCoreID;
+        uint32_t   deltaTicks = taskStatus[j].ulRunTimeCounter - lastSnapshotTaskTicks[i];
+        uint64_t   coreTotal  = (core == 0) ? deltaCoreTicks[0]
+                              : (core == 1) ? deltaCoreTicks[1]
+                              : (deltaCoreTicks[0] + deltaCoreTicks[1]); // affinity=any: use combined
         uint32_t pct10 = (coreTotal > 0)
-                       ? (uint32_t)(((uint64_t)ticks * 1000ULL) / coreTotal)
+                       ? (uint32_t)(((uint64_t)deltaTicks * 1000ULL) / coreTotal)
                        : 0;
         const char* coreStr = (core == 0) ? "core=0" : (core == 1) ? "core=1" : "core=any";
         Serial.printf("[CPU]  %-12s  %s  %3lu.%lu%%/core   ticks=%lu\n",
           CPU_WATCH_TOP5[i].exactName,
           coreStr,
           (unsigned long)(pct10 / 10), (unsigned long)(pct10 % 10),
-          (unsigned long)ticks);
+          (unsigned long)deltaTicks);
         found = true;
         break;
       }
@@ -211,6 +240,18 @@ void printTopCpuTasks() {
     if (!found) Serial.printf("[CPU]  %-12s  not found\n", CPU_WATCH_TOP5[i].exactName);
   }
   Serial.println("[CPU] ════════════════════════════");
+
+  // Save snapshot for next window
+  lastSnapshotCoreTicks[0] = coreTicks[0];
+  lastSnapshotCoreTicks[1] = coreTicks[1];
+  for (int i = 0; i < 5; i++) {
+    for (UBaseType_t j = 0; j < actualCount; j++) {
+      if (strcmp(taskStatus[j].pcTaskName, CPU_WATCH_TOP5[i].exactName) == 0) {
+        lastSnapshotTaskTicks[i] = taskStatus[j].ulRunTimeCounter;
+        break;
+      }
+    }
+  }
   free(taskStatus);
 }
 
