@@ -57,6 +57,11 @@
  * fb_count=2: sensor DMA double-buffered — sensor fills buf[1] while CPU processes buf[0].
  *   Previously forced to 1 due to suspected OV2640 partial-frame bug with grayscale+fb_count=2.
  *   Re-enabled: partial frames are already tolerated (fb->len >= w*(h-4) check).
+ *
+ * Pump minimum on-time: PUMP_MIN_ON_MS = 500ms.
+ *   pumpOff() defers the actual off if elapsed < PUMP_MIN_ON_MS, sets pumpReleaseRequested.
+ *   loop() completes the deferred off once the minimum has elapsed.
+ *   This guarantees the pump (and LED) fires for at least half a second per press.
  */
 
 #include "esp_camera.h"
@@ -103,9 +108,10 @@ const float    MARKER_CONFIDENCE_CUTOFF = 50.0f;
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
-const int      PIN_PUMP             = 13;
-const int      PIN_LED              = 4;
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
+const int      PIN_PUMP              = 13;
+const int      PIN_LED               = 4;
+const uint32_t PUMP_HOLD_TIMEOUT_MS  = 800;
+const uint32_t PUMP_MIN_ON_MS        = 500;  // pump fires for at least this long per press
 
 const framesize_t FRAME_SIZE            = FRAMESIZE_VGA;  // 640x480 (sensor outputs 640x477)
 const uint8_t     JPEG_QUALITY          = 12;
@@ -126,8 +132,10 @@ uint32_t lastCpuReportMs  = 0;
 enum CamMode { MODE_SAFE, MODE_ARMED };
 CamMode camMode = MODE_SAFE;
 
-bool     pumpActive   = false;
-uint32_t pumpLastSeen = 0;
+bool     pumpActive            = false;
+uint32_t pumpLastSeen          = 0;
+uint32_t pumpOnMs              = 0;     // millis() when pump last turned on
+bool     pumpReleaseRequested  = false; // deferred off: set by pumpOff() if elapsed < PUMP_MIN_ON_MS
 
 // ── Gray buf for stream_task — written by snap_task (150ms wait), read by stream_task ──
 // Allocated in PSRAM (ps_malloc) — 305KB won't fit internal SRAM.
@@ -284,6 +292,11 @@ void printTopCpuTasks() {
 
 // ════════════════════════════════════════════════════════════
 //  Pump helpers
+//
+//  Minimum on-time: PUMP_MIN_ON_MS (500ms).
+//  pumpOn()  — records pumpOnMs, clears pumpReleaseRequested.
+//  pumpOff() — if elapsed < PUMP_MIN_ON_MS, defers: sets pumpReleaseRequested and returns.
+//              loop() calls pumpOff() again once the minimum has elapsed.
 // ════════════════════════════════════════════════════════════
 void pumpOn() {
   if (camMode == MODE_SAFE) { Serial.println("[PUMP] Blocked — SAFE mode"); return; }
@@ -292,18 +305,27 @@ void pumpOn() {
     digitalWrite(PIN_LED, HIGH);
     digitalWrite(PIN_PUMP, HIGH);
     pumpActive = true;
+    pumpOnMs   = millis();
+    pumpReleaseRequested = false;
     Serial.println("[PUMP] ON");
   }
   pumpLastSeen = millis();
 }
 
 void pumpOff() {
-  if (pumpActive) {
-    pinMode(PIN_LED, INPUT);
-    digitalWrite(PIN_PUMP, LOW);   // LOW → gate off → pump stops
-    pumpActive = false;
-    Serial.println("[PUMP] OFF");
+  if (!pumpActive) return;
+  uint32_t elapsed = millis() - pumpOnMs;
+  if (elapsed < PUMP_MIN_ON_MS) {
+    pumpReleaseRequested = true;
+    Serial.printf("[PUMP] Release deferred (%lums < %lums min)\n",
+                  (unsigned long)elapsed, (unsigned long)PUMP_MIN_ON_MS);
+    return;
   }
+  pumpReleaseRequested = false;
+  pinMode(PIN_LED, INPUT);
+  digitalWrite(PIN_PUMP, LOW);   // LOW → gate off → pump stops
+  pumpActive = false;
+  Serial.println("[PUMP] OFF");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -753,12 +775,19 @@ void setup() {
   Serial.printf("[BOOT] Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
   Serial.printf("[BOOT] Mode    : SAFE (boots safe, pump blocked)\n");
   Serial.printf("[BOOT] Detection interval: %dms\n", DETECTION_INTERVAL_MS);
+  Serial.printf("[BOOT] Pump min on-time  : %dms\n", PUMP_MIN_ON_MS);
   Serial.printf("[BOOT] Free heap: %u  Free PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
   Serial.println("[BOOT] Core layout: Core0=snap_task(p2) | Core1=det_task(p2)+stream_task(p1)+loopTask(p1)");
 }
 
 void loop() {
   server.handleClient();
+
+  // Deferred pump off — fires once PUMP_MIN_ON_MS has elapsed after pumpOn()
+  if (pumpReleaseRequested && pumpActive &&
+      (millis() - pumpOnMs) >= PUMP_MIN_ON_MS) {
+    pumpOff();
+  }
 
   if (pumpActive && (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS) {
     Serial.println("[PUMP] Heartbeat timeout — auto-release");
