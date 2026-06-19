@@ -247,7 +247,7 @@ Because both controls are **pulse-based** (the hardware toggle is a momentary GP
 ### Button Behaviour
 
 | Button | Type | Behaviour |
-|--------|------|-----------| 
+|--------|------|-----------|
 | `left_fwd` | Hold | Left track forward (GPIO 12 HIGH) |
 | `left_back` | Hold | Left track back (GPIO 14 LOW) |
 | `right_fwd` | Hold | Right track forward (GPIO 26 HIGH) |
@@ -733,9 +733,14 @@ Detection result JSON schema:
 ### Pump Control
 
 ```cpp
-const int PIN_PUMP = 4;  // Temp for LED; change digitalWrite to LOW for real pump relay
-const uint32_t PUMP_HOLD_TIMEOUT_MS = 800;
+const int      PIN_PUMP             = 13;  // Real pump relay GPIO
+const int      PIN_LED              = 4;   // On-board LED (driven alongside pump)
+const uint32_t PUMP_HOLD_TIMEOUT_MS = 800; // Watchdog: auto-release if no hold heartbeat
+const uint32_t PUMP_MIN_ON_MS       = 500; // Minimum pump-on duration — pump fires for at
+                                           // least this long even if release arrives sooner
 ```
+
+**Minimum-on enforcement:** `pumpOn()` records `pumpOnMs = millis()` and clears `pumpReleaseRequested`. `pumpOff()` checks `millis() - pumpOnMs < PUMP_MIN_ON_MS`; if too early it sets `pumpReleaseRequested = true` and returns without cutting power. `loop()` polls `pumpReleaseRequested` and calls `pumpOff()` again once the minimum has elapsed. This guarantees the pump (and LED) fires for at least 500 ms regardless of how quickly release is received.
 
 ### Safe / Armed Mode
 
@@ -768,7 +773,8 @@ setup():
 
 loop() [Core 1, priority 1]:
   server.handleClient()
-  if pumpActive and timeout: pumpOff()
+  if pumpActive and (millis() - pumpLastSeen) > PUMP_HOLD_TIMEOUT_MS: pumpOff()
+  if pumpReleaseRequested and pumpActive and (millis() - pumpOnMs) >= PUMP_MIN_ON_MS: pumpOff()
   if millis() - lastCpuReportMs >= CPU_REPORT_INTERVAL_MS: printTopCpuTasks()
   // det_task is notified directly by snap_task — loop() does NOT notify det_task
 ```
