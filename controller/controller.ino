@@ -179,7 +179,7 @@ const int AUTO_TURRET_MAX       = 3000; // both directions
 const int AUTO_ARM_MAX          = 2000; // starts down, arm fwd = arm up
 const int AUTO_ARM_RESET_POS    = 1000; // target for armPos
 const int AUTO_ARM_DEFAULT_POS  = 2000; // target for armPos
-const int AUTO_DEADZONE         = 10;
+const int AUTO_DEADZONE         = 15;
 const int AUTO_MIN_MOVE         = 150;
 const int AUTO_MAX_MOVE         = 350;
 const uint32_t AUTO_CORRECTION_DELAY_MS = 2000; // pause after autonomous correction
